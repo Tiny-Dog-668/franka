@@ -1,0 +1,10 @@
+uname -a
+cat /sys/kernel/realtime
+ip -br addr show enp3s0
+ping -c 2 172.16.0.2
+/home/td/franka/tools/system/verify_franka_host.sh
+
+
+source /home/td/franka/.venv/bin/activate
+python3 /home/td/franka/scripts/robot/minimal_franka_move.py --ip 172.16.0.2 --dz -0.02 --speed 0.02 --realtime ignore
+

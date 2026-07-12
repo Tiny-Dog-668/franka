@@ -1,0 +1,31 @@
+{
+  "task": "TacEx-Sim2Real-Grasp-v0",
+  "checkpoint": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_grasp/2026-03-31_22-38-07_ppo_torch_vision_only_resnet18/checkpoints/agent_100000.pt",
+  "output": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_grasp/2026-03-31_22-38-07_ppo_torch_vision_only_resnet18/checkpoints/exported/policy_actor_e2e_agent_100000.pt",
+  "input_mode": "rgb",
+  "input_signature": {
+    "action_history": [
+      5
+    ],
+    "proprio_obs": [
+      15
+    ],
+    "wrist_rgb": [
+      480,
+      640,
+      3
+    ]
+  },
+  "output_signature": {
+    "mean_actions": [
+      5
+    ]
+  },
+  "notes": [
+    "Outputs raw actor mean actions before environment-side action_scale, IK, and safety gating.",
+    "critic_* privileged observations are internally zero-filled because the actor does not consume them.",
+    "wrist_rgb is expected as uint8 RGB frames in HWC layout.",
+    "The export includes the same frozen ResNet18 ImageNet feature extractor used by the environment."
+  ],
+  "trace_max_abs_err": 0.0
+}

@@ -1,0 +1,35 @@
+22.04 realtime workflow for Franka
+
+1. Reboot and enter the realtime kernel:
+   - Ubuntu, with Linux 5.15.0-1032-realtime
+
+2. Verify that realtime is active:
+   uname -a
+   cat /sys/kernel/realtime
+
+3. Keep the robot on the wired port:
+   ip -br addr show enp3s0
+   ping -c 2 172.16.0.2
+
+4. If you need internet while staying on 22.04 realtime:
+   - Best option: enable phone USB tethering
+   - Or use a USB Wi-Fi adapter that is supported by the realtime kernel
+   - After connecting it, run:
+     /home/td/franka/tools/system/check_franka_network.sh
+
+5. Make sure traffic is split correctly:
+   - Robot traffic should go to 172.16.0.2 via enp3s0
+   - Internet traffic can go through the tether or USB Wi-Fi interface
+   - Avoid VPN/proxy when testing robot motion
+
+6. Run the host verification:
+   /home/td/franka/tools/system/verify_franka_host.sh
+
+7. Run the minimal motion test:
+   source /home/td/franka/.venv/bin/activate
+   python3 /home/td/franka/scripts/robot/minimal_franka_move.py --ip 172.16.0.2 --dz -0.02 --speed 0.02 --realtime ignore
+
+8. If motion aborts with communication_constraints_violation:
+   - Keep only the wired robot link active if possible
+   - Close browser, sync, cloud drive, and other background traffic
+   - Retry with an even smaller move and low speed

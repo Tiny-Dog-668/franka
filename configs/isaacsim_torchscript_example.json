@@ -1,0 +1,64 @@
+{
+  "backend": {
+    "kind": "real",
+    "robot_ip": "172.16.0.2",
+    "realtime": "ignore",
+    "enable_gripper": true,
+    "auto_recover": false,
+    "auto_gripper_homing": true,
+    "settle_time_s": 0.2
+  },
+  "runner": {
+    "episodes": 1,
+    "max_steps": 20,
+    "log_dir": "runs",
+    "run_name": "isaacsim_torchscript_validation"
+  },
+  "control": {
+    "speed": 0.03,
+    "gripper_speed": 0.03,
+    "gripper_force": 20.0,
+    "max_dx": 0.01,
+    "max_dy": 0.01,
+    "max_dz": 0.01,
+    "max_yaw_deg": 10.0,
+    "fallback_gripper_max_width": 0.056,
+    "workspace": {
+      "minimum": [0.2, -0.3, 0.05],
+      "maximum": [0.65, 0.3, 0.45]
+    }
+  },
+  "goal": {
+    "target_translation": [0.45, 0.0, 0.18],
+    "target_yaw_deg": 0.0,
+    "translation_tolerance_m": 0.01,
+    "yaw_tolerance_deg": 5.0
+  },
+  "policy": {
+    "kind": "torchscript",
+    "action_mode": "normalized",
+    "seed": 7,
+    "checkpoint_path": "/home/td/franka/policies/policy.pt",
+    "device": "cpu",
+    "observation_keys": [
+      "joint_positions",
+      "joint_velocities",
+      "tcp_translation",
+      "tcp_quaternion",
+      "external_wrench",
+      "gripper_width"
+    ],
+    "output_key": null,
+    "expects_batch_dim": true,
+    "scripted_actions": []
+  },
+  "sim": {
+    "initial_translation": [0.38, 0.05, 0.13],
+    "initial_yaw_deg": 0.0,
+    "observation_noise_std": 0.001,
+    "action_noise_std": 0.0005,
+    "yaw_noise_deg": 0.5,
+    "gripper_max_width": 0.056,
+    "seed": 7
+  }
+}

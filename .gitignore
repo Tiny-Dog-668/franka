@@ -1,0 +1,29 @@
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local editor and Codex state
+.agents/
+.codex/
+.vscode/
+.idea/
+
+# Runtime logs and real-camera data
+runs/
+
+# Generated build artifacts and archives
+artifacts/
+*.zip
+
+# Large model weights (keep JSON metadata tracked)
+*.pt
+*.pth
+*.ckpt
+
+# Local scratch files
+text.txt
+.DS_Store

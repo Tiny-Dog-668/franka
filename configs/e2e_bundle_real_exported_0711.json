@@ -1,0 +1,51 @@
+{
+  "robot_ip": "172.16.0.2",
+  "realtime": "ignore",
+  "speed": 0.3,
+  "gripper_speed": 0.03,
+  "gripper_force": 20.0,
+  "gripper_command_tolerance_m": 0.0001,
+  "settle_time_s": 0.05,
+  "auto_recover": false,
+  "auto_gripper_homing": false,
+  "async_gripper_commands": true,
+  "fallback_gripper_max_width": 0.056,
+  "workspace": {
+    "minimum": [0.2, -0.3, 0.05],
+    "maximum": [0.65, 0.3, 0.45]
+  },
+  "camera": {
+    "source": "realsense",
+    "serial": null,
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "warmup_frames": 30,
+    "image_path": null,
+    "save_rgb": true,
+    "enable_crop": true,
+    "crop_left": 80,
+    "crop_top": 0,
+    "crop_width": 480,
+    "crop_height": 480
+  },
+  "action_adapter": {
+    "labels": ["dx", "dy", "dz", "gripper"],
+    "scales": [0.005, 0.005, 0.005, 0.002],
+    "clip_low": [-1.0, -1.0, -1.0, -1.0],
+    "clip_high": [1.0, 1.0, 1.0, 1.0],
+    "gripper_mode": "delta_width",
+    "gripper_binary_threshold": 0.0
+  },
+  "runner": {
+    "steps": 20,
+    "log_dir": "runs",
+    "run_name": "e2e_bundle_real_exported_0711"
+  },
+  "model": {
+    "model_path": "/home/td/franka/checkpoint/exported_0711/exported/policy_actor_e2e_best_agent.pt",
+    "metadata_path": "/home/td/franka/checkpoint/exported_0711/exported/policy_actor_e2e_best_agent.json",
+    "device": "cpu",
+    "history_source": "clipped_action"
+  }
+}
