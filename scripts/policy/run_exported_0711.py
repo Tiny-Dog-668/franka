@@ -15,13 +15,13 @@ from franka_sim2real.e2e_bundle import load_bundle_config, run_bundle_deploy
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "e2e_bundle_real_exported_0711.json"
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(default_config: str | Path = DEFAULT_CONFIG) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the exported_0711 cube-grasp TorchScript policy on Franka."
+        description="Run an exported cube-grasp TorchScript policy on Franka."
     )
     parser.add_argument(
         "--config",
-        default=str(DEFAULT_CONFIG),
+        default=str(default_config),
         help="Deployment config path.",
     )
     parser.add_argument("--robot-ip", help="Override robot_ip from the config.")
@@ -45,8 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(default_config: str | Path = DEFAULT_CONFIG) -> int:
+    args = build_parser(default_config).parse_args()
     config = load_bundle_config(args.config)
 
     if args.robot_ip:
@@ -59,10 +59,18 @@ def main() -> int:
         config.camera.source = "image"
         config.camera.image_path = args.image
 
-    print("Policy: exported_0711 cube-grasp best_agent")
+    metadata = json.loads(Path(config.model.metadata_path).read_text(encoding="utf-8"))
+    print(f"Policy task: {metadata.get('task', 'unknown')}")
+    print(f"Config: {args.config}")
     print(f"Model: {config.model.model_path}")
     print("Model inputs: action_history[4], proprio_obs[15], wrist_rgb[224,224,3]")
     print("Model outputs: [dx, dy, dz, gripper]")
+    print(
+        "History: "
+        f"source={config.model.history_source}, "
+        f"scale={config.model.history_scale}, "
+        f"delay_steps={config.model.history_delay_steps}"
+    )
     if args.preview_only:
         print("Mode: preview only; arm, gripper, and automatic gripper homing are disabled.")
     else:

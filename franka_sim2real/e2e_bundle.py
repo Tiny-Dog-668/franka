@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
+import sys
 import time
+import warnings
+from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +65,26 @@ class BundleModelConfig:
     metadata_path: str = str(BUNDLE_DIR / "policy_actor_e2e.json")
     device: str = "cpu"
     history_source: str = "clipped_action"
+    history_scale: float = 1.0
+    history_delay_steps: int = 1
+
+
+@dataclass
+class BundleInitialStateConfig:
+    enforce: bool = False
+    joint_positions: list[float] | None = None
+    joint_position_tolerance_rad: float = 0.01
+    max_abs_joint_velocity_rad_s: float = 0.02
+    tcp_translation: list[float] | None = None
+    tcp_translation_tolerance_m: float = 0.005
+    tcp_quaternion_xyzw: list[float] | None = None
+    tcp_orientation_tolerance_deg: float = 2.0
+    gripper_width_m: float | None = None
+    gripper_width_tolerance_m: float = 0.002
+    minimum_gripper_max_width_m: float | None = None
+    required_robot_mode: str | None = None
+    require_gripper_not_grasped: bool = False
+    require_no_robot_errors: bool = True
 
 
 @dataclass
@@ -78,6 +103,7 @@ class BundleDeployConfig:
     action_adapter: BundleActionAdapterConfig = field(default_factory=BundleActionAdapterConfig)
     runner: BundleRunnerConfig = field(default_factory=BundleRunnerConfig)
     model: BundleModelConfig = field(default_factory=BundleModelConfig)
+    initial_state: BundleInitialStateConfig = field(default_factory=BundleInitialStateConfig)
     workspace: dict[str, list[float]] = field(
         default_factory=lambda: {
             "minimum": [0.2, -0.3, 0.05],
@@ -92,16 +118,19 @@ class BundleDeployConfig:
         action_adapter = BundleActionAdapterConfig(**data.get("action_adapter", {}))
         runner = BundleRunnerConfig(**data.get("runner", {}))
         model = BundleModelConfig(**data.get("model", {}))
+        initial_state = BundleInitialStateConfig(**data.get("initial_state", {}))
         top_level = dict(data)
         top_level.pop("camera", None)
         top_level.pop("action_adapter", None)
         top_level.pop("runner", None)
         top_level.pop("model", None)
+        top_level.pop("initial_state", None)
         return cls(
             camera=camera,
             action_adapter=action_adapter,
             runner=runner,
             model=model,
+            initial_state=initial_state,
             **top_level,
         )
 
@@ -113,6 +142,281 @@ def load_bundle_config(path: str | Path) -> BundleDeployConfig:
     path = Path(path)
     with path.open("r", encoding="utf-8") as handle:
         return BundleDeployConfig.from_dict(json.load(handle))
+
+
+class ActionHistoryBuffer:
+    """Track policy history with the same scale and delay used during training."""
+
+    VALID_SOURCES = {"raw_action", "clipped_action", "zeros"}
+
+    def __init__(
+        self,
+        history_dim: int,
+        source: str,
+        scale: float = 1.0,
+        delay_steps: int = 1,
+    ) -> None:
+        if isinstance(history_dim, bool) or not isinstance(history_dim, int) or history_dim < 1:
+            raise ValueError("history_dim must be a positive integer")
+        if source not in self.VALID_SOURCES:
+            valid = ", ".join(sorted(self.VALID_SOURCES))
+            raise ValueError(f"model.history_source must be one of: {valid}")
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+            raise ValueError("model.history_scale must be finite and positive")
+        scale = float(scale)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("model.history_scale must be finite and positive")
+        if isinstance(delay_steps, bool) or not isinstance(delay_steps, int) or delay_steps < 1:
+            raise ValueError("model.history_delay_steps must be a positive integer")
+
+        self.history_dim = history_dim
+        self.source = source
+        self.scale = scale
+        self.delay_steps = delay_steps
+        zeros = np.zeros(history_dim, dtype=np.float32)
+        self._queue: deque[np.ndarray] = deque(
+            (zeros.copy() for _ in range(delay_steps)),
+            maxlen=delay_steps,
+        )
+
+    def current(self) -> np.ndarray:
+        return self._queue[0].copy()
+
+    def update(self, raw_action: np.ndarray, clipped_action: np.ndarray) -> None:
+        if self.source == "zeros":
+            candidate = np.zeros(self.history_dim, dtype=np.float32)
+        elif self.source == "raw_action":
+            candidate = np.asarray(raw_action, dtype=np.float32).reshape(-1)
+        else:
+            candidate = np.asarray(clipped_action, dtype=np.float32).reshape(-1)
+
+        if candidate.shape[0] != self.history_dim:
+            raise ValueError(
+                f"Expected history action with {self.history_dim} values, got {candidate.shape[0]}"
+            )
+        if not np.all(np.isfinite(candidate)):
+            raise ValueError("History action contains NaN or Inf")
+        self._queue.append(np.asarray(candidate * self.scale, dtype=np.float32).copy())
+
+
+def _validate_vector(name: str, values: list[float] | None, expected_dim: int) -> np.ndarray | None:
+    if values is None:
+        return None
+    vector = np.asarray(values, dtype=np.float64).reshape(-1)
+    if vector.shape[0] != expected_dim:
+        raise ValueError(f"initial_state.{name} must contain exactly {expected_dim} values")
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(f"initial_state.{name} contains NaN or Inf")
+    return vector
+
+
+def _validate_nonnegative_finite(name: str, value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"initial_state.{name} must be finite and non-negative")
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"initial_state.{name} must be finite and non-negative")
+    return value
+
+
+def _quaternion_error_deg(actual_xyzw: np.ndarray, expected_xyzw: np.ndarray) -> float:
+    actual_norm = float(np.linalg.norm(actual_xyzw))
+    expected_norm = float(np.linalg.norm(expected_xyzw))
+    if actual_norm <= 1e-12 or expected_norm <= 1e-12:
+        raise ValueError("TCP quaternion norm must be non-zero")
+    dot = float(np.dot(actual_xyzw / actual_norm, expected_xyzw / expected_norm))
+    dot = min(1.0, max(-1.0, abs(dot)))
+    return math.degrees(2.0 * math.acos(dot))
+
+
+def evaluate_initial_state(
+    observation: RobotObservation,
+    config: BundleInitialStateConfig,
+) -> dict[str, Any]:
+    """Evaluate the real robot state before opening the camera or running policy inference."""
+
+    expected_joint_positions = _validate_vector("joint_positions", config.joint_positions, 7)
+    expected_tcp_translation = _validate_vector("tcp_translation", config.tcp_translation, 3)
+    expected_tcp_quaternion = _validate_vector("tcp_quaternion_xyzw", config.tcp_quaternion_xyzw, 4)
+    joint_tolerance = _validate_nonnegative_finite(
+        "joint_position_tolerance_rad", config.joint_position_tolerance_rad
+    )
+    velocity_tolerance = _validate_nonnegative_finite(
+        "max_abs_joint_velocity_rad_s", config.max_abs_joint_velocity_rad_s
+    )
+    translation_tolerance = _validate_nonnegative_finite(
+        "tcp_translation_tolerance_m", config.tcp_translation_tolerance_m
+    )
+    orientation_tolerance = _validate_nonnegative_finite(
+        "tcp_orientation_tolerance_deg", config.tcp_orientation_tolerance_deg
+    )
+    gripper_tolerance = _validate_nonnegative_finite(
+        "gripper_width_tolerance_m", config.gripper_width_tolerance_m
+    )
+    if config.gripper_width_m is not None:
+        expected_gripper_width = _validate_nonnegative_finite(
+            "gripper_width_m", config.gripper_width_m
+        )
+    else:
+        expected_gripper_width = None
+    if config.minimum_gripper_max_width_m is not None:
+        minimum_gripper_max_width = _validate_nonnegative_finite(
+            "minimum_gripper_max_width_m", config.minimum_gripper_max_width_m
+        )
+    else:
+        minimum_gripper_max_width = None
+    if config.required_robot_mode is not None and not str(config.required_robot_mode).strip():
+        raise ValueError("initial_state.required_robot_mode must be a non-empty string or null")
+
+    report: dict[str, Any] = {
+        "enforced": bool(config.enforce),
+        "passed": True,
+        "checks": {},
+        "failures": [],
+    }
+
+    def add_check(name: str, passed: bool, details: dict[str, Any], failure: str) -> None:
+        report["checks"][name] = {"passed": bool(passed), **details}
+        if not passed:
+            report["passed"] = False
+            report["failures"].append(failure)
+
+    if config.require_no_robot_errors:
+        current_errors = observation.metadata.get("current_errors", [])
+        passed = not bool(observation.has_errors) and not bool(current_errors)
+        add_check(
+            "robot_errors",
+            passed,
+            {
+                "has_errors": bool(observation.has_errors),
+                "current_errors": current_errors,
+                "last_motion_errors": observation.metadata.get("last_motion_errors", []),
+            },
+            "robot reports an active error",
+        )
+
+    if config.required_robot_mode is not None:
+        actual_mode = str(observation.robot_mode)
+        expected_mode = str(config.required_robot_mode)
+        add_check(
+            "robot_mode",
+            actual_mode == expected_mode,
+            {"actual": actual_mode, "expected": expected_mode},
+            f"robot mode is {actual_mode!r}, expected {expected_mode!r}",
+        )
+
+    actual_joint_positions = _validate_vector("actual_joint_positions", observation.joint_positions, 7)
+    if expected_joint_positions is not None:
+        max_error = float(np.max(np.abs(actual_joint_positions - expected_joint_positions)))
+        add_check(
+            "joint_positions",
+            max_error <= joint_tolerance,
+            {
+                "actual_rad": actual_joint_positions.tolist(),
+                "expected_rad": expected_joint_positions.tolist(),
+                "max_abs_error_rad": max_error,
+                "tolerance_rad": joint_tolerance,
+            },
+            f"joint position max error {max_error:.6f} rad exceeds {joint_tolerance:.6f} rad",
+        )
+
+    actual_joint_velocities = _validate_vector("actual_joint_velocities", observation.joint_velocities, 7)
+    max_velocity = float(np.max(np.abs(actual_joint_velocities)))
+    add_check(
+        "joint_velocities",
+        max_velocity <= velocity_tolerance,
+        {
+            "actual_rad_s": actual_joint_velocities.tolist(),
+            "max_abs_rad_s": max_velocity,
+            "tolerance_rad_s": velocity_tolerance,
+        },
+        f"joint velocity {max_velocity:.6f} rad/s exceeds {velocity_tolerance:.6f} rad/s",
+    )
+
+    actual_tcp_translation = _validate_vector("actual_tcp_translation", observation.tcp_translation, 3)
+    if expected_tcp_translation is not None:
+        translation_error = float(np.linalg.norm(actual_tcp_translation - expected_tcp_translation))
+        add_check(
+            "tcp_translation",
+            translation_error <= translation_tolerance,
+            {
+                "actual_m": actual_tcp_translation.tolist(),
+                "expected_m": expected_tcp_translation.tolist(),
+                "error_norm_m": translation_error,
+                "tolerance_m": translation_tolerance,
+            },
+            f"TCP translation error {translation_error:.6f} m exceeds {translation_tolerance:.6f} m",
+        )
+
+    actual_tcp_quaternion = _validate_vector("actual_tcp_quaternion", observation.tcp_quaternion, 4)
+    if expected_tcp_quaternion is not None:
+        orientation_error = _quaternion_error_deg(actual_tcp_quaternion, expected_tcp_quaternion)
+        add_check(
+            "tcp_orientation",
+            orientation_error <= orientation_tolerance,
+            {
+                "actual_xyzw": actual_tcp_quaternion.tolist(),
+                "expected_xyzw": expected_tcp_quaternion.tolist(),
+                "error_deg": orientation_error,
+                "tolerance_deg": orientation_tolerance,
+            },
+            f"TCP orientation error {orientation_error:.3f} deg exceeds {orientation_tolerance:.3f} deg",
+        )
+
+    if expected_gripper_width is not None:
+        if observation.gripper_width is None:
+            add_check(
+                "gripper_width",
+                False,
+                {
+                    "actual_m": None,
+                    "expected_m": expected_gripper_width,
+                    "tolerance_m": gripper_tolerance,
+                },
+                "gripper width is unavailable",
+            )
+        else:
+            actual_gripper_width = float(observation.gripper_width)
+            gripper_error = abs(actual_gripper_width - expected_gripper_width)
+            add_check(
+                "gripper_width",
+                gripper_error <= gripper_tolerance,
+                {
+                    "actual_m": actual_gripper_width,
+                    "expected_m": expected_gripper_width,
+                    "abs_error_m": gripper_error,
+                    "tolerance_m": gripper_tolerance,
+                },
+                f"gripper width error {gripper_error:.6f} m exceeds {gripper_tolerance:.6f} m",
+            )
+
+    if minimum_gripper_max_width is not None:
+        if observation.gripper_max_width is None:
+            add_check(
+                "gripper_max_width",
+                False,
+                {"actual_m": None, "minimum_m": minimum_gripper_max_width},
+                "gripper maximum width is unavailable",
+            )
+        else:
+            actual_max_width = float(observation.gripper_max_width)
+            add_check(
+                "gripper_max_width",
+                actual_max_width >= minimum_gripper_max_width,
+                {"actual_m": actual_max_width, "minimum_m": minimum_gripper_max_width},
+                f"gripper maximum width {actual_max_width:.6f} m is below {minimum_gripper_max_width:.6f} m",
+            )
+
+    if config.require_gripper_not_grasped:
+        is_grasped = observation.gripper_is_grasped
+        add_check(
+            "gripper_not_grasped",
+            is_grasped is False,
+            {"is_grasped": is_grasped},
+            "gripper grasp state is unavailable or reports an existing grasp",
+        )
+
+    return report
 
 
 def _apply_camera_crop(
@@ -335,6 +639,12 @@ def _validate_bundle_action_dims(bundle: BundleTorchScriptPolicy, config: Bundle
             "model.history_source requires action_history dim to match model output dim, "
             f"got history_dim={bundle.history_dim}, output_dim={bundle.action_dim}"
         )
+    ActionHistoryBuffer(
+        history_dim=bundle.history_dim,
+        source=config.model.history_source,
+        scale=config.model.history_scale,
+        delay_steps=config.model.history_delay_steps,
+    )
 
 
 def clip_policy_action(
@@ -456,6 +766,29 @@ def _make_run_dir(config: BundleDeployConfig) -> Path:
     return run_dir
 
 
+@contextmanager
+def _managed_deploy_resources(env: RealFrankaEnv, camera: Any):
+    """Close the robot environment first and the camera second on every exit path."""
+
+    try:
+        yield
+    finally:
+        active_exception = sys.exc_info()[0] is not None
+        close_errors: list[str] = []
+        for name, resource in (("robot environment", env), ("camera", camera)):
+            try:
+                resource.close()
+            except Exception as exc:  # pragma: no cover - hardware cleanup failure
+                close_errors.append(f"{name}: {exc}")
+
+        if close_errors:
+            message = "Failed to close deployment resources cleanly: " + "; ".join(close_errors)
+            if active_exception:
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
+            else:
+                raise RuntimeError(message)
+
+
 def run_bundle_deploy(
     config: BundleDeployConfig,
     execute_motion: bool = True,
@@ -491,22 +824,59 @@ def run_bundle_deploy(
         device=config.model.device,
     )
     _validate_bundle_action_dims(bundle, config)
-    env = RealFrankaEnv(env_config)
-    camera = _make_camera(
-        config.camera,
-        output_width=bundle.rgb_width,
-        output_height=bundle.rgb_height,
+    action_history_buffer = ActionHistoryBuffer(
+        history_dim=bundle.history_dim,
+        source=config.model.history_source,
+        scale=config.model.history_scale,
+        delay_steps=config.model.history_delay_steps,
     )
 
-    previous_action_history = np.zeros(bundle.history_dim, dtype=np.float32)
-    observation = env.reset()
+    env = RealFrankaEnv(env_config)
+    try:
+        observation = env.reset()
+        initial_state_report = evaluate_initial_state(observation, config.initial_state)
+    except Exception:
+        env.close()
+        raise
+
+    initial_state_report_path = run_dir / "initial_state_check.json"
+    with initial_state_report_path.open("w", encoding="utf-8") as handle:
+        json.dump(initial_state_report, handle, indent=2)
+
+    if config.initial_state.enforce and not initial_state_report["passed"]:
+        env.close()
+        failure_lines = "\n".join(
+            f"  - {failure}" for failure in initial_state_report["failures"]
+        )
+        raise RuntimeError(
+            "Initial-state safety check failed; no policy motion command was sent.\n"
+            f"{failure_lines}\n"
+            "Move the robot and gripper back to the configured policy initial state, then retry.\n"
+            "Suggested command:\n"
+            f"  .venv/bin/python scripts/robot/go_to_zero_pose.py --ip {config.robot_ip} "
+            "--realtime ignore --speed 0.1 --max-step-rad 0.1 --gripper-speed 0.03"
+        )
+
+    try:
+        camera = _make_camera(
+            config.camera,
+            output_width=bundle.rgb_width,
+            output_height=bundle.rgb_height,
+        )
+    except Exception:
+        env.close()
+        raise
+
     desired_gripper_width = observation.gripper_width
     summary: dict[str, Any] = {
         "run_dir": str(run_dir),
+        "initial_state_check": initial_state_report,
         "steps": [],
     }
 
-    with (run_dir / "rollout.jsonl").open("w", encoding="utf-8") as log_file:
+    with _managed_deploy_resources(env, camera), (run_dir / "rollout.jsonl").open(
+        "w", encoding="utf-8"
+    ) as log_file:
         for step_index in range(config.runner.steps):
             step_timing: dict[str, float] = {}
 
@@ -525,7 +895,7 @@ def run_bundle_deploy(
             pack_start = time.perf_counter()
             action_history, proprio = build_bundle_inputs(
                 observation,
-                previous_action_history,
+                action_history_buffer.current(),
                 proprio_dim=bundle.proprio_dim,
                 history_dim=bundle.history_dim,
             )
@@ -631,22 +1001,11 @@ def run_bundle_deploy(
             summary["steps"].append(record)
 
             observation = next_observation
-            if config.model.history_source == "raw_action":
-                previous_action_history = np.asarray(raw_action, dtype=np.float32)
-            elif config.model.history_source == "clipped_action":
-                previous_action_history = clipped_action.astype(np.float32)
-            elif config.model.history_source == "zeros":
-                previous_action_history = np.zeros(bundle.history_dim, dtype=np.float32)
-            else:
-                raise ValueError(
-                    "model.history_source must be one of: raw_action, clipped_action, zeros"
-                )
+            action_history_buffer.update(raw_action, clipped_action)
 
             if done:
                 break
 
-    camera.close()
-    env.close()
     summary["num_steps"] = len(summary["steps"])
     summary["save_step_data"] = save_step_data
     if summary["steps"]:
