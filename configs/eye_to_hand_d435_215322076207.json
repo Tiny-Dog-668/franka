@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "camera": {
+    "serial": "215322076207",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "warmup_frames": 30,
+    "burst_frames": 10
+  },
+  "board": {
+    "inner_corners_columns": 11,
+    "inner_corners_rows": 8,
+    "square_size_m": 0.015
+  },
+  "robot": {
+    "ip": "172.16.0.2",
+    "realtime": "ignore",
+    "speed": 0.2,
+    "settle_time_s": 1.0,
+    "workspace_minimum_m": [0.2, -0.3, 0.05],
+    "workspace_maximum_m": [0.65, 0.3, 0.45],
+    "max_segment_translation_m": 0.01,
+    "max_segment_rotation_deg": 5.0,
+    "tool_envelope_radius_m": 0.22
+  },
+  "quality": {
+    "max_reprojection_rms_px": 0.8,
+    "max_joint_velocity_rad_s": 0.02,
+    "max_capture_tcp_drift_m": 0.0005,
+    "max_capture_tcp_drift_deg": 0.2,
+    "max_target_translation_error_m": 0.01,
+    "max_target_rotation_error_deg": 5.0,
+    "max_gripper_width_drift_m": 0.0005,
+    "consensus_translation_m": 0.005,
+    "consensus_rotation_deg": 1.0,
+    "validation_translation_m": 0.005,
+    "validation_rotation_deg": 1.0,
+    "required_calibration_samples": 25,
+    "required_validation_samples": 5,
+    "minimum_valid_methods": 3
+  }
+}

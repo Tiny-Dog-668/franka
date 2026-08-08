@@ -1,0 +1,25 @@
+{
+  "family": "tag36h11",
+  "id": 0,
+  "tag_size_mm": 40.0,
+  "tag_size_definition": "outer edge of black marker square; excludes white quiet zone",
+  "cut_size_mm": 50.0,
+  "white_margin_each_side_mm": 5.0,
+  "cube_face_mm": 50.0,
+  "print_scale": "Actual size / 100%; disable fit-to-page",
+  "pose_solver_marker_length_m": 0.04,
+  "files": {
+    "apriltag_tag36h11_id0_40mm_cutout.svg": {
+      "sha256": "d6296b97013526b9ff533d612677a6af98d6a1f73f374113de114bc7cdb85106"
+    },
+    "apriltag_tag36h11_id0_40mm_a4.svg": {
+      "sha256": "361d05b8e1503dfa9106534715c33ecda9447ee34d0fd2301cced54550135a31"
+    },
+    "apriltag_tag36h11_id0_40mm_cutout.png": {
+      "sha256": "c9770d6fb978e6db0ecef04a87a254a47ae2b2aefab726250670ad42d0d1ab9c"
+    },
+    "apriltag_tag36h11_id0_40mm_a4.pdf": {
+      "sha256": "515223e5f7d9257bf4ae8b26a2acb30923919ca498697537aadaf9e84b175895"
+    }
+  }
+}
