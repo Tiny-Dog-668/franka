@@ -1,0 +1,156 @@
+{
+  "kind": "tacex_rma_student_torchscript",
+  "version": 6,
+  "student_checkpoint": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment_rma_student/2026-08-02_23-58-22_distillation/checkpoints/student_0100000.pt",
+  "student_checkpoint_sha256": "dfd15c17c22c9e054f0621565c74701644074b7471f58a7709e66439ec2c385e",
+  "teacher_checkpoint": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment_rma_teacher/2026-08-02_22-55-03_ppo_torch_rma_privileged_position/checkpoints/best_agent.pt",
+  "teacher_checkpoint_sha256": "39157b2de316e5f691184e8095532c4334d8c4d32cc0a4434d0a7d6f4f4afd1b",
+  "torchscript_sha256": "4359c78ee94a6ef2beec4963a9d55bd293938e83f614b93650c2b7261e82caa1",
+  "input_signature": {
+    "wrist_rgb": [
+      224,
+      224,
+      3
+    ],
+    "proprio_obs": [
+      15
+    ],
+    "action_history": [
+      4
+    ]
+  },
+  "input_order": [
+    "wrist_rgb",
+    "proprio_obs",
+    "action_history"
+  ],
+  "output_signature": {
+    "mean_actions": [
+      4
+    ]
+  },
+  "actor_mean_bounds": [
+    -1.0,
+    1.0
+  ],
+  "normalization": {
+    "joint_lower": [
+      -2.8973000049591064,
+      -1.7627999782562256,
+      -2.8973000049591064,
+      -3.0717999935150146,
+      -2.8973000049591064,
+      -0.017500000074505806,
+      -2.8973000049591064
+    ],
+    "joint_upper": [
+      2.8973000049591064,
+      1.7627999782562256,
+      2.8973000049591064,
+      -0.0697999969124794,
+      2.8973000049591064,
+      3.752500057220459,
+      2.8973000049591064
+    ],
+    "joint_velocity_scale": [
+      2.174999952316284,
+      2.174999952316284,
+      2.174999952316284,
+      2.174999952316284,
+      2.609999895095825,
+      2.609999895095825,
+      2.609999895095825
+    ],
+    "gripper_width_center_scale": [
+      0.04,
+      0.04
+    ],
+    "history_scale": [
+      0.02500000037252903,
+      0.02500000037252903,
+      0.02500000037252903,
+      0.004999999888241291
+    ],
+    "cube_position_center": [
+      0.5,
+      0.0,
+      0.026000000536441803
+    ],
+    "cube_position_scale": [
+      0.05000000074505806,
+      0.05000000074505806,
+      0.10000000149011612
+    ],
+    "gripper_position_center": [
+      0.5,
+      0.0,
+      0.17499999701976776
+    ],
+    "gripper_position_scale": [
+      0.10000000149011612,
+      0.10000000149011612,
+      0.15000000596046448
+    ],
+    "target_position_center": [
+      0.0,
+      0.0,
+      -0.15000000596046448
+    ],
+    "target_position_scale": [
+      0.10000000149011612,
+      0.10000000149011612,
+      0.15000000596046448
+    ],
+    "position_frame": "robot_root"
+  },
+  "vision_encoder_state_dict_sha256": "20b6b34486948daa294de76dd7da9fb0b7c4dbef2f232010ec1c43dc2175f6d0",
+  "teacher_actor_state_dict_sha256": "fd97a895b5cc16d054dc1ff9d59ced01af1cf9ea1fddf8ab0c19b771cb42f7a6",
+  "actor_contract": {
+    "feature_dim": 30,
+    "feature_order": [
+      "normalized_proprio_obs[15]",
+      "normalized_action_history[4]",
+      "normalized_cube_position_root[3]",
+      "normalized_gripper_position_root_from_fk[3]",
+      "normalized_cube_minus_gripper_position_root[3]",
+      "left_right_cube_finger_contact[2]"
+    ],
+    "object_pose_components": "position_xyz_only",
+    "end_effector_pose_components": "position_xyz_only",
+    "contact_components": "left_right_cube_finger_binary",
+    "kinematics": {
+      "source": "panda_urdf_joint_origins",
+      "joint_order": [
+        "panda_joint1",
+        "panda_joint2",
+        "panda_joint3",
+        "panda_joint4",
+        "panda_joint5",
+        "panda_joint6",
+        "panda_joint7"
+      ],
+      "joint_axis": "local_z",
+      "output": "mean_of_left_and_right_fingertip_centers",
+      "output_frame": "robot_root",
+      "panda_link7_to_link8_m": 0.107,
+      "panda_hand_to_fingertip_midpoint_m": 0.1034
+    }
+  },
+  "trace_max_abs_error": 0.0,
+  "reload_max_abs_error": 0.0,
+  "cuda_validation": {
+    "available": true,
+    "max_abs_error": 1.4901161193847656e-06
+  },
+  "cuda_validation_atol": 0.001,
+  "privileged_inputs": [],
+  "notes": [
+    "wrist_rgb is uint8 RGB in NHWC layout.",
+    "Real input must already use the calibrated crop/resize contract.",
+    "The simulator-only nominal intrinsic compensation is not embedded.",
+    "Fingertip-midpoint XYZ is computed inside the Actor with Panda FK from proprio_obs joint positions.",
+    "Cube and end-effector orientation are not Actor features.",
+    "Left/right cube-finger contact probabilities are predicted from wrist_rgb.",
+    "Load with map_location='cpu' or map_location='cuda:0'; inputs must use the same device."
+  ]
+}

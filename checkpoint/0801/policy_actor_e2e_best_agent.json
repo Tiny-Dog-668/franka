@@ -1,0 +1,452 @@
+{
+  "task": "TacEx-Sim2Real-Cube-Real-Alignment-v0",
+  "checkpoint": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment/2026-07-30_23-17-16_ppo_torch_vision_only_resnet18/checkpoints/best_agent.pt",
+  "checkpoint_sha256": "486df9f857ee10592b105a0336442489830c3c1e7be733fedeb907b43f969df8",
+  "output": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment/2026-07-30_23-17-16_ppo_torch_vision_only_resnet18/checkpoints/exported/policy_actor_e2e_best_agent.pt",
+  "torchscript_sha256": "3c7b28946abcb518caa8c7bd78a3ebdecd9e8a7ff42a8b7070af625306387376",
+  "input_mode": "rgb",
+  "input_signature": {
+    "action_history": [
+      4
+    ],
+    "proprio_obs": [
+      15
+    ],
+    "wrist_rgb": [
+      224,
+      224,
+      3
+    ]
+  },
+  "output_signature": {
+    "mean_actions": [
+      4
+    ]
+  },
+  "action_semantics": [
+    "dx",
+    "dy",
+    "dz",
+    "gripper_total_width_delta"
+  ],
+  "actor_mean_transform": "tanh",
+  "actor_mean_bounds": [
+    -1.0,
+    1.0
+  ],
+  "policy_contract": {
+    "version": 9,
+    "task": "TacEx-Sim2Real-Cube-Real-Alignment-v0",
+    "actor_mean_transform": "tanh",
+    "policy_output_expression": "tanh(actions)",
+    "action_history": "per_dimension_processed_action_no_privileged_gate_v3",
+    "action_history_units": [
+      "m_relative_x",
+      "m_relative_y",
+      "m_relative_z",
+      "m_total_width_delta"
+    ],
+    "deployment_history_source": "clipped_action",
+    "deployment_history_scales": [
+      0.025,
+      0.025,
+      0.025,
+      0.005
+    ],
+    "deployment_history_delay_steps": 1,
+    "action_dim": 4,
+    "action_scale": 0.025,
+    "action_scales": [
+      0.025,
+      0.025,
+      0.025,
+      0.005
+    ],
+    "action_noise_scale": 0.0,
+    "xyz_command_frame": "robot_root",
+    "privileged_dz_gate": "disabled",
+    "gripper_control_mode": "total_width_delta_cached_target",
+    "gripper_width_delta_scale": 0.005,
+    "gripper_width_bounds": [
+      0.0,
+      0.08
+    ],
+    "gripper_width_delta_updates_per_policy_step": 1,
+    "gripper_joint_target_mapping": "symmetric_half_total_width",
+    "gripper_finger_target_increment_per_physics_application_per_processed_unit": null,
+    "gripper_target_reapplications_per_policy_step": 2,
+    "gripper_realized_motion": "cached_total_width_target_is_updated_once_per_policy_step_and_reapplied_each_physics_step",
+    "sim_dt": 0.016666666666666666,
+    "decimation": 2,
+    "nominal_policy_frequency_hz": 30.0,
+    "camera_height": 224,
+    "camera_width": 224,
+    "actor_observation_dims": {
+      "action_history": 4,
+      "proprio_obs": 15,
+      "wrist_resnet": 512
+    },
+    "run_config_sha256": {
+      "agent.yaml": "c08974363ca84b7beb056f2a4e0dad796841ebc8b2f1db3d1b10a5999f7e2b2f",
+      "agent.pkl": "e8b31c03168d1290ec2903dfcf8a9d515db3320a351edd60aa375a732c793af6",
+      "env.yaml": "9c820ba92a75905c1500c9ea764a5064af74dbc6d78dca5e9b96099245931bb9",
+      "env.pkl": "8c9205277e8a70871cafd6a15812cba9c903d13dc12c195020cec4c825cc437b"
+    },
+    "lift_reference_mode": "center_of_mass",
+    "lift_reward_start_delta_m": 0.0,
+    "success_lift_delta_m": 0.035,
+    "lift_reward_requires_upright": false,
+    "success_requires_upright": false,
+    "lift_tilt_curriculum_enabled": false,
+    "lift_tilt_curriculum_start_deg": 40.0,
+    "lift_tilt_curriculum_end_deg": 10.0,
+    "lift_tilt_curriculum_start_step": 0,
+    "lift_tilt_curriculum_end_step": 120000,
+    "lift_tilt_curriculum_step_offset": 0,
+    "arm_ik_tcp_source": "panda_hand_fixed_offset",
+    "arm_ik_tcp_offset_m": [
+      0.0,
+      0.0,
+      0.1034
+    ],
+    "reach_center_source": "mean_of_left_and_right_fingertip_centers",
+    "fingertip_local_offset_m": [
+      0.0,
+      0.0,
+      0.045
+    ],
+    "critic_gripper_position_source": "mean_of_left_and_right_fingertip_centers",
+    "action_gate_center_source": "mean_of_left_and_right_fingertip_centers",
+    "camera_update_period_s": 0.03333333333333333,
+    "nominal_camera_frequency_hz": 30.0,
+    "camera_pose_position_m": [
+      1.172904219177,
+      0.031653013416,
+      0.512212537004
+    ],
+    "camera_pose_quaternion_wxyz": [
+      -0.375287920087,
+      0.60701377471,
+      0.582420741286,
+      -0.389203461533
+    ],
+    "camera_pose_convention": "ros",
+    "camera_raw_resolution_wh": [
+      640,
+      480
+    ],
+    "camera_raw_intrinsic_matrix": [
+      604.8974,
+      0.0,
+      320.980103,
+      0.0,
+      605.085815,
+      247.913223,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "camera_crop_roi_xywh": [
+      100,
+      34,
+      400,
+      398
+    ],
+    "camera_model_intrinsic_matrix": [
+      338.742544,
+      0.0,
+      123.748857,
+      0.0,
+      340.550811,
+      120.393372,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "camera_native_render_intrinsic_matrix": [
+      300.0,
+      0.0,
+      112.0,
+      0.0,
+      300.0,
+      112.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "camera_nominal_intrinsic_compensation_enabled": true,
+    "camera_nominal_intrinsic_compensation_mode": "gpu_affine_grid_centered_square_pixel_render_to_calibrated_k",
+    "camera_resize_interpolation": "bilinear",
+    "deployment_camera_serial": "215322076207",
+    "cube_nominal_xy_m": [
+      0.5,
+      0.0
+    ],
+    "cube_full_xy_bounds_m": [
+      0.45,
+      0.55,
+      -0.05,
+      0.05
+    ],
+    "cube_position_curriculum_enabled": true,
+    "cube_position_curriculum_initial_xy_range_m": [
+      0.02,
+      0.02
+    ],
+    "cube_position_curriculum_start_step": 20000,
+    "cube_position_curriculum_end_step": 100000,
+    "cube_position_curriculum_step_offset": 0,
+    "plate_thickness_m": 0.001,
+    "plate_top_height_m": 0.001,
+    "table_collision_force_threshold_n": 1.0,
+    "table_collision_penalty": -10.0,
+    "table_collision_robot_body_names": [
+      "panda_link1",
+      "panda_link2",
+      "panda_link3",
+      "panda_link4",
+      "panda_link5",
+      "panda_link6",
+      "panda_link7",
+      "panda_hand",
+      "panda_leftfinger",
+      "panda_rightfinger"
+    ],
+    "table_contact_sensor_history_length": 2,
+    "episode_length_s": 5.0,
+    "max_episode_length_steps": 150
+  },
+  "agent_config_source": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment/2026-07-30_23-17-16_ppo_torch_vision_only_resnet18/params/agent.yaml",
+  "env_config_source": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment/2026-07-30_23-17-16_ppo_torch_vision_only_resnet18/params/env.pkl",
+  "action_history_semantics": "per_dimension_processed_action_no_privileged_gate_v3",
+  "nominal_policy_frequency_hz": 30.0,
+  "environment_action_scale": 0.025,
+  "environment_action_scales": [
+    0.025,
+    0.025,
+    0.025,
+    0.005
+  ],
+  "vision_encoder": {
+    "format_version": 1,
+    "architecture": "torchvision.models.resnet18[:-1]",
+    "weights_id": "ResNet18_Weights.IMAGENET1K_V1",
+    "feature_dim": 512,
+    "mode": "eval",
+    "all_parameters_frozen": true,
+    "state_dict_sha256": "daf6ed5401b89c66f0067333321855e5369dfd3c3a47717fbda1c8559d6848c7",
+    "artifact_sha256": "57b392c4e96d28e034c7e6ddc986f1c408a46b1d1e0ab189b4c0a55d00078f7d",
+    "hash_canonicalization": "sorted_key_dtype_shape_raw_bytes_v1",
+    "artifact": "vision_encoder_resnet18.pt",
+    "torch_version": "2.7.0+cu128",
+    "torchvision_version": "0.22.0+cu128",
+    "normalization": {
+      "mean": [
+        0.48500001430511475,
+        0.4560000002384186,
+        0.4059999883174896
+      ],
+      "std": [
+        0.2290000021457672,
+        0.2240000069141388,
+        0.22499999403953552
+      ]
+    },
+    "policy_contract": {
+      "version": 9,
+      "task": "TacEx-Sim2Real-Cube-Real-Alignment-v0",
+      "actor_mean_transform": "tanh",
+      "policy_output_expression": "tanh(actions)",
+      "action_history": "per_dimension_processed_action_no_privileged_gate_v3",
+      "action_history_units": [
+        "m_relative_x",
+        "m_relative_y",
+        "m_relative_z",
+        "m_total_width_delta"
+      ],
+      "deployment_history_source": "clipped_action",
+      "deployment_history_scales": [
+        0.025,
+        0.025,
+        0.025,
+        0.005
+      ],
+      "deployment_history_delay_steps": 1,
+      "action_dim": 4,
+      "action_scale": 0.025,
+      "action_scales": [
+        0.025,
+        0.025,
+        0.025,
+        0.005
+      ],
+      "action_noise_scale": 0.0,
+      "xyz_command_frame": "robot_root",
+      "privileged_dz_gate": "disabled",
+      "gripper_control_mode": "total_width_delta_cached_target",
+      "gripper_width_delta_scale": 0.005,
+      "gripper_width_bounds": [
+        0.0,
+        0.08
+      ],
+      "gripper_width_delta_updates_per_policy_step": 1,
+      "gripper_joint_target_mapping": "symmetric_half_total_width",
+      "gripper_finger_target_increment_per_physics_application_per_processed_unit": null,
+      "gripper_target_reapplications_per_policy_step": 2,
+      "gripper_realized_motion": "cached_total_width_target_is_updated_once_per_policy_step_and_reapplied_each_physics_step",
+      "sim_dt": 0.016666666666666666,
+      "decimation": 2,
+      "nominal_policy_frequency_hz": 30.0,
+      "camera_height": 224,
+      "camera_width": 224,
+      "actor_observation_dims": {
+        "action_history": 4,
+        "proprio_obs": 15,
+        "wrist_resnet": 512
+      },
+      "run_config_sha256": {
+        "agent.yaml": "c08974363ca84b7beb056f2a4e0dad796841ebc8b2f1db3d1b10a5999f7e2b2f",
+        "agent.pkl": "e8b31c03168d1290ec2903dfcf8a9d515db3320a351edd60aa375a732c793af6",
+        "env.yaml": "9c820ba92a75905c1500c9ea764a5064af74dbc6d78dca5e9b96099245931bb9",
+        "env.pkl": "8c9205277e8a70871cafd6a15812cba9c903d13dc12c195020cec4c825cc437b"
+      },
+      "lift_reference_mode": "center_of_mass",
+      "lift_reward_start_delta_m": 0.0,
+      "success_lift_delta_m": 0.035,
+      "lift_reward_requires_upright": false,
+      "success_requires_upright": false,
+      "lift_tilt_curriculum_enabled": false,
+      "lift_tilt_curriculum_start_deg": 40.0,
+      "lift_tilt_curriculum_end_deg": 10.0,
+      "lift_tilt_curriculum_start_step": 0,
+      "lift_tilt_curriculum_end_step": 120000,
+      "lift_tilt_curriculum_step_offset": 0,
+      "arm_ik_tcp_source": "panda_hand_fixed_offset",
+      "arm_ik_tcp_offset_m": [
+        0.0,
+        0.0,
+        0.1034
+      ],
+      "reach_center_source": "mean_of_left_and_right_fingertip_centers",
+      "fingertip_local_offset_m": [
+        0.0,
+        0.0,
+        0.045
+      ],
+      "critic_gripper_position_source": "mean_of_left_and_right_fingertip_centers",
+      "action_gate_center_source": "mean_of_left_and_right_fingertip_centers",
+      "camera_update_period_s": 0.03333333333333333,
+      "nominal_camera_frequency_hz": 30.0,
+      "camera_pose_position_m": [
+        1.172904219177,
+        0.031653013416,
+        0.512212537004
+      ],
+      "camera_pose_quaternion_wxyz": [
+        -0.375287920087,
+        0.60701377471,
+        0.582420741286,
+        -0.389203461533
+      ],
+      "camera_pose_convention": "ros",
+      "camera_raw_resolution_wh": [
+        640,
+        480
+      ],
+      "camera_raw_intrinsic_matrix": [
+        604.8974,
+        0.0,
+        320.980103,
+        0.0,
+        605.085815,
+        247.913223,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "camera_crop_roi_xywh": [
+        100,
+        34,
+        400,
+        398
+      ],
+      "camera_model_intrinsic_matrix": [
+        338.742544,
+        0.0,
+        123.748857,
+        0.0,
+        340.550811,
+        120.393372,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "camera_native_render_intrinsic_matrix": [
+        300.0,
+        0.0,
+        112.0,
+        0.0,
+        300.0,
+        112.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "camera_nominal_intrinsic_compensation_enabled": true,
+      "camera_nominal_intrinsic_compensation_mode": "gpu_affine_grid_centered_square_pixel_render_to_calibrated_k",
+      "camera_resize_interpolation": "bilinear",
+      "deployment_camera_serial": "215322076207",
+      "cube_nominal_xy_m": [
+        0.5,
+        0.0
+      ],
+      "cube_full_xy_bounds_m": [
+        0.45,
+        0.55,
+        -0.05,
+        0.05
+      ],
+      "cube_position_curriculum_enabled": true,
+      "cube_position_curriculum_initial_xy_range_m": [
+        0.02,
+        0.02
+      ],
+      "cube_position_curriculum_start_step": 20000,
+      "cube_position_curriculum_end_step": 100000,
+      "cube_position_curriculum_step_offset": 0,
+      "plate_thickness_m": 0.001,
+      "plate_top_height_m": 0.001,
+      "table_collision_force_threshold_n": 1.0,
+      "table_collision_penalty": -10.0,
+      "table_collision_robot_body_names": [
+        "panda_link1",
+        "panda_link2",
+        "panda_link3",
+        "panda_link4",
+        "panda_link5",
+        "panda_link6",
+        "panda_link7",
+        "panda_hand",
+        "panda_leftfinger",
+        "panda_rightfinger"
+      ],
+      "table_contact_sensor_history_length": 2,
+      "episode_length_s": 5.0,
+      "max_episode_length_steps": 150
+    },
+    "verified": true,
+    "source_artifact": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment/2026-07-30_23-17-16_ppo_torch_vision_only_resnet18/params/vision_encoder_resnet18.pt",
+    "source_manifest": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment/2026-07-30_23-17-16_ppo_torch_vision_only_resnet18/params/vision_encoder_resnet18.json",
+    "embedded_state_dict_sha256": "daf6ed5401b89c66f0067333321855e5369dfd3c3a47717fbda1c8559d6848c7",
+    "embedded": true
+  },
+  "notes": [
+    "Outputs tanh-bounded actor mean actions before environment-side action_scale, IK, and safety gating.",
+    "critic_* privileged observations are internally zero-filled because the actor does not consume them.",
+    "The fourth action is a normalized total-gripper-width delta command; environment/deployment code must apply policy_contract.action_scales per dimension.",
+    "wrist_rgb is expected as uint8 RGB frames in HWC layout.",
+    "The export includes the same frozen ResNet18 ImageNet feature extractor used by the environment."
+  ],
+  "trace_max_abs_err": 0.0,
+  "reload_max_abs_err": 0.0
+}
