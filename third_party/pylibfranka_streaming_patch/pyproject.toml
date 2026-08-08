@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "pybind11>=3.0,<4"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pylibfranka-streaming-patch"
+version = "0.21.1.1"
+description = "Async state-read sidecar for pylibfranka 0.21.1"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["pylibfranka_streaming_patch"]
