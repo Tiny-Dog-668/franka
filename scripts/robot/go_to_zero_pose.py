@@ -37,6 +37,10 @@ TARGET_JOINT_POSITION = [
 SIM_INITIAL_FINGER_JOINT_POSITION = 0.02
 TARGET_GRIPPER_WIDTH = 2.0 * SIM_INITIAL_FINGER_JOINT_POSITION
 
+# This is deliberately a transit-only setting, not the deployment impedance.
+# The policy runner configures its own impedance when streaming starts.
+DEFAULT_TRANSIT_JOINT_IMPEDANCE = [1500.0, 1500.0, 1500.0, 1200.0, 1200.0, 1000.0, 1000.0]
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -68,7 +72,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--settle-time",
         type=float,
         default=0.2,
-        help="Seconds to wait before verifying final joint position and velocity.",
+        help="Minimum seconds to wait before verifying final joint position and velocity.",
+    )
+    parser.add_argument(
+        "--settle-timeout",
+        type=float,
+        default=2.0,
+        help="Maximum seconds to wait for the arm to meet the final-state tolerances.",
+    )
+    parser.add_argument(
+        "--position-tolerance-rad",
+        type=float,
+        default=0.008,
+        help="Required maximum absolute final joint-position error in radians.",
+    )
+    parser.add_argument(
+        "--velocity-tolerance-rad-s",
+        type=float,
+        default=0.02,
+        help="Required maximum absolute final joint velocity in rad/s.",
+    )
+    parser.add_argument(
+        "--transit-joint-impedance",
+        type=float,
+        nargs=7,
+        default=None,
+        metavar=("K1", "K2", "K3", "K4", "K5", "K6", "K7"),
+        help=(
+            "Set a known joint stiffness only while moving to the initial pose. "
+            "Use the printed recommended values after a low-impedance policy run."
+        ),
     )
     parser.add_argument(
         "--realtime",
@@ -98,8 +131,14 @@ def main() -> int:
     if args.max_step_rad <= 0.0:
         print("--max-step-rad must be positive.")
         return 1
-    if args.settle_time < 0.0:
-        print("--settle-time must be non-negative.")
+    if args.settle_time < 0.0 or args.settle_timeout < args.settle_time:
+        print("Require 0 <= --settle-time <= --settle-timeout.")
+        return 1
+    if args.position_tolerance_rad <= 0.0 or args.velocity_tolerance_rad_s <= 0.0:
+        print("Final-state tolerances must be positive.")
+        return 1
+    if args.transit_joint_impedance is not None and any(value <= 0.0 for value in args.transit_joint_impedance):
+        print("--transit-joint-impedance values must all be positive.")
         return 1
 
     realtime_config = (
@@ -118,6 +157,12 @@ def main() -> int:
         )
     print(f"  speed: {args.speed}")
     print(f"  realtime: {args.realtime}")
+    if args.transit_joint_impedance is None:
+        print(
+            "  low-impedance recovery recommendation: "
+            "--transit-joint-impedance "
+            + " ".join(str(int(value)) for value in DEFAULT_TRANSIT_JOINT_IMPEDANCE)
+        )
 
     robot = Robot(args.ip, realtime_config=realtime_config)
     robot.relative_dynamics_factor = args.speed
@@ -149,6 +194,13 @@ def main() -> int:
         print("Robot has an active error; attempting recovery before the confirmed motion.")
         robot.recover_from_errors()
 
+    if args.transit_joint_impedance is not None:
+        robot.set_joint_impedance(args.transit_joint_impedance)
+        print(
+            "Set transit joint impedance [Nm/rad]: "
+            f"{[float(value) for value in args.transit_joint_impedance]}"
+        )
+
     for step_index in range(1, step_count + 1):
         fraction = step_index / full_step_count
         target_q = [
@@ -170,21 +222,41 @@ def main() -> int:
         print("Finished the first staged segment; the full initial pose was not reached.")
         return 0
 
+    deadline = time.monotonic() + args.settle_timeout
     time.sleep(args.settle_time)
-    state = robot.state
-    actual_q = [float(value) for value in state.q]
-    actual_dq = [float(value) for value in state.dq]
-    joint_errors = [
-        actual - target
-        for actual, target in zip(actual_q, TARGET_JOINT_POSITION)
-    ]
+    while True:
+        state = robot.state
+        actual_q = [float(value) for value in state.q]
+        actual_dq = [float(value) for value in state.dq]
+        joint_errors = [
+            actual - target
+            for actual, target in zip(actual_q, TARGET_JOINT_POSITION)
+        ]
+        max_position_error = max(abs(value) for value in joint_errors)
+        max_velocity = max(abs(value) for value in actual_dq)
+        if (
+            max_position_error <= args.position_tolerance_rad
+            and max_velocity <= args.velocity_tolerance_rad_s
+        ):
+            break
+        if time.monotonic() >= deadline:
+            print("Arm trajectory completed, but the actual final state is outside tolerance.")
+            print(f"Max absolute joint position error [rad]: {max_position_error:.9f}")
+            print(f"Max absolute joint velocity [rad/s]: {max_velocity:.9f}")
+            print(
+                "No policy should be started from this state. If this followed a low-impedance "
+                "streaming run, retry with --transit-joint-impedance."
+            )
+            return 2
+        time.sleep(0.02)
+
     pose = robot.current_pose.end_effector_pose
-    print("Arm reached saved policy initial joint pose.")
+    print("Arm reached the saved policy initial joint pose within tolerance.")
     print(f"Actual joint position [rad]: {actual_q}")
     print(f"Joint position error [rad]: {joint_errors}")
     print(f"Actual joint velocity [rad/s]: {actual_dq}")
-    print(f"Max absolute joint position error [rad]: {max(abs(x) for x in joint_errors):.9f}")
-    print(f"Max absolute joint velocity [rad/s]: {max(abs(x) for x in actual_dq):.9f}")
+    print(f"Max absolute joint position error [rad]: {max_position_error:.9f}")
+    print(f"Max absolute joint velocity [rad/s]: {max_velocity:.9f}")
     print(f"Actual TCP translation: {pose.translation.tolist()}")
     print(f"Actual TCP quaternion: {pose.quaternion.tolist()}")
 

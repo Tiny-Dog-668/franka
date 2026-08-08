@@ -12,6 +12,9 @@ import numpy as np
 
 PREVIEW_SIZE = (640, 480)
 WINDOW_NAME = "GelSight Multi Preview"
+SENSOR_WIDTH = 3280
+SENSOR_HEIGHT = 2464
+SENSOR_FPS = 25
 
 
 @dataclass(frozen=True)
@@ -21,12 +24,13 @@ class CameraSpec:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Preview one or more GelSight cameras.")
+    parser = argparse.ArgumentParser(description="Preview one or two GelSight Mini cameras.")
     parser.add_argument(
         "--cams",
         type=int,
         nargs="+",
-        help="Optional manual camera IDs, for example: --cams 4 6 8 10",
+        metavar="CAM",
+        help="Optional manual camera IDs, for example: --cams 4 or --cams 4 6",
     )
     parser.add_argument(
         "--save-dir",
@@ -73,19 +77,26 @@ def discover_gelsight_cameras() -> list[CameraSpec]:
 
 
 def open_camera(cam_id: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(cam_id)
+    cap = cv2.VideoCapture(cam_id, cv2.CAP_V4L2)
     if not cap.isOpened():
         raise RuntimeError(f"[ERROR] 无法打开相机 /dev/video{cam_id}")
 
-    # Some GelSight UVC nodes ignore these requests and keep their native mode.
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    # GelSight Mini exposes one native capture mode: MJPEG 3280x2464 @ 25 FPS.
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, SENSOR_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, SENSOR_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, SENSOR_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     print(f"[INFO] 成功打开相机 /dev/video{cam_id} -> {width}x{height} @ {fps:.2f} FPS")
+    if (width, height) != (SENSOR_WIDTH, SENSOR_HEIGHT):
+        print(
+            f"[WARN] /dev/video{cam_id} 未使用预期分辨率 "
+            f"{SENSOR_WIDTH}x{SENSOR_HEIGHT}"
+        )
     return cap
 
 
@@ -150,6 +161,12 @@ def main() -> int:
         for spec in camera_specs:
             print(f"[INFO]   /dev/video{spec.cam_id} -> {spec.label}")
 
+    if len(camera_specs) not in (1, 2):
+        discovered = " ".join(f"/dev/video{spec.cam_id}" for spec in camera_specs) or "无"
+        raise RuntimeError(
+            f"[ERROR] 需要 1 或 2 个 GelSight 图像流，当前为 {len(camera_specs)} 个: {discovered}"
+        )
+
     caps: list[tuple[CameraSpec, cv2.VideoCapture]] = []
     try:
         for spec in camera_specs:
@@ -171,8 +188,10 @@ def main() -> int:
             previews: list[np.ndarray] = []
             frame_count += 1
 
-            for spec, cap in caps:
-                ret, frame = cap.read()
+            # Trigger all UVC devices before decoding to reduce inter-camera skew.
+            grabbed = [cap.grab() for _, cap in caps]
+            for (spec, cap), was_grabbed in zip(caps, grabbed):
+                ret, frame = cap.retrieve() if was_grabbed else (False, None)
                 if not ret or frame is None:
                     print(f"[WARN] /dev/video{spec.cam_id} 读取失败，显示占位图")
                     previews.append(_make_placeholder(f"/dev/video{spec.cam_id} read failed"))
