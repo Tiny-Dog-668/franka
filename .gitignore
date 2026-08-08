@@ -17,6 +17,7 @@ runs/
 
 # Generated build artifacts and archives
 artifacts/
+dist/
 *.zip
 
 # Large model weights (keep JSON metadata tracked)

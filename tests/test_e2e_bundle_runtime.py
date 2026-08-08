@@ -49,6 +49,23 @@ def make_observation(
 
 
 class ActionHistoryBufferTests(unittest.TestCase):
+    def test_rma_processed_action_history_keeps_physical_units(self) -> None:
+        history = ActionHistoryBuffer(
+            history_dim=4,
+            source="processed_action",
+            scale=[1.0, 1.0, 1.0, 1.0],
+            delay_steps=1,
+            processed_action_scale=[0.05, 0.05, 0.05, 0.01],
+        )
+        executed = np.asarray([0.1, -0.1, 0.05, -0.1], dtype=np.float32)
+        history.update(np.ones(4, dtype=np.float32), executed)
+        np.testing.assert_allclose(
+            history.current(),
+            np.asarray([0.005, -0.005, 0.0025, -0.001], dtype=np.float32),
+            rtol=0.0,
+            atol=1e-8,
+        )
+
     def test_0712_two_step_scaled_clipped_history(self) -> None:
         history = ActionHistoryBuffer(
             history_dim=4,
@@ -77,6 +94,21 @@ class ActionHistoryBufferTests(unittest.TestCase):
         history.update(clipped * 10.0, clipped)
         np.testing.assert_array_equal(history.current(), clipped)
 
+    def test_per_dimension_history_scale(self) -> None:
+        history = ActionHistoryBuffer(
+            4,
+            "clipped_action",
+            scale=[0.05, 0.05, 0.05, 0.01],
+        )
+        clipped = np.asarray([1.0, -1.0, 0.5, -0.25], dtype=np.float32)
+        history.update(clipped * 9.0, clipped)
+        np.testing.assert_allclose(
+            history.current(),
+            np.asarray([0.05, -0.05, 0.025, -0.0025], dtype=np.float32),
+            rtol=0.0,
+            atol=1e-7,
+        )
+
     def test_zeros_mode_stays_zero(self) -> None:
         history = ActionHistoryBuffer(4, "zeros", delay_steps=2)
         history.update(np.ones(4), np.ones(4))
@@ -85,6 +117,9 @@ class ActionHistoryBufferTests(unittest.TestCase):
 
     def test_invalid_history_configuration_is_rejected(self) -> None:
         for scale in (0.0, -0.05, math.nan, math.inf, True, "0.05"):
+            with self.subTest(scale=scale), self.assertRaises(ValueError):
+                ActionHistoryBuffer(4, "clipped_action", scale=scale)
+        for scale in ([0.05] * 3, [0.05, 0.05, 0.05, 0.0]):
             with self.subTest(scale=scale), self.assertRaises(ValueError):
                 ActionHistoryBuffer(4, "clipped_action", scale=scale)
         for delay in (0, -1, 1.5, True):
@@ -164,6 +199,45 @@ class Exported0712ConfigTests(unittest.TestCase):
         self.assertEqual(config.model.history_scale, 1.0)
         self.assertEqual(config.model.history_delay_steps, 1)
         self.assertFalse(config.initial_state.enforce)
+
+
+class Exported0726ConfigTests(unittest.TestCase):
+    def test_0726_config_matches_exported_policy_contract(self) -> None:
+        config = load_bundle_config(REPO_ROOT / "configs/e2e_bundle_real_exported_0726.json")
+        self.assertEqual(config.action_adapter.scales, [0.05, 0.05, 0.05, 0.01])
+        self.assertEqual(config.model.history_source, "clipped_action")
+        self.assertEqual(config.model.history_scale, [0.05, 0.05, 0.05, 0.01])
+        self.assertEqual(config.model.history_delay_steps, 1)
+        self.assertTrue(config.model.enforce_policy_contract)
+        self.assertEqual(config.camera.serial, "215322076207")
+        self.assertEqual(
+            (
+                config.camera.crop_left,
+                config.camera.crop_top,
+                config.camera.crop_width,
+                config.camera.crop_height,
+            ),
+            (80, 0, 480, 480),
+        )
+        self.assertEqual(config.runner.steps, 1)
+        self.assertIn("/checkpoint/0726/exported/", config.model.model_path)
+
+
+class Exported0808GelSightConfigTests(unittest.TestCase):
+    def test_0808_config_enables_the_two_tactile_inputs(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0808_gelsight.json"
+        )
+        self.assertTrue(config.tactile_camera.enabled)
+        self.assertEqual(config.tactile_camera.left_device, 0)
+        self.assertEqual(config.tactile_camera.right_device, 6)
+        self.assertEqual(
+            (config.tactile_camera.width, config.tactile_camera.height),
+            (3280, 2464),
+        )
+        self.assertEqual(config.model.history_source, "processed_action")
+        self.assertEqual(config.action_adapter.scales, [0.05, 0.05, 0.05, 0.01])
+        self.assertIn("/checkpoint/0808/", config.model.model_path)
 
 
 class InitialStateRolloutGateTests(unittest.TestCase):
