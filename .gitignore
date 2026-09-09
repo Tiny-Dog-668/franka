@@ -45,6 +45,8 @@ compile_commands.json
 /runs_old/
 /real_policy_logs/
 /real_rl_logs/
+/real_rlpd_runs/
+/real_rlpd_data/
 /sim_rollout/
 /eval_dataset/
 *.log
@@ -70,8 +72,9 @@ compile_commands.json
 /checkpoints/
 /checkpoint/**/*.ts
 
-# Separate local checkout; add it as a submodule if it becomes a dependency
+# Separate local checkouts; add them as submodules if they become dependencies
 /TacEx/
+/rlpd/
 
 # Local command notes and scratch files
 /order.txt
