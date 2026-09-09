@@ -1,0 +1,162 @@
+{
+  "kind": "tacex_rma_x040_wide_three_frame_direct_action_torchscript",
+  "version": 1,
+  "task": "TacEx-Sim2Real-Cube-Real-Alignment-RMA-X040-Wide-Size-Buckets-Three-Frame-Direct-Action-Student-DR-v0",
+  "student_checkpoint": "/data2/skrl/sim2real_cube_real_alignment_rma_x040_wide_size_buckets_three_frame_direct_action_student/2026-08-12_02-09-40_distillation/checkpoints/student_0100000.pt",
+  "student_checkpoint_sha256": "5aa6113d6d003baed0a93b709e3a7f8ae5b4e6962f3e03e0336802fa6fbea74d",
+  "torchscript_sha256": "4fe54fd09db1375c63ed2776a1344bdac0052d2157b782cca8010f32e5d06fa6",
+  "teacher_checkpoint": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment_rma_x040_wide_size_buckets_teacher/2026-08-11_01-09-58_ppo_torch_rma_privileged_xyz_no_contact_size_buckets_4_6cm/checkpoints/agent_100000.pt",
+  "teacher_checkpoint_sha256": "735b6ab4b1e4260e35eb07c0fbd535807b1fb8d351bffd8443bb8cb478043fec",
+  "input_signature": {
+    "wrist_rgb_history": [
+      3,
+      224,
+      224,
+      3
+    ],
+    "proprio_obs": [
+      15
+    ],
+    "action_history": [
+      4
+    ]
+  },
+  "input_order": [
+    "wrist_rgb_history",
+    "proprio_obs",
+    "action_history"
+  ],
+  "output_signature": {
+    "mean_actions": [
+      4
+    ]
+  },
+  "runtime_privileged_inputs": [],
+  "training_privileged_inputs": {
+    "rma_cube_pos": [
+      3
+    ],
+    "purpose": "Teacher action and fused-visual position MSE labels only; never a runtime input"
+  },
+  "student_environment_contract": {
+    "profile": "rma_x040_wide_xyz_no_contact_size_buckets_v2",
+    "robot_profile": "franka_panda_hand",
+    "action_dim": 4,
+    "action_scales": [
+      0.05,
+      0.05,
+      0.05,
+      0.01
+    ],
+    "gripper_control_mode": "total_width_delta_cached_target",
+    "gripper_actuator": {
+      "effort_limit_sim": 40.0,
+      "stiffness": 400.0,
+      "damping": 40.0
+    },
+    "cube_nominal_position_root_m": [
+      0.4,
+      0.0,
+      0.026
+    ],
+    "cube_reset_half_range_xy_m": [
+      0.08,
+      0.1
+    ],
+    "cube_position_curriculum_enabled": false,
+    "cube_position_curriculum_force_full_range": true,
+    "tcp_table_clearance_min_z_m": 0.011,
+    "tcp_table_clearance_penalty": -10.0,
+    "table_top_height_m": 0.001,
+    "success_terminates_episode": false,
+    "position_frame": "robot_root",
+    "teacher_actor_feature_dim": 28,
+    "teacher_contact_input": "none",
+    "cube_size_buckets_m": [
+      0.04,
+      0.04285714285714286,
+      0.045714285714285714,
+      0.04857142857142857,
+      0.05142857142857143,
+      0.054285714285714284,
+      0.05714285714285715,
+      0.06
+    ],
+    "cube_size_sampling": "uniform_discrete_per_environment_per_reset",
+    "cube_center_z_buckets_root_m": [
+      0.021,
+      0.02242857142857143,
+      0.023857142857142858,
+      0.025285714285714286,
+      0.026714285714285715,
+      0.028142857142857143,
+      0.029571428571428575,
+      0.031
+    ],
+    "arm_joint_reset_noise": {
+      "joint_count": 7,
+      "distribution": "normal_clipped_per_environment_per_reset",
+      "mean_rad": 0.0,
+      "std_rad": 0.01,
+      "clip_abs_rad": 0.03,
+      "finger_joint_noise": "none",
+      "joint_velocity_reset_rad_s": 0.0
+    },
+    "camera_position_delta_max_m": [
+      0.01,
+      0.01,
+      0.01
+    ],
+    "camera_rotation_delta_max_deg": [
+      2.0,
+      2.0,
+      2.0
+    ],
+    "dr_curriculum_enabled": false,
+    "student_base_led": {
+      "subset_path": "panda_link0/visuals/panda_link0/subset_5",
+      "nominal_emissive_color": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "sampling": "per_environment_per_episode_hsv",
+      "hue_deg_range": [
+        105.0,
+        135.0
+      ],
+      "saturation_range": [
+        0.75,
+        1.0
+      ],
+      "value_range": [
+        0.35,
+        1.0
+      ]
+    },
+    "cube_bucket_rendering": {
+      "selection": "selected_bucket_per_environment_per_reset",
+      "inactive_bucket_exclusion": "parked_behind_all_cameras_using_env_x_extent",
+      "usd_visibility_mutation": "none",
+      "parking_strategy": "beyond_positive_x_env_extent_behind_all_cameras",
+      "camera_margin_m": 0.5
+    },
+    "wrist_rgb_history": {
+      "shape": [
+        3,
+        224,
+        224,
+        3
+      ],
+      "dtype": "uint8",
+      "order": "oldest_to_newest",
+      "stride_policy_steps": 1,
+      "policy_frequency_hz": 30,
+      "reset_fill": "repeat_first_post_reset_frame"
+    }
+  },
+  "legacy_appearance_evaluation_only": false,
+  "position_head": "training-only auxiliary output; not in TorchScript signature",
+  "script_max_abs_error": 0.0,
+  "reload_max_abs_error": 0.0
+}

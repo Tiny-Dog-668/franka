@@ -3,25 +3,27 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from franka_sim2real.gelsight_devices import (
+    GelSightDeviceSpec as CameraSpec,
+    discover_gelsight_cameras,
+)
 
 PREVIEW_SIZE = (640, 480)
 WINDOW_NAME = "GelSight Multi Preview"
 SENSOR_WIDTH = 3280
 SENSOR_HEIGHT = 2464
 SENSOR_FPS = 25
-
-
-@dataclass(frozen=True)
-class CameraSpec:
-    cam_id: int
-    label: str
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Preview one or two GelSight Mini cameras.")
@@ -38,43 +40,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory where snapshot images will be saved.",
     )
     return parser
-
-
-def _video_number(video_path: Path) -> int:
-    return int(video_path.name.replace("video", ""))
-
-
-def discover_gelsight_cameras() -> list[CameraSpec]:
-    specs: list[CameraSpec] = []
-    sysfs_root = Path("/sys/class/video4linux")
-    if not sysfs_root.exists():
-        return specs
-
-    for video_path in sorted(sysfs_root.glob("video*"), key=_video_number):
-        name_path = video_path / "name"
-        index_path = video_path / "index"
-        interface_path = video_path / "device" / "interface"
-        if not name_path.exists() or not index_path.exists():
-            continue
-
-        name = name_path.read_text(encoding="utf-8", errors="ignore").strip()
-        if "GelSight" not in name:
-            continue
-
-        index = index_path.read_text(encoding="utf-8", errors="ignore").strip()
-        if index != "0":
-            continue
-
-        label = name
-        if interface_path.exists():
-            interface_name = interface_path.read_text(encoding="utf-8", errors="ignore").strip()
-            if interface_name:
-                label = interface_name
-
-        specs.append(CameraSpec(cam_id=_video_number(video_path), label=label))
-
-    return specs
-
 
 def open_camera(cam_id: int) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(cam_id, cv2.CAP_V4L2)

@@ -1,0 +1,61 @@
+{
+  "kind": "tacex_rma_gelsight_size_buckets_student_torchscript",
+  "version": 1,
+  "student_checkpoint": "/data2/skrl/sim2real_cube_real_alignment_rma_gelsight_size_buckets_student/2026-08-13_20-50-13_distillation/checkpoints/student_10000.pt",
+  "student_checkpoint_sha256": "2851a35c3267772752b95825585f8c90ea85119ca6e7be6ca6ae7eb3c2b3d496",
+  "torchscript_sha256": "59bb41f03b66a41b6aeb0457e700e65fea98e8d48396b84fce922a4c2a65ada2",
+  "input_order": [
+    "wrist_rgb",
+    "proprio_obs",
+    "action_history",
+    "gsmini_left_rgb",
+    "gsmini_right_rgb",
+    "gsmini_left_reference_rgb",
+    "gsmini_right_reference_rgb"
+  ],
+  "input_signature": {
+    "wrist_rgb": [
+      224,
+      224,
+      3
+    ],
+    "proprio_obs": [
+      15
+    ],
+    "action_history": [
+      4
+    ],
+    "gsmini_left_rgb": [
+      96,
+      128,
+      3
+    ],
+    "gsmini_right_rgb": [
+      96,
+      128,
+      3
+    ],
+    "gsmini_left_reference_rgb": [
+      96,
+      128,
+      3
+    ],
+    "gsmini_right_reference_rgb": [
+      96,
+      128,
+      3
+    ]
+  },
+  "output_signature": {
+    "mean_actions": [
+      4
+    ]
+  },
+  "tactile_delta": "signed_float32_current_minus_reference_div_255",
+  "contact_to_actor": "hard_binary_logit_ge_0",
+  "validation": {
+    "cpu_batch_1_max_abs_error": 0.0,
+    "cpu_batch_8_max_abs_error": 0.0
+  },
+  "cuda_validation": true
+}

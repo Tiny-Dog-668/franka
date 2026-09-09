@@ -58,7 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Delay before each headless burst so the cube can settle",
     )
-    parser.add_argument("--output-dir", help="Defaults to runs/TIMESTAMP_cube_pose_dataset")
+    parser.add_argument(
+        "--output-dir",
+        help="Defaults to REPO_ROOT/eval_dataset",
+    )
     return parser
 
 
@@ -102,9 +105,7 @@ def main() -> int:
     output_dir = (
         Path(args.output_dir).expanduser().resolve()
         if args.output_dir
-        else REPO_ROOT
-        / "runs"
-        / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_cube_pose_dataset"
+        else REPO_ROOT / "eval_dataset"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "manifest.csv"

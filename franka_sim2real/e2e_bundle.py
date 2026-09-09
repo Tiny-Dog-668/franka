@@ -20,11 +20,30 @@ from PIL import Image
 
 from .config import Sim2RealConfig
 from .envs.franka_real import RealFrankaEnv
+from .gelsight_devices import select_gelsight_pair
+from .hil import HILSettings
+from .policy_features import extract_actor_features, validate_actor_feature_contract
+from .residual_runtime import ResidualDeploySettings, ResidualPolicyRuntime
+from .real_rl.runtime import RealRLDeploySettings, RealRLPolicyRuntime
 from .safety import apply_safety_limits
 from .types import RobotAction, RobotObservation, print_error_wrench_report
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUNDLE_DIR = REPO_ROOT / "deploy_bundle_e2e"
+
+
+@dataclass(frozen=True)
+class CameraFramePacket:
+    sequence: int
+    capture_timestamp: float
+    camera_timestamp_ms: float | None
+    raw_rgb: np.ndarray
+    policy_rgb: np.ndarray
+
+    @property
+    def host_monotonic_s(self) -> float:
+        """兼容 Real-RL v2 时间戳契约之前的调用方。"""
+        return self.capture_timestamp
 
 
 @dataclass
@@ -35,6 +54,9 @@ class BundleCameraConfig:
     height: int = 480
     fps: int = 30
     warmup_frames: int = 0
+    auto_exposure: bool | None = None
+    exposure: float | None = None
+    gain: float | None = None
     image_path: str | None = None
     save_rgb: bool = True
     enable_crop: bool = True
@@ -47,6 +69,7 @@ class BundleCameraConfig:
 @dataclass
 class BundleTactileCameraConfig:
     enabled: bool = False
+    auto_discover: bool = False
     left_device: int | str = 0
     right_device: int | str = 6
     width: int = 3280
@@ -95,6 +118,10 @@ class BundleModelConfig:
     rma_position_source: str = "vision"
     rma_contact_source: str = "vision"
     rma_oracle_cube_position_root: list[float] | None = None
+    # XY RMA Student v8 在运行时需要左右指尖接触证据。真机夹爪只有一个
+    # grasp 标志，"gripper_is_grasped" 是显式近似：true 映射成
+    # [threshold, threshold]，绝不从腕部 wrench 推断。
+    rma_contact_force_source: str = "unsupported"
 
 
 @dataclass
@@ -105,6 +132,11 @@ class BundleInitialStateConfig:
     max_abs_joint_velocity_rad_s: float = 0.02
     tcp_translation: list[float] | None = None
     tcp_translation_tolerance_m: float = 0.005
+    # O_T_EE reported by libfranka is already O_T_F @ F_T_EE.  Record the
+    # F_T_EE translation independently so a tool swap cannot silently remove
+    # or double the simulation TCP offset.
+    flange_to_tcp_translation_m: list[float] | None = None
+    flange_to_tcp_translation_tolerance_m: float = 0.001
     tcp_quaternion_xyzw: list[float] | None = None
     tcp_orientation_tolerance_deg: float = 2.0
     gripper_width_m: float | None = None
@@ -143,9 +175,16 @@ class BundleStreamingConfig:
     maximum_joint_velocities: list[float] = field(
         default_factory=lambda: [0.655, 0.655, 0.655, 0.655, 1.315, 1.315, 1.315]
     )
-    # None preserves the robot's current Desk-configured joint impedance.
-    # A supplied array is applied once before Robot::control starts.
+    # ``joint`` uses Franka's joint impedance controller. ``cartesian`` uses
+    # its Cartesian impedance controller, whose stiffness axes are the
+    # configured stiffness frame.
+    impedance_mode: str = "joint"
+    # A supplied array is applied once before Robot::control starts in joint
+    # impedance mode. None preserves the Desk-configured value.
     joint_impedance: list[float] | None = None
+    # [Kx, Ky, Kz, Kroll, Kpitch, Kyaw]. Required in Cartesian mode; XYZ is
+    # N/m and rotation is Nm/rad. Kz is element 2.
+    cartesian_impedance: list[float] | None = None
     # None leaves the controller's current collision behavior untouched. When
     # supplied, server9 applies all four arrays before Robot::control starts so
     # the active thresholds are deterministic and auditable in the run config.
@@ -204,6 +243,9 @@ class BundleDeployConfig:
     model: BundleModelConfig = field(default_factory=BundleModelConfig)
     initial_state: BundleInitialStateConfig = field(default_factory=BundleInitialStateConfig)
     streaming: BundleStreamingConfig = field(default_factory=BundleStreamingConfig)
+    # Offset from libfranka's configured EE to the physical tool point that
+    # must remain in the workspace. It is distinct from the nominal O_T_EE.
+    tool_tcp_offset_ee_m: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     workspace: dict[str, list[float]] = field(
         default_factory=lambda: {
             "minimum": [0.2, -0.3, 0.05],
@@ -402,6 +444,10 @@ def evaluate_initial_state(
     translation_tolerance = _validate_nonnegative_finite(
         "tcp_translation_tolerance_m", config.tcp_translation_tolerance_m
     )
+    flange_to_tcp_translation_tolerance = _validate_nonnegative_finite(
+        "flange_to_tcp_translation_tolerance_m",
+        config.flange_to_tcp_translation_tolerance_m,
+    )
     orientation_tolerance = _validate_nonnegative_finite(
         "tcp_orientation_tolerance_deg", config.tcp_orientation_tolerance_deg
     )
@@ -502,6 +548,44 @@ def evaluate_initial_state(
             },
             f"TCP translation error {translation_error:.6f} m exceeds {translation_tolerance:.6f} m",
         )
+
+    expected_flange_to_tcp_translation = _validate_vector(
+        "flange_to_tcp_translation_m", config.flange_to_tcp_translation_m, 3
+    )
+    if expected_flange_to_tcp_translation is not None:
+        actual_flange_to_tcp_translation = _validate_vector(
+            "actual_flange_to_tcp_translation",
+            observation.metadata.get("flange_to_tcp_translation_m"),
+            3,
+        )
+        if actual_flange_to_tcp_translation is None:
+            add_check(
+                "flange_to_tcp_translation",
+                False,
+                {
+                    "actual_m": None,
+                    "expected_m": expected_flange_to_tcp_translation.tolist(),
+                    "tolerance_m": flange_to_tcp_translation_tolerance,
+                },
+                "active flange-to-TCP transform is unavailable",
+            )
+        else:
+            flange_to_tcp_error = float(
+                np.linalg.norm(actual_flange_to_tcp_translation - expected_flange_to_tcp_translation)
+            )
+            add_check(
+                "flange_to_tcp_translation",
+                flange_to_tcp_error <= flange_to_tcp_translation_tolerance,
+                {
+                    "actual_m": actual_flange_to_tcp_translation.tolist(),
+                    "expected_m": expected_flange_to_tcp_translation.tolist(),
+                    "error_norm_m": flange_to_tcp_error,
+                    "tolerance_m": flange_to_tcp_translation_tolerance,
+                },
+                "flange-to-TCP translation error "
+                f"{flange_to_tcp_error:.6f} m exceeds "
+                f"{flange_to_tcp_translation_tolerance:.6f} m",
+            )
 
     actual_tcp_quaternion = _validate_vector("actual_tcp_quaternion", observation.tcp_quaternion, 4)
     if expected_tcp_quaternion is not None:
@@ -657,6 +741,18 @@ class RealSenseRGBCamera:
             profile = self.pipeline.start(self.config)
             self._started = True
             self.color_sensor = profile.get_device().first_color_sensor()
+            stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            intrinsics = stream.get_intrinsics()
+            self.intrinsics = {
+                "width": int(intrinsics.width),
+                "height": int(intrinsics.height),
+                "fx": float(intrinsics.fx),
+                "fy": float(intrinsics.fy),
+                "cx": float(intrinsics.ppx),
+                "cy": float(intrinsics.ppy),
+                "distortion_model": str(intrinsics.model).split(".")[-1],
+                "distortion_coefficients": [float(value) for value in intrinsics.coeffs],
+            }
 
             # Manual values must be set before camera warmup. Otherwise the
             # warmup frames are captured using auto exposure and the image may
@@ -709,18 +805,23 @@ class RealSenseRGBCamera:
             "gain": get_option(self.rs.option.gain),
         }
 
-    def read(self) -> np.ndarray:
+    def read_packet(self) -> tuple[np.ndarray, np.ndarray, float | None]:
         frames = self.pipeline.wait_for_frames()
         color_frame = frames.get_color_frame()
         if not color_frame:
             raise RuntimeError("Failed to capture color frame from RealSense.")
-        rgb = np.asanyarray(color_frame.get_data(), dtype=np.uint8)
-        return _apply_camera_crop(
+        rgb = np.asanyarray(color_frame.get_data(), dtype=np.uint8).copy()
+        policy_rgb = _apply_camera_crop(
             rgb,
             self.camera_config,
             output_width=self.output_width,
             output_height=self.output_height,
         )
+        return rgb, np.array(policy_rgb, dtype=np.uint8, copy=True), float(color_frame.get_timestamp())
+
+    def read(self) -> np.ndarray:
+        _raw, policy_rgb, _timestamp = self.read_packet()
+        return policy_rgb
 
     def close(self) -> None:
         if self._started:
@@ -735,6 +836,8 @@ class LatestFrameCamera:
         self.camera = camera
         self._condition = threading.Condition()
         self._latest: np.ndarray | None = None
+        self._latest_packet: CameraFramePacket | None = None
+        self._sequence = 0
         self._error: BaseException | None = None
         self._closing = False
         self._thread = threading.Thread(
@@ -759,7 +862,13 @@ class LatestFrameCamera:
                 if self._closing:
                     return
             try:
-                frame = self.camera.read()
+                if hasattr(self.camera, "read_packet"):
+                    raw, frame, camera_timestamp_ms = self.camera.read_packet()
+                else:
+                    frame = self.camera.read()
+                    raw = frame
+                    camera_timestamp_ms = None
+                capture_timestamp = time.monotonic()
             except BaseException as exc:
                 with self._condition:
                     if not self._closing:
@@ -770,6 +879,14 @@ class LatestFrameCamera:
                 if self._closing:
                     return
                 self._latest = np.asarray(frame, dtype=np.uint8).copy()
+                self._sequence += 1
+                self._latest_packet = CameraFramePacket(
+                    sequence=self._sequence,
+                    capture_timestamp=capture_timestamp,
+                    camera_timestamp_ms=camera_timestamp_ms,
+                    raw_rgb=np.asarray(raw, dtype=np.uint8).copy(),
+                    policy_rgb=self._latest.copy(),
+                )
                 self._condition.notify_all()
 
     def read(self) -> np.ndarray:
@@ -779,6 +896,60 @@ class LatestFrameCamera:
             if self._latest is None:
                 raise RuntimeError("No RealSense frame is available")
             return self._latest.copy()
+
+    def read_policy_packet(self) -> tuple[np.ndarray, dict[str, Any]]:
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError(f"RealSense capture failed: {self._error}") from self._error
+            if self._latest_packet is None:
+                raise RuntimeError("No RealSense frame packet is available")
+            packet = self._latest_packet
+            return packet.policy_rgb.copy(), {
+                "sequence": packet.sequence,
+                "capture_timestamp": packet.capture_timestamp,
+                "host_monotonic_s": packet.host_monotonic_s,
+                "camera_timestamp_ms": packet.camera_timestamp_ms,
+            }
+
+    def read_policy_packet_with_raw(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        """Return policy and raw pixels from one atomic camera packet."""
+
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError(f"RealSense capture failed: {self._error}") from self._error
+            if self._latest_packet is None:
+                raise RuntimeError("No RealSense frame packet is available")
+            packet = self._latest_packet
+            return packet.policy_rgb.copy(), packet.raw_rgb.copy(), {
+                "sequence": packet.sequence,
+                "capture_timestamp": packet.capture_timestamp,
+                "host_monotonic_s": packet.host_monotonic_s,
+                "camera_timestamp_ms": packet.camera_timestamp_ms,
+                "camera_intrinsics": self.camera_intrinsics(),
+            }
+
+    def read_raw_packet(self) -> CameraFramePacket:
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError(f"RealSense capture failed: {self._error}") from self._error
+            if self._latest_packet is None:
+                raise RuntimeError("No RealSense frame packet is available")
+            packet = self._latest_packet
+            return CameraFramePacket(
+                packet.sequence,
+                packet.capture_timestamp,
+                packet.camera_timestamp_ms,
+                packet.raw_rgb.copy(),
+                packet.policy_rgb.copy(),
+            )
+
+    def camera_intrinsics(self) -> dict[str, Any]:
+        value = getattr(self.camera, "intrinsics", None)
+        if not isinstance(value, dict):
+            raise RuntimeError("RealSense intrinsics are unavailable")
+        return dict(value)
 
     def close(self) -> None:
         with self._condition:
@@ -793,6 +964,30 @@ class LatestFrameCamera:
             raise RuntimeError("RealSense capture thread did not stop")
 
 
+def resolve_gelsight_devices(
+    config: BundleTactileCameraConfig,
+    selector: Any = select_gelsight_pair,
+) -> tuple[int | str, int | str]:
+    """Resolve optional runtime discovery and return the concrete left/right pair."""
+
+    if not isinstance(config.auto_discover, bool):
+        raise ValueError("tactile_camera.auto_discover must be a boolean")
+    if config.auto_discover:
+        left_spec, right_spec = selector()
+        config.left_device = left_spec.cam_id
+        config.right_device = right_spec.cam_id
+        print("Automatically discovered two GelSight primary image streams:")
+        for side, spec in (("left", left_spec), ("right", right_spec)):
+            serial = f", serial={spec.serial}" if spec.serial else ""
+            print(
+                f"  {side}: /dev/video{spec.cam_id} "
+                f"({spec.label}{serial})"
+            )
+    if config.left_device == config.right_device:
+        raise ValueError("tactile_camera left_device and right_device must differ")
+    return config.left_device, config.right_device
+
+
 class GelSightPairCamera:
     """Continuously capture a left/right GelSight pair without blocking policy ticks."""
 
@@ -804,8 +999,7 @@ class GelSightPairCamera:
     ) -> None:
         if left_shape[2] != 3 or right_shape[2] != 3:
             raise ValueError("GelSight model inputs must be HxWx3 RGB images")
-        if config.left_device == config.right_device:
-            raise ValueError("tactile_camera left_device and right_device must differ")
+        left_device, right_device = resolve_gelsight_devices(config)
         if config.warmup_frames < 1:
             raise ValueError("tactile_camera.warmup_frames must be positive")
         if config.first_frame_timeout_s <= 0.0:
@@ -821,14 +1015,18 @@ class GelSightPairCamera:
         self.left_shape = left_shape
         self.right_shape = right_shape
         self._condition = threading.Condition()
+        # OpenCV VideoCapture.release() must never race with grab()/retrieve().
+        # UVC/OpenCV can otherwise segfault in native code while closing a
+        # two-camera GelSight session.
+        self._capture_lock = threading.Lock()
         self._latest: tuple[np.ndarray, np.ndarray] | None = None
         self._error: BaseException | None = None
         self._closing = False
         self._captures: list[Any] = []
         try:
             self._captures = [
-                self._open(config.left_device),
-                self._open(config.right_device),
+                self._open(left_device),
+                self._open(right_device),
             ]
         except Exception:
             for capture in self._captures:
@@ -908,18 +1106,24 @@ class GelSightPairCamera:
                 if self._closing:
                     return
             try:
-                grabbed = [capture.grab() for capture in self._captures]
-                frames: list[np.ndarray] = []
-                for capture, ok in zip(self._captures, grabbed):
-                    retrieved, frame = capture.retrieve() if ok else (False, None)
-                    if not retrieved or frame is None:
-                        raise RuntimeError("failed to retrieve a GelSight frame")
-                    frames.append(frame)
-                pair = (
-                    self._resize_rgb(frames[0], self.left_shape),
-                    self._resize_rgb(frames[1], self.right_shape),
-                )
-                captured_pairs += 1
+                with self._capture_lock:
+                    # ``close`` may have begun while this thread was waiting
+                    # for the capture lock. Never touch released captures.
+                    with self._condition:
+                        if self._closing:
+                            return
+                    grabbed = [capture.grab() for capture in self._captures]
+                    frames: list[np.ndarray] = []
+                    for capture, ok in zip(self._captures, grabbed):
+                        retrieved, frame = capture.retrieve() if ok else (False, None)
+                        if not retrieved or frame is None:
+                            raise RuntimeError("failed to retrieve a GelSight frame")
+                        frames.append(frame)
+                    pair = (
+                        self._resize_rgb(frames[0], self.left_shape),
+                        self._resize_rgb(frames[1], self.right_shape),
+                    )
+                    captured_pairs += 1
             except BaseException as exc:
                 with self._condition:
                     if not self._closing:
@@ -948,8 +1152,18 @@ class GelSightPairCamera:
                 return
             self._closing = True
             self._condition.notify_all()
-        for capture in self._captures:
-            capture.release()
+        # Releasing a VideoCapture while _capture_loop is in grab/retrieve is
+        # an OpenCV native-code use-after-free. If a driver call is stuck, fail
+        # without an unsafe release instead of crashing the Python process.
+        if not self._capture_lock.acquire(timeout=2.0):
+            raise RuntimeError(
+                "Timed out waiting for GelSight capture thread before releasing cameras"
+            )
+        try:
+            for capture in self._captures:
+                capture.release()
+        finally:
+            self._capture_lock.release()
         if threading.current_thread() is not self._thread:
             self._thread.join(timeout=2.0)
             if self._thread.is_alive():
@@ -963,6 +1177,20 @@ class PolicyCameraRig:
 
     def read(self) -> np.ndarray:
         return self.wrist_camera.read()
+
+    def read_policy_packet(self) -> tuple[np.ndarray, dict[str, Any]]:
+        return self.wrist_camera.read_policy_packet()
+
+    def read_policy_packet_with_raw(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        return self.wrist_camera.read_policy_packet_with_raw()
+
+    def read_raw_packet(self) -> CameraFramePacket:
+        return self.wrist_camera.read_raw_packet()
+
+    def camera_intrinsics(self) -> dict[str, Any]:
+        return self.wrist_camera.camera_intrinsics()
 
     def read_tactile(self) -> tuple[np.ndarray, np.ndarray]:
         return self.tactile_camera.read()
@@ -1004,6 +1232,42 @@ class StaticRGBCamera:
         return None
 
 
+class WristRGBHistoryBuffer:
+    """Maintain the exact oldest-to-newest RGB history required by TacEx.
+
+    The three-frame TacEx policies initialise their simulator history by
+    repeating the first post-reset frame.  Doing the same here avoids a
+    synthetic black history at the first two real-robot policy ticks.
+    """
+
+    def __init__(self, frames: int, image_shape: tuple[int, int, int]) -> None:
+        if frames < 1:
+            raise ValueError("wrist RGB history must contain at least one frame")
+        if len(image_shape) != 3 or image_shape[2] != 3:
+            raise ValueError("wrist RGB history image shape must be HxWx3")
+        self.frames = int(frames)
+        self.image_shape = tuple(int(value) for value in image_shape)
+        self._images: deque[np.ndarray] = deque(maxlen=self.frames)
+
+    def update(self, image: np.ndarray) -> np.ndarray:
+        frame = np.asarray(image, dtype=np.uint8)
+        if frame.shape != self.image_shape:
+            raise ValueError(
+                f"Expected RGB frame {self.image_shape}, got {frame.shape}"
+            )
+        frame = np.array(frame, dtype=np.uint8, order="C", copy=True)
+        if not self._images:
+            self._images.extend(frame.copy() for _ in range(self.frames))
+        else:
+            self._images.append(frame)
+        return self.current()
+
+    def current(self) -> np.ndarray:
+        if len(self._images) != self.frames:
+            raise RuntimeError("RGB history is not initialized; call update(frame) first")
+        return np.stack(tuple(self._images), axis=0)
+
+
 class BundleTorchScriptPolicy:
     def __init__(
         self,
@@ -1015,6 +1279,8 @@ class BundleTorchScriptPolicy:
         rma_position_source: str = "vision",
         rma_contact_source: str = "vision",
         rma_oracle_cube_position_root: list[float] | None = None,
+        residual_settings: ResidualDeploySettings | None = None,
+        real_rl_settings: RealRLDeploySettings | None = None,
     ) -> None:
         if torch_num_threads is not None:
             if isinstance(torch_num_threads, bool) or not isinstance(torch_num_threads, int):
@@ -1033,27 +1299,119 @@ class BundleTorchScriptPolicy:
         if optimize_for_inference:
             self.model = torch.jit.optimize_for_inference(self.model)
 
-        signature = self.metadata["input_signature"]
+        signature = dict(self.metadata["input_signature"])
+        declared_input_order = self.metadata.get("input_order", ())
+        tactile_input_names = (
+            "gsmini_left_rgb",
+            "gsmini_right_rgb",
+            "gsmini_left_reference_rgb",
+            "gsmini_right_reference_rgb",
+        )
+        # The first three-frame exporter used a compact ``tactile_rgb`` shape
+        # entry while its TorchScript input_order already named all four camera
+        # tensors. Expand that unambiguous legacy form here. New exports write
+        # the four names directly.
+        if (
+            "tactile_rgb" in signature
+            and all(name in declared_input_order for name in tactile_input_names)
+            and not any(name in signature for name in tactile_input_names)
+        ):
+            tactile_shape = signature["tactile_rgb"]
+            if not isinstance(tactile_shape, list) or len(tactile_shape) != 3:
+                raise ValueError("tactile_rgb must have input signature [H,W,3]")
+            signature.update({name: tactile_shape for name in tactile_input_names})
         output_signature = self.metadata.get("output_signature", {})
         self.history_dim = int(signature["action_history"][0])
         self.proprio_dim = int(signature["proprio_obs"][0])
-        self.rgb_height, self.rgb_width, _ = signature["wrist_rgb"]
+        has_single_rgb = "wrist_rgb" in signature
+        has_rgb_history = "wrist_rgb_history" in signature
+        if has_single_rgb == has_rgb_history:
+            raise ValueError(
+                "TorchScript metadata must provide exactly one of wrist_rgb or wrist_rgb_history"
+            )
+        self.uses_wrist_rgb_history = has_rgb_history
+        self.rgb_history_frames = 1
+        if has_rgb_history:
+            history_shape = tuple(int(value) for value in signature["wrist_rgb_history"])
+            if len(history_shape) != 4 or history_shape[0] < 1 or history_shape[-1] != 3:
+                raise ValueError("wrist_rgb_history must have input signature [T,H,W,3]")
+            self.rgb_history_frames, self.rgb_height, self.rgb_width, _ = history_shape
+            self.rgb_input_name = "wrist_rgb_history"
+        else:
+            rgb_shape = tuple(int(value) for value in signature["wrist_rgb"])
+            if len(rgb_shape) != 3 or rgb_shape[-1] != 3:
+                raise ValueError("wrist_rgb must have input signature [H,W,3]")
+            self.rgb_height, self.rgb_width, _ = rgb_shape
+            self.rgb_input_name = "wrist_rgb"
+        self.rgb_input_shape = (
+            (self.rgb_history_frames, self.rgb_height, self.rgb_width, 3)
+            if self.uses_wrist_rgb_history
+            else (self.rgb_height, self.rgb_width, 3)
+        )
         self.gelsight_input_shapes: dict[str, tuple[int, int, int]] = {}
-        for name in ("gsmini_left_rgb", "gsmini_right_rgb"):
+        gelsight_current_names = ("gsmini_left_rgb", "gsmini_right_rgb")
+        gelsight_reference_names = (
+            "gsmini_left_reference_rgb",
+            "gsmini_right_reference_rgb",
+        )
+        for name in (*gelsight_current_names, *gelsight_reference_names):
             if name in signature:
                 shape = tuple(int(value) for value in signature[name])
                 if len(shape) != 3 or shape[2] != 3:
                     raise ValueError(f"{name} must have an HxWx3 input signature")
                 self.gelsight_input_shapes[name] = shape
-        if len(self.gelsight_input_shapes) not in (0, 2):
+        current_inputs = [name for name in gelsight_current_names if name in signature]
+        reference_inputs = [name for name in gelsight_reference_names if name in signature]
+        if len(current_inputs) not in (0, 2) or len(reference_inputs) not in (0, 2):
             raise ValueError(
-                "TorchScript metadata must provide both gsmini_left_rgb and "
-                "gsmini_right_rgb, or neither"
+                "TorchScript metadata must provide complete left/right GelSight "
+                "current and reference image pairs"
             )
-        self.has_gelsight_inputs = bool(self.gelsight_input_shapes)
+        if reference_inputs and not current_inputs:
+            raise ValueError("GelSight reference inputs require current GelSight inputs")
+        self.has_gelsight_inputs = bool(current_inputs)
+        self.has_gelsight_reference_inputs = bool(reference_inputs)
+        if self.has_gelsight_reference_inputs:
+            for current, reference in zip(gelsight_current_names, gelsight_reference_names):
+                if self.gelsight_input_shapes[current] != self.gelsight_input_shapes[reference]:
+                    raise ValueError(
+                        f"{reference} must have the same shape as {current}"
+                    )
         self.action_dim = int(output_signature.get("mean_actions", [self.history_dim])[0])
         self.kind = str(self.metadata.get("kind", "legacy_e2e_torchscript"))
         self.is_tacex_rma_student = self.kind == "tacex_rma_student_torchscript"
+        self.is_tacex_rma_xy_student = self.kind == "tacex_rma_xy_student_torchscript"
+        self.is_tacex_rma_direct_action_student = (
+            self.kind == "tacex_rma_direct_action_student_torchscript"
+        )
+        self.is_tacex_rma_x040_wide_direct_action_student = (
+            self.kind == "tacex_rma_x040_wide_direct_action_torchscript"
+        )
+        self.is_tacex_rma_x040_wide_three_frame_direct_action_student = (
+            self.kind == "tacex_rma_x040_wide_three_frame_direct_action_torchscript"
+        )
+        self.is_tacex_rma_gelsight_size_buckets_student = (
+            self.kind == "tacex_rma_gelsight_size_buckets_student_torchscript"
+        )
+        self.is_tacex_rma_gelsight_x040_three_frame_student = (
+            self.kind == "tacex_rma_gelsight_x040_dr_three_frame_student_torchscript"
+        )
+        self.contact_force_dim = 0
+        self.contact_force_threshold_n: float | None = None
+        if "contact_force_n" in signature:
+            shape = tuple(int(value) for value in signature["contact_force_n"])
+            if shape != (2,):
+                raise ValueError("contact_force_n must have input signature [2]")
+            threshold = signature.get("contact_force_threshold_n")
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or not math.isfinite(float(threshold))
+                or float(threshold) <= 0.0
+            ):
+                raise ValueError("contact_force_threshold_n must be finite and positive")
+            self.contact_force_dim = 2
+            self.contact_force_threshold_n = float(threshold)
         self.rma_position_source = str(rma_position_source)
         self.rma_contact_source = str(rma_contact_source)
         self.rma_oracle_cube_position_root: tuple[float, float, float] | None = None
@@ -1081,21 +1439,90 @@ class BundleTorchScriptPolicy:
             )
         if override_enabled and not hasattr(self.model, "actor_core"):
             raise ValueError("RMA TorchScript does not expose actor_core for input ablation")
-        default_order = ["action_history", "proprio_obs", "wrist_rgb"]
+        default_order = ["action_history", "proprio_obs", self.rgb_input_name]
         if self.has_gelsight_inputs:
             default_order.extend(["gsmini_left_rgb", "gsmini_right_rgb"])
+        if self.has_gelsight_reference_inputs:
+            default_order.extend(gelsight_reference_names)
+        if self.contact_force_dim:
+            default_order.append("contact_force_n")
         self.input_order = list(self.metadata.get("input_order", default_order))
         if sorted(self.input_order) != sorted(default_order):
             raise ValueError(
                 "TorchScript metadata input_order must contain exactly "
                 + ", ".join(default_order)
             )
-        expected_tacex_order = ["wrist_rgb", "proprio_obs", "action_history"]
+        expected_tacex_order = [self.rgb_input_name, "proprio_obs", "action_history"]
         if self.has_gelsight_inputs:
             expected_tacex_order.extend(["gsmini_left_rgb", "gsmini_right_rgb"])
-        if self.is_tacex_rma_student and self.input_order != expected_tacex_order:
+        if (
+            self.is_tacex_rma_student
+            or self.is_tacex_rma_direct_action_student
+            or self.is_tacex_rma_x040_wide_direct_action_student
+            or self.is_tacex_rma_x040_wide_three_frame_direct_action_student
+        ) and self.input_order != expected_tacex_order:
             raise ValueError(
-                f"TacEx RMA Student requires input_order {expected_tacex_order}"
+                "TacEx RMA Student requires input_order "
+                f"{expected_tacex_order}"
+            )
+        if (
+            self.is_tacex_rma_gelsight_size_buckets_student
+            or self.is_tacex_rma_gelsight_x040_three_frame_student
+        ):
+            expected_reference_order = [
+                self.rgb_input_name,
+                "proprio_obs",
+                "action_history",
+                "gsmini_left_rgb",
+                "gsmini_right_rgb",
+                "gsmini_left_reference_rgb",
+                "gsmini_right_reference_rgb",
+            ]
+            if self.input_order != expected_reference_order:
+                raise ValueError(
+                    "TacEx GelSight reference Student requires input_order "
+                    f"{expected_reference_order}"
+                )
+        if self.is_tacex_rma_xy_student:
+            expected_xy_order = [
+                "wrist_rgb",
+                "proprio_obs",
+                "action_history",
+                "contact_force_n",
+            ]
+            if self.input_order != expected_xy_order:
+                raise ValueError(
+                    f"TacEx RMA XY Student requires input_order {expected_xy_order}"
+                )
+        self.residual_runtime: ResidualPolicyRuntime | None = None
+        self.real_rl_runtime: RealRLPolicyRuntime | None = None
+        if residual_settings is not None and real_rl_settings is not None:
+            raise ValueError("Residual BC and Real-RL are mutually exclusive")
+        if residual_settings is not None:
+            if override_enabled:
+                raise ValueError("Residual BC cannot be combined with RMA input overrides")
+            required_methods = ("encode_visual", "tactile_encoder", "normalizer", "action_head")
+            missing_methods = [name for name in required_methods if not hasattr(self.model, name)]
+            if missing_methods:
+                raise ValueError(
+                    "Base TorchScript does not expose Residual BC feature methods: "
+                    + ", ".join(missing_methods)
+                )
+            self.residual_runtime = ResidualPolicyRuntime(
+                residual_settings,
+                base_model_path=self.model_path,
+                base_kind=self.kind,
+                device=self.device,
+            )
+        if real_rl_settings is not None:
+            if override_enabled:
+                raise ValueError("Real-RL cannot be combined with RMA input overrides")
+            validate_actor_feature_contract(self.model)
+            self.real_rl_runtime = RealRLPolicyRuntime(
+                real_rl_settings,
+                base_model_path=self.model_path,
+                base_kind=self.kind,
+                device=self.device,
             )
 
     def _predict_adaptation(
@@ -1111,6 +1538,132 @@ class BundleTorchScriptPolicy:
             )
         return self.model.predict_adaptation(wrist_rgb)
 
+    def _predict_gelsight_auxiliary(
+        self,
+        wrist_rgb: torch.Tensor,
+        proprio_obs: torch.Tensor,
+        action_history: torch.Tensor,
+        tactile_tensors: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the GelSight export's auxiliary position/contact outputs.
+
+        These outputs are diagnostics only.  The policy action always comes
+        from the regular deployed ``forward`` method, so enabling progress
+        logging cannot alter the command sent to the robot.
+        """
+        if not hasattr(self.model, "forward_with_auxiliary"):
+            raise RuntimeError(
+                "TacEx GelSight export does not expose forward_with_auxiliary"
+            )
+        outputs = self.model.forward_with_auxiliary(
+            wrist_rgb,
+            proprio_obs,
+            action_history,
+            tactile_tensors["gsmini_left_rgb"],
+            tactile_tensors["gsmini_right_rgb"],
+            tactile_tensors["gsmini_left_reference_rgb"],
+            tactile_tensors["gsmini_right_reference_rgb"],
+        )
+        if not isinstance(outputs, tuple) or len(outputs) != 4:
+            raise RuntimeError(
+                "GelSight forward_with_auxiliary returned an unexpected output"
+            )
+        _actions, _normalized_position, contact_logits, _heatmap = outputs
+        if tuple(contact_logits.shape) != (int(wrist_rgb.shape[0]), 2):
+            raise RuntimeError(
+                "Expected GelSight auxiliary contact logits [N,2], got "
+                f"{tuple(contact_logits.shape)}"
+            )
+        return _normalized_position, contact_logits
+
+    def _apply_residual_bc(
+        self,
+        base_action: torch.Tensor,
+        wrist_rgb: torch.Tensor,
+        proprio_obs: torch.Tensor,
+        action_history: torch.Tensor,
+        tactile_tensors: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        runtime = self.residual_runtime
+        if runtime is None:
+            return base_action
+        required_tactile = (
+            "gsmini_left_rgb",
+            "gsmini_right_rgb",
+            "gsmini_left_reference_rgb",
+            "gsmini_right_reference_rgb",
+        )
+        missing = [name for name in required_tactile if name not in tactile_tensors]
+        if missing:
+            raise RuntimeError("Residual BC is missing GelSight inputs: " + ", ".join(missing))
+        actor_features, recomputed_base = extract_actor_features(
+            self.model,
+            wrist_rgb,
+            proprio_obs,
+            action_history,
+            tactile_tensors["gsmini_left_rgb"],
+            tactile_tensors["gsmini_right_rgb"],
+            tactile_tensors["gsmini_left_reference_rgb"],
+            tactile_tensors["gsmini_right_reference_rgb"],
+        )
+        base_error = float(torch.max(torch.abs(recomputed_base - base_action)).item())
+        if base_error > 5e-4:
+            raise RuntimeError(
+                "Residual feature path does not reproduce the base action: "
+                f"max_abs_error={base_error:.6g}"
+            )
+        final, predicted, applied = runtime.apply(actor_features, base_action)
+        self.last_inference_info["residual_bc"] = {
+            "base_action": base_action.detach().cpu().reshape(-1).tolist(),
+            "predicted_residual_xyz": predicted.detach().cpu().reshape(-1).tolist(),
+            "applied_residual_xyz": applied.detach().cpu().reshape(-1).tolist(),
+            "final_action": final.detach().cpu().reshape(-1).tolist(),
+            "scale": float(runtime.settings.scale),
+            "max_abs": float(runtime.settings.max_abs),
+            "model_sha256": runtime.model_sha256,
+            "base_recompute_max_abs_error": base_error,
+        }
+        return final
+
+    def _apply_real_rl(
+        self,
+        base_action: torch.Tensor,
+        wrist_rgb: torch.Tensor,
+        proprio_obs: torch.Tensor,
+        action_history: torch.Tensor,
+        tactile_tensors: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        runtime = self.real_rl_runtime
+        if runtime is None:
+            return base_action
+        required = (
+            "gsmini_left_rgb", "gsmini_right_rgb",
+            "gsmini_left_reference_rgb", "gsmini_right_reference_rgb",
+        )
+        missing = [name for name in required if name not in tactile_tensors]
+        if missing:
+            raise RuntimeError("Real-RL is missing GelSight inputs: " + ", ".join(missing))
+        features, recomputed = extract_actor_features(
+            self.model,
+            wrist_rgb,
+            proprio_obs,
+            action_history,
+            tactile_tensors["gsmini_left_rgb"],
+            tactile_tensors["gsmini_right_rgb"],
+            tactile_tensors["gsmini_left_reference_rgb"],
+            tactile_tensors["gsmini_right_reference_rgb"],
+        )
+        base_error = float(torch.max(torch.abs(recomputed - base_action)).item())
+        if base_error > 5e-4:
+            raise RuntimeError(
+                "Real-RL feature path does not reproduce the base action: "
+                f"max_abs_error={base_error:.6g}"
+            )
+        final, info = runtime.apply(features, base_action)
+        info["base_recompute_max_abs_error"] = base_error
+        self.last_inference_info["real_rl"] = info
+        return final
+
     def predict(
         self,
         action_history: np.ndarray,
@@ -1118,6 +1671,9 @@ class BundleTorchScriptPolicy:
         wrist_rgb: np.ndarray,
         gsmini_left_rgb: np.ndarray | None = None,
         gsmini_right_rgb: np.ndarray | None = None,
+        gsmini_left_reference_rgb: np.ndarray | None = None,
+        gsmini_right_reference_rgb: np.ndarray | None = None,
+        contact_force_n: np.ndarray | None = None,
         *,
         collect_rma_debug: bool = False,
     ) -> np.ndarray:
@@ -1132,6 +1688,12 @@ class BundleTorchScriptPolicy:
             # warns because a tensor created from that buffer could otherwise have
             # undefined behavior if it were ever mutated.
             writable_rgb = np.array(wrist_rgb, dtype=np.uint8, order="C", copy=True)
+            expected_rgb_shape = self.rgb_input_shape
+            if writable_rgb.shape != expected_rgb_shape:
+                raise ValueError(
+                    f"Expected {self.rgb_input_name} shape {expected_rgb_shape}, "
+                    f"got {writable_rgb.shape}"
+                )
             rgb_tensor = torch.as_tensor(
                 writable_rgb, dtype=torch.uint8, device=self.device
             ).unsqueeze(0)
@@ -1139,6 +1701,8 @@ class BundleTorchScriptPolicy:
         tactile_values = {
             "gsmini_left_rgb": gsmini_left_rgb,
             "gsmini_right_rgb": gsmini_right_rgb,
+            "gsmini_left_reference_rgb": gsmini_left_reference_rgb,
+            "gsmini_right_reference_rgb": gsmini_right_reference_rgb,
         }
         for name, shape in self.gelsight_input_shapes.items():
             value = tactile_values[name]
@@ -1150,6 +1714,18 @@ class BundleTorchScriptPolicy:
             tactile_tensors[name] = torch.as_tensor(
                 writable, dtype=torch.uint8, device=self.device
             ).unsqueeze(0)
+        contact_force_tensor: torch.Tensor | None = None
+        if self.contact_force_dim:
+            if contact_force_n is None:
+                raise ValueError("Model requires contact_force_n, but none was supplied")
+            force = np.asarray(contact_force_n, dtype=np.float32).reshape(-1)
+            if force.shape != (self.contact_force_dim,) or not np.all(np.isfinite(force)):
+                raise ValueError(
+                    f"contact_force_n must contain {self.contact_force_dim} finite values"
+                )
+            contact_force_tensor = torch.as_tensor(
+                force, dtype=torch.float32, device=self.device
+            ).unsqueeze(0)
 
         override_enabled = (
             self.rma_position_source != "vision" or self.rma_contact_source != "vision"
@@ -1159,15 +1735,30 @@ class BundleTorchScriptPolicy:
                 tensors = {
                     "action_history": action_tensor,
                     "proprio_obs": proprio_tensor,
-                    "wrist_rgb": rgb_tensor,
+                    self.rgb_input_name: rgb_tensor,
                     **tactile_tensors,
                 }
+                if contact_force_tensor is not None:
+                    tensors["contact_force_n"] = contact_force_tensor
                 output = self.model(*(tensors[name] for name in self.input_order))
                 self.last_inference_info = {
                     "rma_position_source": "vision",
                     "rma_contact_source": "vision",
                     "vision_bypassed": False,
                 } if self.is_tacex_rma_student else {}
+                if self.is_tacex_rma_xy_student:
+                    assert contact_force_tensor is not None
+                    self.last_inference_info = {
+                        "rma_contact_force_n": contact_force_tensor.detach()
+                        .cpu()
+                        .reshape(-1)
+                        .tolist(),
+                        "rma_grasped": bool(
+                            torch.all(
+                                contact_force_tensor >= float(self.contact_force_threshold_n)
+                            ).item()
+                        ),
+                    }
                 if collect_rma_debug and self.is_tacex_rma_student:
                     if not hasattr(self.model, "predict_adaptation"):
                         raise RuntimeError(
@@ -1197,6 +1788,33 @@ class BundleTorchScriptPolicy:
                             .reshape(-1)
                             .tolist(),
                             "contact_state": contact_state.detach().cpu().reshape(-1).tolist(),
+                        }
+                    )
+                elif (
+                    collect_rma_debug
+                    and self.is_tacex_rma_gelsight_size_buckets_student
+                    and hasattr(self.model, "forward_with_auxiliary")
+                ):
+                    assert rgb_tensor is not None
+                    _normalized_position, contact_logits = self._predict_gelsight_auxiliary(
+                        rgb_tensor,
+                        proprio_tensor,
+                        action_tensor,
+                        tactile_tensors,
+                    )
+                    contact_state = torch.sigmoid(contact_logits)
+                    contact_active = contact_logits >= 0.0
+                    self.last_inference_info.update(
+                        {
+                            "contact_state": contact_state.detach()
+                            .cpu()
+                            .reshape(-1)
+                            .tolist(),
+                            "contact_active": contact_active.detach()
+                            .cpu()
+                            .reshape(-1)
+                            .tolist(),
+                            "rma_contact_source": "gelsight_auxiliary_logits",
                         }
                     )
             else:
@@ -1255,6 +1873,54 @@ class BundleTorchScriptPolicy:
                     "vision_bypassed": not needs_vision,
                 }
 
+        if self.is_tacex_rma_gelsight_x040_three_frame_student:
+            if not isinstance(output, tuple) or len(output) != 3:
+                raise RuntimeError(
+                    "TacEx GelSight X040 three-frame Student returned an unexpected output"
+                )
+            action, contact_probability, cube_position_root = output
+            batch = int(action_tensor.shape[0])
+            if (
+                tuple(action.shape) != (batch, 4)
+                or tuple(contact_probability.shape) != (batch, 2)
+                or tuple(cube_position_root.shape) != (batch, 3)
+                or not torch.isfinite(action).all()
+                or not torch.isfinite(contact_probability).all()
+                or not torch.isfinite(cube_position_root).all()
+            ):
+                raise RuntimeError(
+                    "TacEx GelSight X040 three-frame Student output contract is invalid"
+                )
+            if collect_rma_debug:
+                self.last_inference_info = {
+                    "contact_probability": contact_probability.detach()
+                    .cpu()
+                    .reshape(-1)
+                    .tolist(),
+                    "cube_position_root": cube_position_root.detach()
+                    .cpu()
+                    .reshape(-1)
+                    .tolist(),
+                }
+            output = action
+        if self.residual_runtime is not None:
+            assert rgb_tensor is not None
+            output = self._apply_residual_bc(
+                output,
+                rgb_tensor,
+                proprio_tensor,
+                action_tensor,
+                tactile_tensors,
+            )
+        if self.real_rl_runtime is not None:
+            assert rgb_tensor is not None
+            output = self._apply_real_rl(
+                output,
+                rgb_tensor,
+                proprio_tensor,
+                action_tensor,
+                tactile_tensors,
+            )
         output = output.detach().cpu().numpy().reshape(-1)
         return output
 
@@ -1278,6 +1944,37 @@ def build_bundle_inputs(
     if action_history.shape[0] != history_dim:
         raise ValueError(f"Expected action_history with {history_dim} dims, got {action_history.shape[0]}")
     return action_history, proprio
+
+
+def build_rma_contact_force_input(
+    observation: RobotObservation,
+    bundle: BundleTorchScriptPolicy,
+    config: BundleDeployConfig,
+) -> np.ndarray | None:
+    """构造 XY RMA Student 可选的双侧接触力输入。
+
+    真机没有独立的左右指尖力读数。腕部外力包含机械臂/桌面接触，无法区分
+    两根手指，不能替代这里的输入。夹爪标志近似只复现 Actor 的
+    ``双方均 >= threshold`` 二值特征。
+    """
+    if not getattr(bundle, "contact_force_dim", 0):
+        return None
+    source = config.model.rma_contact_force_source
+    if source == "gripper_is_grasped":
+        if observation.gripper_is_grasped is None:
+            raise RuntimeError(
+                "RMA XY contact input requires gripper_is_grasped, but the gripper state "
+                "is unavailable"
+            )
+        assert bundle.contact_force_threshold_n is not None
+        value = bundle.contact_force_threshold_n if observation.gripper_is_grasped else 0.0
+        return np.full(bundle.contact_force_dim, value, dtype=np.float32)
+    if source == "zeros":
+        return np.zeros(bundle.contact_force_dim, dtype=np.float32)
+    raise ValueError(
+        "TacEx RMA XY Student requires model.rma_contact_force_source to be "
+        "'gripper_is_grasped' or 'zeros'"
+    )
 
 
 def _action_adapter_dim(config: BundleDeployConfig) -> int:
@@ -1336,10 +2033,49 @@ def _validate_bundle_action_dims(bundle: BundleTorchScriptPolicy, config: Bundle
         processed_action_scale=config.action_adapter.scales,
     )
     if config.model.enforce_policy_contract:
-        if bundle.is_tacex_rma_student:
+        if bundle.is_tacex_rma_gelsight_x040_three_frame_student:
+            _validate_tacex_rma_gelsight_x040_three_frame_student_contract(
+                bundle, config, history_buffer.scale
+            )
+        elif bundle.is_tacex_rma_gelsight_size_buckets_student:
+            _validate_tacex_rma_gelsight_size_buckets_student_contract(
+                bundle, config, history_buffer.scale
+            )
+        elif bundle.is_tacex_rma_student:
             _validate_tacex_rma_student_contract(bundle, config, history_buffer.scale)
+        elif bundle.is_tacex_rma_xy_student:
+            _validate_tacex_rma_xy_student_contract(bundle, config, history_buffer.scale)
+        elif bundle.is_tacex_rma_direct_action_student:
+            _validate_tacex_rma_direct_action_student_contract(
+                bundle, config, history_buffer.scale
+            )
+        elif bundle.is_tacex_rma_x040_wide_direct_action_student:
+            _validate_tacex_rma_x040_wide_direct_action_student_contract(
+                bundle, config, history_buffer.scale
+            )
+        elif bundle.is_tacex_rma_x040_wide_three_frame_direct_action_student:
+            _validate_tacex_rma_x040_wide_three_frame_direct_action_student_contract(
+                bundle, config, history_buffer.scale
+            )
         else:
             _validate_policy_contract(bundle, config, history_buffer.scale)
+
+
+def reject_evaluation_only_motion(
+    bundle: BundleTorchScriptPolicy, execute_motion: bool
+) -> None:
+    """Do not treat a TacEx evaluation-only export as a real-robot policy."""
+
+    if (
+        execute_motion
+        and getattr(bundle, "is_tacex_rma_x040_wide_three_frame_direct_action_student", False) is True
+        and bundle.metadata.get("legacy_appearance_evaluation_only") is True
+    ):
+        raise ValueError(
+            "This TorchScript export is marked legacy_appearance_evaluation_only by TacEx; "
+            "it may be used with --validate-only or --preview-only, but cannot command "
+            "the real robot. Re-export a deployment-approved checkpoint first."
+        )
 
 
 def _sha256_file(path: Path) -> str:
@@ -1563,7 +2299,762 @@ def _validate_tacex_rma_student_contract(
         raise ValueError("TacEx RMA Student requires calibrated camera crop enabled")
 
 
-def validate_bundle_artifacts(config: BundleDeployConfig) -> dict[str, Any]:
+def _validate_tacex_rma_gelsight_size_buckets_student_contract(
+    bundle: BundleTorchScriptPolicy,
+    config: BundleDeployConfig,
+    history_scale_vector: np.ndarray,
+) -> None:
+    """Fail closed on fixed-size GelSight reference-delta Students."""
+    policy_name = "TacEx GelSight Size-Buckets Reference Student"
+    metadata = bundle.metadata
+    version = metadata.get("version")
+    if version not in (1, 2):
+        raise ValueError(f"{policy_name} deployment requires metadata version 1 or 2")
+    expected_sha256 = metadata.get("torchscript_sha256")
+    if not isinstance(expected_sha256, str) or not expected_sha256:
+        raise ValueError(f"{policy_name} metadata is missing torchscript_sha256")
+    if _sha256_file(bundle.model_path) != expected_sha256:
+        raise ValueError(f"{policy_name} TorchScript SHA-256 does not match metadata")
+    expected_tactile_shapes = {
+        "gsmini_left_rgb": (96, 128, 3),
+        "gsmini_right_rgb": (96, 128, 3),
+        "gsmini_left_reference_rgb": (96, 128, 3),
+        "gsmini_right_reference_rgb": (96, 128, 3),
+    }
+    if (
+        bundle.action_dim != 4
+        or bundle.history_dim != 4
+        or bundle.proprio_dim != 15
+        or bundle.contact_force_dim != 0
+        or bundle.gelsight_input_shapes != expected_tactile_shapes
+        or not bundle.has_gelsight_reference_inputs
+        or bundle.uses_wrist_rgb_history
+        or (bundle.rgb_height, bundle.rgb_width) != (224, 224)
+    ):
+        raise ValueError(
+            f"{policy_name} requires wrist_rgb[224,224,3], proprio_obs[15], "
+            "action_history[4], two current and two reference GelSight inputs, "
+            "and actions[4]"
+        )
+    if metadata.get("input_order") != [
+        "wrist_rgb",
+        "proprio_obs",
+        "action_history",
+        "gsmini_left_rgb",
+        "gsmini_right_rgb",
+        "gsmini_left_reference_rgb",
+        "gsmini_right_reference_rgb",
+    ]:
+        raise ValueError(f"{policy_name} input_order is inconsistent")
+    if metadata.get("tactile_delta") != (
+        "signed_float32_current_minus_reference_div_255"
+    ):
+        raise ValueError(f"{policy_name} tactile-delta convention is inconsistent")
+    if version == 1:
+        if metadata.get("contact_to_actor") != "hard_binary_logit_ge_0":
+            raise ValueError(f"{policy_name} contact-to-Actor convention is inconsistent")
+    else:
+        if metadata.get("contact_to_actor") != (
+            "continuous_tactile_features; logits_are_auxiliary_only"
+        ):
+            raise ValueError(f"{policy_name} v2 contact-to-Actor convention is inconsistent")
+        model_contract = metadata.get("student_model_contract")
+        if not isinstance(model_contract, dict) or (
+            model_contract.get("runtime_input_order") != metadata.get("input_order")
+            or model_contract.get("actor_feature_dim") != 1043
+            or model_contract.get("runtime_privileged_inputs") != []
+        ):
+            raise ValueError(f"{policy_name} v2 Student model contract is inconsistent")
+        deployment_contract = metadata.get("deployment_contract")
+        if not isinstance(deployment_contract, dict):
+            raise ValueError(f"{policy_name} v2 deployment contract is missing")
+        frequency = deployment_contract.get("policy_frequency_hz")
+        episode_length = deployment_contract.get("episode_length_s")
+        max_steps = deployment_contract.get("max_episode_length_steps")
+        if (
+            isinstance(frequency, bool)
+            or not isinstance(frequency, (int, float))
+            or not math.isclose(float(frequency), 30.0, rel_tol=0.0, abs_tol=1e-8)
+            or isinstance(episode_length, bool)
+            or not isinstance(episode_length, (int, float))
+            or not math.isclose(float(episode_length), 5.0, rel_tol=0.0, abs_tol=1e-8)
+            or isinstance(max_steps, bool)
+            or not isinstance(max_steps, int)
+            or max_steps != 150
+        ):
+            raise ValueError(f"{policy_name} v2 deployment step contract is inconsistent")
+    validation = metadata.get("validation")
+    if not isinstance(validation, dict) or any(
+        not isinstance(validation.get(name), (int, float))
+        or not math.isfinite(float(validation[name]))
+        or float(validation[name]) > 1.0e-5
+        for name in ("cpu_batch_1_max_abs_error", "cpu_batch_8_max_abs_error")
+    ):
+        raise ValueError(f"{policy_name} CPU TorchScript validation is invalid")
+    if torch.device(config.model.device).type == "cuda" and metadata.get("cuda_validation") is not True:
+        raise ValueError(f"{policy_name} CUDA deployment requires successful CUDA validation")
+    if not config.tactile_camera.enabled:
+        raise ValueError(f"{policy_name} requires tactile_camera.enabled=true")
+    _validate_tacex_rma_x040_wide_real_runtime(
+        config, history_scale_vector, policy_name
+    )
+
+
+def _validate_tacex_rma_gelsight_x040_three_frame_student_contract(
+    bundle: BundleTorchScriptPolicy,
+    config: BundleDeployConfig,
+    history_scale_vector: np.ndarray,
+) -> None:
+    """Fail closed on supported 0814/0815 X040 three-frame GelSight Students."""
+
+    policy_name = "TacEx GelSight X040 Three-Frame Student"
+    metadata = bundle.metadata
+    if metadata.get("version") != 1:
+        raise ValueError(f"{policy_name} deployment requires metadata version 1")
+    expected_sha256 = metadata.get("torchscript_sha256")
+    if not isinstance(expected_sha256, str) or not expected_sha256:
+        raise ValueError(f"{policy_name} metadata is missing torchscript_sha256")
+    if _sha256_file(bundle.model_path) != expected_sha256:
+        raise ValueError(f"{policy_name} TorchScript SHA-256 does not match metadata")
+    expected_tactile_shapes = {
+        "gsmini_left_rgb": (96, 128, 3),
+        "gsmini_right_rgb": (96, 128, 3),
+        "gsmini_left_reference_rgb": (96, 128, 3),
+        "gsmini_right_reference_rgb": (96, 128, 3),
+    }
+    if (
+        bundle.action_dim != 4
+        or bundle.history_dim != 4
+        or bundle.proprio_dim != 15
+        or bundle.contact_force_dim != 0
+        or bundle.gelsight_input_shapes != expected_tactile_shapes
+        or not bundle.has_gelsight_reference_inputs
+        or not bundle.uses_wrist_rgb_history
+        or bundle.rgb_history_frames != 3
+        or (bundle.rgb_height, bundle.rgb_width) != (224, 224)
+    ):
+        raise ValueError(
+            f"{policy_name} requires wrist_rgb_history[3,224,224,3], "
+            "proprio_obs[15], action_history[4], two current and two reference "
+            "GelSight inputs, and actions[4]"
+        )
+    expected_input_order = [
+        "wrist_rgb_history",
+        "proprio_obs",
+        "action_history",
+        "gsmini_left_rgb",
+        "gsmini_right_rgb",
+        "gsmini_left_reference_rgb",
+        "gsmini_right_reference_rgb",
+    ]
+    if metadata.get("input_order") != expected_input_order:
+        raise ValueError(f"{policy_name} input_order is inconsistent")
+    if metadata.get("output_signature") != {
+        "action": [4],
+        "left_right_contact_probability": [2],
+        "cube_position_root_m": [3],
+    }:
+        raise ValueError(f"{policy_name} output signature is inconsistent")
+    if metadata.get("input_signature", {}).get("tactile_delta") != (
+        "signed_float32_current_minus_reference_div_255"
+    ):
+        raise ValueError(f"{policy_name} tactile-delta convention is inconsistent")
+    model_contract = metadata.get("student_model_contract")
+    if not isinstance(model_contract, dict) or (
+        model_contract.get("runtime_input_order") != expected_input_order
+        or model_contract.get("runtime_output") != metadata.get("output_signature")
+        or model_contract.get("actor_feature_dim") != 1043
+        or model_contract.get("runtime_privileged_inputs") != []
+    ):
+        raise ValueError(f"{policy_name} model contract is inconsistent")
+    model_version = model_contract.get("model_version")
+    if model_version not in (2, 3):
+        raise ValueError(f"{policy_name} model contract version is unsupported")
+    if (
+        model_version == 3
+        and model_contract.get("position_normalization")
+        != "x040_wide_robot_root_xyz"
+    ):
+        raise ValueError(f"{policy_name} v3 position-normalization is inconsistent")
+    validation = metadata.get("validation")
+    if not isinstance(validation, dict):
+        raise ValueError(f"{policy_name} CPU TorchScript validation is missing")
+    for name in ("cpu_batch_1_max_abs_error", "cpu_batch_8_max_abs_error"):
+        values = validation.get(name)
+        if (
+            not isinstance(values, list)
+            or len(values) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) > 1.0e-5
+                for value in values
+            )
+        ):
+            raise ValueError(f"{policy_name} CPU TorchScript validation is invalid")
+    if torch.device(config.model.device).type == "cuda" and metadata.get("cuda_validation") is not True:
+        raise ValueError(f"{policy_name} CUDA deployment requires successful CUDA validation")
+    if not config.tactile_camera.enabled:
+        raise ValueError(f"{policy_name} requires tactile_camera.enabled=true")
+    if config.control_mode == "streaming" and not math.isclose(
+        config.streaming.policy_frequency_hz, 30.0, rel_tol=0.0, abs_tol=1.0e-8
+    ):
+        raise ValueError(f"{policy_name} requires streaming.policy_frequency_hz=30")
+    # The corrected GelSight geometry places the lowest centered fingertip
+    # 0.1613 m along panda_hand +Z. libfranka's configured O_T_EE origin is
+    # already 0.1034 m along the same axis from panda_hand, so the workspace
+    # point must use the remaining 0.0579 m. This offset only changes safety
+    # validation; IK continues to command the configured O_T_EE frame.
+    expected_tool_tcp_offset = np.asarray([0.0, 0.0, 0.0579], dtype=np.float64)
+    configured_tool_tcp_offset = np.asarray(
+        config.tool_tcp_offset_ee_m, dtype=np.float64
+    ).reshape(-1)
+    if (
+        configured_tool_tcp_offset.shape != expected_tool_tcp_offset.shape
+        or not np.allclose(
+            configured_tool_tcp_offset,
+            expected_tool_tcp_offset,
+            rtol=0.0,
+            atol=1.0e-9,
+        )
+    ):
+        raise ValueError(
+            f"{policy_name} requires tool_tcp_offset_ee_m=[0, 0, 0.0579] "
+            "for the corrected 161.3 mm panda_hand-to-lowest-point geometry"
+        )
+    _validate_tacex_rma_x040_wide_real_runtime(
+        config, history_scale_vector, policy_name
+    )
+
+
+def _validate_tacex_rma_direct_action_student_contract(
+    bundle: BundleTorchScriptPolicy,
+    config: BundleDeployConfig,
+    history_scale_vector: np.ndarray,
+) -> None:
+    """对 0809 Direct-Action Visual Student 的部署契约执行失败即拒绝的校验。"""
+    metadata = bundle.metadata
+    if metadata.get("version") != 1:
+        raise ValueError("TacEx RMA Direct-Action Student deployment requires metadata version 1")
+    expected_sha256 = metadata.get("torchscript_sha256")
+    if not isinstance(expected_sha256, str) or not expected_sha256:
+        raise ValueError("TacEx RMA Direct-Action Student metadata is missing torchscript_sha256")
+    actual_sha256 = _sha256_file(bundle.model_path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "TorchScript SHA-256 does not match metadata: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    if torch.device(config.model.device).type == "cuda":
+        cuda_validation = metadata.get("cuda_validation")
+        cuda_validation_atol = metadata.get("cuda_validation_atol")
+        cuda_max_abs_error = (
+            cuda_validation.get("max_abs_error") if isinstance(cuda_validation, dict) else None
+        )
+        if (
+            not isinstance(cuda_validation, dict)
+            or cuda_validation.get("available") is not True
+            or isinstance(cuda_max_abs_error, bool)
+            or not isinstance(cuda_max_abs_error, (int, float))
+            or not math.isfinite(float(cuda_max_abs_error))
+            or float(cuda_max_abs_error) < 0.0
+            or isinstance(cuda_validation_atol, bool)
+            or not isinstance(cuda_validation_atol, (int, float))
+            or not math.isfinite(float(cuda_validation_atol))
+            or float(cuda_validation_atol) <= 0.0
+            or float(cuda_max_abs_error) > float(cuda_validation_atol)
+        ):
+            raise ValueError(
+                "TacEx RMA Direct-Action Student CUDA deployment requires successful "
+                "CUDA validation metadata"
+            )
+    if (
+        bundle.action_dim != 4
+        or bundle.history_dim != 4
+        or bundle.proprio_dim != 15
+        or bundle.contact_force_dim != 0
+    ):
+        raise ValueError(
+            "TacEx RMA Direct-Action Student requires wrist_rgb[224,224,3], "
+            "proprio_obs[15], action_history[4], no contact_force_n, and actions[4]"
+        )
+    if bundle.has_gelsight_inputs:
+        raise ValueError("TacEx RMA Direct-Action Student must not declare GelSight inputs")
+    if (bundle.rgb_height, bundle.rgb_width) != (224, 224):
+        raise ValueError("TacEx RMA Direct-Action Student requires wrist_rgb[224,224,3]")
+    model_contract = metadata.get("model_contract")
+    if not isinstance(model_contract, dict):
+        raise ValueError("TacEx RMA Direct-Action Student metadata is missing model_contract")
+    if (
+        model_contract.get("model_version") != 1
+        or model_contract.get("input_order") != ["wrist_rgb", "proprio_obs", "action_history"]
+        or model_contract.get("input_signature") != metadata.get("input_signature")
+        or model_contract.get("output_signature") != metadata.get("output_signature")
+        or model_contract.get("feature_dim") != 531
+        or model_contract.get("activation") != "ELU_then_tanh"
+    ):
+        raise ValueError("TacEx RMA Direct-Action Student model_contract is inconsistent")
+    if metadata.get("runtime_privileged_inputs") != []:
+        raise ValueError("TacEx RMA Direct-Action Student must not require privileged inputs")
+    if config.model.history_source != "processed_action":
+        raise ValueError(
+            "TacEx RMA Direct-Action Student requires "
+            "model.history_source='processed_action'"
+        )
+    if not np.allclose(history_scale_vector, np.ones(4, dtype=np.float32), rtol=0.0, atol=1e-8):
+        raise ValueError(
+            "TacEx RMA Direct-Action Student history is already in physical units; "
+            "model.history_scale must be [1, 1, 1, 1]"
+        )
+    if config.model.history_delay_steps != 1:
+        raise ValueError(
+            "TacEx RMA Direct-Action Student requires model.history_delay_steps=1"
+        )
+    if config.action_adapter.labels != ["dx", "dy", "dz", "gripper"]:
+        raise ValueError(
+            "TacEx RMA Direct-Action Student requires action labels [dx, dy, dz, gripper]"
+        )
+    expected_action_scales = np.asarray([0.05, 0.05, 0.05, 0.01], dtype=np.float32)
+    configured_action_scales = np.asarray(config.action_adapter.scales, dtype=np.float32).reshape(-1)
+    if (
+        configured_action_scales.shape != expected_action_scales.shape
+        or not np.allclose(
+            configured_action_scales, expected_action_scales, rtol=0.0, atol=1e-8
+        )
+    ):
+        raise ValueError(
+            "TacEx RMA Direct-Action Student requires action scales "
+            "[0.05, 0.05, 0.05, 0.01]"
+        )
+    if (
+        config.action_adapter.clip_low != [-1.0] * 4
+        or config.action_adapter.clip_high != [1.0] * 4
+        or config.action_adapter.gripper_mode != "delta_width"
+    ):
+        raise ValueError(
+            "TacEx RMA Direct-Action Student requires normalized [-1,1] actions "
+            "and delta_width gripper"
+        )
+    camera = config.camera
+    if (
+        camera.width,
+        camera.height,
+        camera.fps,
+        camera.crop_left,
+        camera.crop_top,
+        camera.crop_width,
+        camera.crop_height,
+    ) != (640, 480, 30, 100, 34, 400, 398) or not camera.enable_crop:
+        raise ValueError(
+            "TacEx RMA Direct-Action Student requires D435 640x480@30 crop "
+            "(100,34,400,398)"
+        )
+
+def _validate_tacex_rma_x040_wide_direct_action_student_contract(
+    bundle: BundleTorchScriptPolicy,
+    config: BundleDeployConfig,
+    history_scale_vector: np.ndarray,
+) -> None:
+    """对 X040-Wide 三输入 Direct-Action Student 执行训练契约校验。"""
+    metadata = bundle.metadata
+    policy_name = "TacEx RMA X040-Wide Direct-Action Student"
+    # 0811 size-change exports intentionally use the compact TacEx exporter
+    # metadata.  They have the same real-robot action/camera contract as the
+    # earlier X040-Wide policy but no training-only position-head manifest.
+    if "model_contract" not in metadata:
+        _validate_tacex_rma_x040_wide_compact_contract(
+            bundle, config, history_scale_vector, policy_name
+        )
+        return
+    if metadata.get("version") != 1:
+        raise ValueError(f"{policy_name} deployment requires metadata version 1")
+    expected_sha256 = metadata.get("torchscript_sha256")
+    if not isinstance(expected_sha256, str) or not expected_sha256:
+        raise ValueError(f"{policy_name} metadata is missing torchscript_sha256")
+    actual_sha256 = _sha256_file(bundle.model_path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "TorchScript SHA-256 does not match metadata: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    if torch.device(config.model.device).type == "cuda":
+        cuda_validation = metadata.get("cuda_validation")
+        cuda_validation_atol = metadata.get("cuda_validation_atol")
+        cuda_max_abs_error = (
+            cuda_validation.get("max_abs_error") if isinstance(cuda_validation, dict) else None
+        )
+        if (
+            not isinstance(cuda_validation, dict)
+            or cuda_validation.get("available") is not True
+            or isinstance(cuda_max_abs_error, bool)
+            or not isinstance(cuda_max_abs_error, (int, float))
+            or not math.isfinite(float(cuda_max_abs_error))
+            or float(cuda_max_abs_error) < 0.0
+            or isinstance(cuda_validation_atol, bool)
+            or not isinstance(cuda_validation_atol, (int, float))
+            or not math.isfinite(float(cuda_validation_atol))
+            or float(cuda_validation_atol) <= 0.0
+            or float(cuda_max_abs_error) > float(cuda_validation_atol)
+        ):
+            raise ValueError(
+                f"{policy_name} CUDA deployment requires successful CUDA validation metadata"
+            )
+    if (
+        bundle.action_dim != 4
+        or bundle.history_dim != 4
+        or bundle.proprio_dim != 15
+        or bundle.contact_force_dim != 0
+        or bundle.has_gelsight_inputs
+        or (bundle.rgb_height, bundle.rgb_width) != (224, 224)
+    ):
+        raise ValueError(
+            f"{policy_name} requires wrist_rgb[224,224,3], proprio_obs[15], "
+            "action_history[4], no contact_force_n/GelSight inputs, and actions[4]"
+        )
+    expected_normalization = {
+        "joint_lower": [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
+        "joint_upper": [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
+        "joint_velocity_scale": [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61],
+        "gripper_width_center_scale": [0.04, 0.04],
+        "history_scale": [0.025, 0.025, 0.025, 0.005],
+        "cube_position_center": [0.4, 0.0, 0.026],
+        "cube_position_scale": [0.08, 0.1, 0.1],
+        "gripper_position_center": [0.5, 0.0, 0.175],
+        "gripper_position_scale": [0.1, 0.1, 0.15],
+        "target_position_center": [-0.1, 0.0, -0.149],
+        "target_position_scale": [0.18, 0.1, 0.15],
+        "position_frame": "robot_root",
+    }
+    if metadata.get("normalization") != expected_normalization:
+        raise ValueError(f"{policy_name} normalization contract is inconsistent")
+    model_contract = metadata.get("model_contract")
+    if not isinstance(model_contract, dict) or (
+        model_contract.get("model_version") != 1
+        or model_contract.get("input_order") != ["wrist_rgb", "proprio_obs", "action_history"]
+        or model_contract.get("input_signature") != metadata.get("input_signature")
+        or model_contract.get("output_signature") != metadata.get("output_signature")
+        or model_contract.get("feature_dim") != 531
+        or model_contract.get("training_only_label") != "normalized_cube_position_root[3]"
+        or model_contract.get("activation") != "ELU_then_action_tanh"
+        or model_contract.get("position_head") != [512, 256, 128, 3]
+    ):
+        raise ValueError(f"{policy_name} model_contract is inconsistent")
+    expected_environment = {
+        "profile": "rma_x040_wide_xyz_no_contact_v1",
+        "action_dim": 4,
+        "action_scales": [0.05, 0.05, 0.05, 0.01],
+        "gripper_control_mode": "total_width_delta_cached_target",
+        "cube_nominal_position_root_m": [0.4, 0.0, 0.026],
+        "cube_reset_half_range_xy_m": [0.08, 0.1],
+        "cube_position_curriculum_enabled": False,
+        "cube_position_curriculum_force_full_range": True,
+        "tcp_table_clearance_min_z_m": 0.011,
+        "position_frame": "robot_root",
+        "teacher_actor_feature_dim": 28,
+        "teacher_contact_input": "none",
+    }
+    if metadata.get("environment_contract") != expected_environment:
+        raise ValueError(f"{policy_name} environment contract is inconsistent")
+    expected_initial_joints = np.asarray([
+        -0.3077768694457032, -0.11490349419892411, 0.30181493015057165,
+        -2.2731998141397707, 0.040613268755509774, 2.162421075317457,
+        0.7543247225501507,
+    ], dtype=np.float64)
+    if (
+        not np.allclose(
+            np.asarray(config.initial_state.joint_positions, dtype=np.float64),
+            expected_initial_joints,
+            rtol=0.0,
+            atol=1e-9,
+        )
+        or abs(config.initial_state.gripper_width_m - 0.040001507848501205) > 1e-8
+    ):
+        raise ValueError(f"{policy_name} requires the X040-Wide training initial state")
+    if config.model.history_source != "processed_action":
+        raise ValueError(f"{policy_name} requires model.history_source='processed_action'")
+    if not np.allclose(history_scale_vector, np.ones(4, dtype=np.float32), rtol=0.0, atol=1e-8):
+        raise ValueError(f"{policy_name} requires model.history_scale=[1, 1, 1, 1]")
+    if config.model.history_delay_steps != 1:
+        raise ValueError(f"{policy_name} requires model.history_delay_steps=1")
+    expected_action_scales = np.asarray([0.05, 0.05, 0.05, 0.01], dtype=np.float32)
+    if (
+        config.action_adapter.labels != ["dx", "dy", "dz", "gripper"]
+        or not np.allclose(
+            np.asarray(config.action_adapter.scales, dtype=np.float32).reshape(-1),
+            expected_action_scales,
+            rtol=0.0,
+            atol=1e-8,
+        )
+        or config.action_adapter.clip_low != [-1.0] * 4
+        or config.action_adapter.clip_high != [1.0] * 4
+        or config.action_adapter.gripper_mode != "delta_width"
+    ):
+        raise ValueError(f"{policy_name} action adapter is inconsistent")
+    camera = config.camera
+    if (
+        camera.width,
+        camera.height,
+        camera.fps,
+        camera.crop_left,
+        camera.crop_top,
+        camera.crop_width,
+        camera.crop_height,
+        camera.enable_crop,
+    ) != (640, 480, 30, 100, 34, 400, 398, True):
+        raise ValueError(
+            f"{policy_name} requires D435 640x480@30 crop (100,34,400,398)"
+        )
+    x_min, x_max = 0.32, 0.48
+    y_min, y_max = -0.10, 0.10
+    if (
+        config.workspace["minimum"][0] > x_min
+        or config.workspace["maximum"][0] < x_max
+        or config.workspace["minimum"][1] > y_min
+        or config.workspace["maximum"][1] < y_max
+        or config.workspace["minimum"][2] > 0.026
+        or config.workspace["maximum"][2] < 0.026
+    ):
+        raise ValueError(
+            f"{policy_name} workspace must contain the trained cube reset range "
+            "x=[0.32,0.48], y=[-0.10,0.10], z=0.026"
+        )
+    if metadata.get("runtime_privileged_inputs") != []:
+        raise ValueError(f"{policy_name} must not require runtime privileged inputs")
+
+
+def _validate_tacex_rma_x040_wide_compact_contract(
+    bundle: BundleTorchScriptPolicy,
+    config: BundleDeployConfig,
+    history_scale_vector: np.ndarray,
+    policy_name: str,
+) -> None:
+    """Validate the compact metadata produced by the current TacEx exporters."""
+
+    metadata = bundle.metadata
+    if metadata.get("version") != 1:
+        raise ValueError(f"{policy_name} deployment requires metadata version 1")
+    expected_sha256 = metadata.get("torchscript_sha256")
+    if not isinstance(expected_sha256, str) or not expected_sha256:
+        raise ValueError(f"{policy_name} metadata is missing torchscript_sha256")
+    if _sha256_file(bundle.model_path) != expected_sha256:
+        raise ValueError(f"{policy_name} TorchScript SHA-256 does not match metadata")
+    if (
+        bundle.action_dim != 4
+        or bundle.history_dim != 4
+        or bundle.proprio_dim != 15
+        or bundle.contact_force_dim != 0
+        or bundle.has_gelsight_inputs
+        or bundle.uses_wrist_rgb_history
+        or (bundle.rgb_height, bundle.rgb_width) != (224, 224)
+    ):
+        raise ValueError(
+            f"{policy_name} requires wrist_rgb[224,224,3], proprio_obs[15], "
+            "action_history[4], no auxiliary runtime inputs, and actions[4]"
+        )
+    if metadata.get("input_order") != ["wrist_rgb", "proprio_obs", "action_history"]:
+        raise ValueError(f"{policy_name} input_order is inconsistent")
+    if metadata.get("runtime_privileged_inputs") != []:
+        raise ValueError(f"{policy_name} must not require runtime privileged inputs")
+    _validate_tacex_rma_x040_wide_real_runtime(
+        config, history_scale_vector, policy_name
+    )
+
+
+def _validate_tacex_rma_x040_wide_three_frame_direct_action_student_contract(
+    bundle: BundleTorchScriptPolicy,
+    config: BundleDeployConfig,
+    history_scale_vector: np.ndarray,
+) -> None:
+    """Fail closed on three-frame TacEx visual students before robot motion."""
+
+    policy_name = "TacEx RMA X040-Wide Three-Frame Direct-Action Student"
+    metadata = bundle.metadata
+    if metadata.get("version") != 1:
+        raise ValueError(f"{policy_name} deployment requires metadata version 1")
+    expected_sha256 = metadata.get("torchscript_sha256")
+    if not isinstance(expected_sha256, str) or not expected_sha256:
+        raise ValueError(f"{policy_name} metadata is missing torchscript_sha256")
+    if _sha256_file(bundle.model_path) != expected_sha256:
+        raise ValueError(f"{policy_name} TorchScript SHA-256 does not match metadata")
+    if (
+        bundle.action_dim != 4
+        or bundle.history_dim != 4
+        or bundle.proprio_dim != 15
+        or bundle.contact_force_dim != 0
+        or bundle.has_gelsight_inputs
+        or not bundle.uses_wrist_rgb_history
+        or bundle.rgb_history_frames != 3
+        or (bundle.rgb_height, bundle.rgb_width) != (224, 224)
+    ):
+        raise ValueError(
+            f"{policy_name} requires wrist_rgb_history[3,224,224,3], "
+            "proprio_obs[15], action_history[4], and actions[4]"
+        )
+    if metadata.get("input_order") != [
+        "wrist_rgb_history", "proprio_obs", "action_history"
+    ]:
+        raise ValueError(f"{policy_name} input_order is inconsistent")
+    if metadata.get("runtime_privileged_inputs") != []:
+        raise ValueError(f"{policy_name} must not require runtime privileged inputs")
+    contract = metadata.get("student_environment_contract")
+    if not isinstance(contract, dict):
+        raise ValueError(f"{policy_name} metadata is missing student_environment_contract")
+    if contract.get("action_scales") != [0.05, 0.05, 0.05, 0.01]:
+        raise ValueError(f"{policy_name} action scales are inconsistent")
+    history_contract = contract.get("wrist_rgb_history")
+    if not isinstance(history_contract, dict) or (
+        history_contract.get("shape") != [3, 224, 224, 3]
+        or history_contract.get("order") != "oldest_to_newest"
+        or history_contract.get("stride_policy_steps") != 1
+        or history_contract.get("reset_fill") != "repeat_first_post_reset_frame"
+        or history_contract.get("policy_frequency_hz") != 30
+    ):
+        raise ValueError(f"{policy_name} RGB-history contract is inconsistent")
+    _validate_tacex_rma_x040_wide_real_runtime(
+        config, history_scale_vector, policy_name
+    )
+
+
+def _validate_tacex_rma_x040_wide_real_runtime(
+    config: BundleDeployConfig,
+    history_scale_vector: np.ndarray,
+    policy_name: str,
+) -> None:
+    """The deployment values shared by current X040-Wide TacEx policies."""
+
+    expected_initial_joints = np.asarray([
+        -0.3077768694457032, -0.11490349419892411, 0.30181493015057165,
+        -2.2731998141397707, 0.040613268755509774, 2.162421075317457,
+        0.7543247225501507,
+    ], dtype=np.float64)
+    if (
+        not np.allclose(np.asarray(config.initial_state.joint_positions, dtype=np.float64),
+                        expected_initial_joints, rtol=0.0, atol=1e-9)
+        or abs(config.initial_state.gripper_width_m - 0.040001507848501205) > 1e-8
+    ):
+        raise ValueError(f"{policy_name} requires the X040-Wide training initial state")
+    if config.model.history_source != "processed_action":
+        raise ValueError(f"{policy_name} requires model.history_source='processed_action'")
+    if not np.allclose(history_scale_vector, np.ones(4, dtype=np.float32), rtol=0.0, atol=1e-8):
+        raise ValueError(f"{policy_name} requires model.history_scale=[1, 1, 1, 1]")
+    if config.model.history_delay_steps != 1:
+        raise ValueError(f"{policy_name} requires model.history_delay_steps=1")
+    if (
+        config.action_adapter.labels != ["dx", "dy", "dz", "gripper"]
+        or not np.allclose(np.asarray(config.action_adapter.scales, dtype=np.float32),
+                           [0.05, 0.05, 0.05, 0.01], rtol=0.0, atol=1e-8)
+        or config.action_adapter.clip_low != [-1.0] * 4
+        or config.action_adapter.clip_high != [1.0] * 4
+        or config.action_adapter.gripper_mode != "delta_width"
+    ):
+        raise ValueError(f"{policy_name} action adapter is inconsistent")
+    camera = config.camera
+    if (camera.width, camera.height, camera.fps, camera.crop_left, camera.crop_top,
+        camera.crop_width, camera.crop_height, camera.enable_crop) != (640, 480, 30, 100, 34, 400, 398, True):
+        raise ValueError(f"{policy_name} requires D435 640x480@30 crop (100,34,400,398)")
+
+
+def _validate_tacex_rma_xy_student_contract(
+    bundle: BundleTorchScriptPolicy,
+    config: BundleDeployConfig,
+    history_scale_vector: np.ndarray,
+) -> None:
+    """对 0809 XY Visual Student 的部署契约执行失败即拒绝的校验。"""
+    metadata = bundle.metadata
+    if metadata.get("version") != 8:
+        raise ValueError("TacEx RMA XY Student deployment requires metadata version 8")
+    cuda_validation = metadata.get("cuda_validation")
+    cuda_validation_atol = metadata.get("cuda_validation_atol")
+    cuda_max_abs_error = cuda_validation.get("max_abs_error") if isinstance(cuda_validation, dict) else None
+    if (
+        not isinstance(cuda_validation, dict)
+        or cuda_validation.get("available") is not True
+        or isinstance(cuda_max_abs_error, bool)
+        or not isinstance(cuda_max_abs_error, (int, float))
+        or not math.isfinite(float(cuda_max_abs_error))
+        or float(cuda_max_abs_error) < 0.0
+        or isinstance(cuda_validation_atol, bool)
+        or not isinstance(cuda_validation_atol, (int, float))
+        or not math.isfinite(float(cuda_validation_atol))
+        or float(cuda_validation_atol) <= 0.0
+        or float(cuda_max_abs_error) > float(cuda_validation_atol)
+    ):
+        raise ValueError("TacEx RMA XY Student metadata has invalid CUDA validation")
+    expected_sha256 = metadata.get("torchscript_sha256")
+    if not isinstance(expected_sha256, str) or not expected_sha256:
+        raise ValueError("TacEx RMA XY Student metadata is missing torchscript_sha256")
+    actual_sha256 = _sha256_file(bundle.model_path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "TorchScript SHA-256 does not match metadata: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    if (
+        bundle.action_dim != 4
+        or bundle.history_dim != 4
+        or bundle.proprio_dim != 15
+        or bundle.contact_force_dim != 2
+        or bundle.contact_force_threshold_n != 1.0
+    ):
+        raise ValueError(
+            "TacEx RMA XY Student requires action_history[4], proprio_obs[15], "
+            "contact_force_n[2] at 1 N, and actions[4]"
+        )
+    if bundle.has_gelsight_inputs:
+        raise ValueError("TacEx RMA XY Student must not declare GelSight inputs")
+    if (bundle.rgb_height, bundle.rgb_width) != (224, 224):
+        raise ValueError("TacEx RMA XY Student requires wrist_rgb[224,224,3]")
+    if config.model.rma_contact_force_source not in {"gripper_is_grasped", "zeros"}:
+        raise ValueError(
+            "TacEx RMA XY Student requires model.rma_contact_force_source to be "
+            "'gripper_is_grasped' or 'zeros'"
+        )
+    if config.model.history_source != "processed_action":
+        raise ValueError("TacEx RMA XY Student requires model.history_source='processed_action'")
+    if not np.allclose(history_scale_vector, np.ones(4, dtype=np.float32), rtol=0.0, atol=1e-8):
+        raise ValueError(
+            "TacEx RMA XY Student history is already in physical units; "
+            "model.history_scale must be [1, 1, 1, 1]"
+        )
+    if config.model.history_delay_steps != 1:
+        raise ValueError("TacEx RMA XY Student requires model.history_delay_steps=1")
+    if config.action_adapter.labels != ["dx", "dy", "dz", "gripper"]:
+        raise ValueError("TacEx RMA XY Student requires action labels [dx, dy, dz, gripper]")
+    expected_action_scales = np.asarray([0.05, 0.05, 0.05, 0.01], dtype=np.float32)
+    if not np.allclose(
+        np.asarray(config.action_adapter.scales, dtype=np.float32).reshape(-1),
+        expected_action_scales,
+        rtol=0.0,
+        atol=1e-8,
+    ):
+        raise ValueError("TacEx RMA XY Student requires action scales [0.05, 0.05, 0.05, 0.01]")
+    if (
+        config.action_adapter.clip_low != [-1.0] * 4
+        or config.action_adapter.clip_high != [1.0] * 4
+        or config.action_adapter.gripper_mode != "delta_width"
+    ):
+        raise ValueError(
+            "TacEx RMA XY Student requires normalized [-1,1] actions and delta_width gripper"
+        )
+    camera = config.camera
+    if (
+        camera.width,
+        camera.height,
+        camera.fps,
+        camera.crop_left,
+        camera.crop_top,
+        camera.crop_width,
+        camera.crop_height,
+    ) != (640, 480, 30, 100, 34, 400, 398) or not camera.enable_crop:
+        raise ValueError("TacEx RMA XY Student requires D435 640x480@30 crop (100,34,400,398)")
+
+
+def validate_bundle_artifacts(
+    config: BundleDeployConfig,
+    residual_settings: ResidualDeploySettings | None = None,
+    real_rl_settings: RealRLDeploySettings | None = None,
+) -> dict[str, Any]:
     """Validate and exercise a bundle without connecting to robot or camera hardware."""
     bundle = BundleTorchScriptPolicy(
         model_path=config.model.model_path,
@@ -1574,6 +3065,8 @@ def validate_bundle_artifacts(config: BundleDeployConfig) -> dict[str, Any]:
         rma_position_source=config.model.rma_position_source,
         rma_contact_source=config.model.rma_contact_source,
         rma_oracle_cube_position_root=config.model.rma_oracle_cube_position_root,
+        residual_settings=residual_settings,
+        real_rl_settings=real_rl_settings,
     )
     _validate_bundle_action_dims(bundle, config)
     streaming_report: dict[str, Any] | None = None
@@ -1586,20 +3079,25 @@ def validate_bundle_artifacts(config: BundleDeployConfig) -> dict[str, Any]:
 
     action_history = np.zeros(bundle.history_dim, dtype=np.float32)
     proprio = np.zeros(bundle.proprio_dim, dtype=np.float32)
-    wrist_rgb = np.zeros(
-        (bundle.rgb_height, bundle.rgb_width, 3),
-        dtype=np.uint8,
-    )
+    wrist_rgb = np.zeros(bundle.rgb_input_shape, dtype=np.uint8)
     tactile_zeros = {
         name: np.zeros(shape, dtype=np.uint8)
         for name, shape in bundle.gelsight_input_shapes.items()
     }
+    contact_force_zeros = (
+        np.zeros(bundle.contact_force_dim, dtype=np.float32)
+        if bundle.contact_force_dim
+        else None
+    )
     output = bundle.predict(
         action_history,
         proprio,
         wrist_rgb,
         tactile_zeros.get("gsmini_left_rgb"),
         tactile_zeros.get("gsmini_right_rgb"),
+        tactile_zeros.get("gsmini_left_reference_rgb"),
+        tactile_zeros.get("gsmini_right_reference_rgb"),
+        contact_force_zeros,
     )
     if output.shape != (bundle.action_dim,):
         raise ValueError(
@@ -1616,17 +3114,35 @@ def validate_bundle_artifacts(config: BundleDeployConfig) -> dict[str, Any]:
         "input_signature": {
             "action_history": [bundle.history_dim],
             "proprio_obs": [bundle.proprio_dim],
-            "wrist_rgb": [bundle.rgb_height, bundle.rgb_width, 3],
+            bundle.rgb_input_name: list(bundle.rgb_input_shape),
             **{
                 name: list(shape)
                 for name, shape in bundle.gelsight_input_shapes.items()
             },
+            **({"contact_force_n": [bundle.contact_force_dim]} if bundle.contact_force_dim else {}),
         },
         "output_signature": {"mean_actions": [bundle.action_dim]},
         "smoke_test_output": output.tolist(),
         "rma_actor_input": dict(bundle.last_inference_info),
+        "rgb_history": {
+            "frames": bundle.rgb_history_frames,
+            "order": "oldest_to_newest" if bundle.uses_wrist_rgb_history else None,
+        },
+        "rma_contact_force_source": (
+            config.model.rma_contact_force_source if bundle.contact_force_dim else None
+        ),
         "policy_contract_enforced": config.model.enforce_policy_contract,
         "streaming_contract": streaming_report,
+        "residual_bc": (
+            None
+            if bundle.residual_runtime is None
+            else bundle.residual_runtime.report()
+        ),
+        "real_rl": (
+            None
+            if bundle.real_rl_runtime is None
+            else bundle.real_rl_runtime.report()
+        ),
     }
 
 
@@ -1725,13 +3241,21 @@ def _make_camera(
     gelsight_input_shapes: dict[str, tuple[int, int, int]] | None = None,
 ):
     if camera_config.source == "realsense":
-        wrist_camera = LatestFrameCamera(
-            RealSenseRGBCamera(
-                camera_config,
-                output_width=output_width,
-                output_height=output_height,
-            )
+        color_camera = RealSenseRGBCamera(
+            camera_config,
+            output_width=output_width,
+            output_height=output_height,
+            auto_exposure=camera_config.auto_exposure,
+            exposure=camera_config.exposure,
+            gain=camera_config.gain,
         )
+        controls = color_camera.get_color_controls()
+        print(
+            "RealSense color controls: "
+            f"auto_exposure={controls['auto_exposure']}, "
+            f"exposure={controls['exposure']}, gain={controls['gain']}"
+        )
+        wrist_camera = LatestFrameCamera(color_camera)
     elif camera_config.source == "image":
         if not camera_config.image_path:
             raise ValueError("camera.image_path must be set when source='image'")
@@ -1765,6 +3289,37 @@ def _make_camera(
         wrist_camera.close()
         raise
     return PolicyCameraRig(wrist_camera, tactile_camera)
+
+
+def capture_gelsight_reference_frames(
+    camera: Any,
+    bundle: BundleTorchScriptPolicy,
+) -> dict[str, np.ndarray]:
+    """Capture the fixed post-reset tactile baseline required by the 0813 Student.
+
+    The simulator stores the first valid GelSight image after every reset and
+    keeps it unchanged for the episode.  Real deployment has one rollout per
+    process, so we take exactly one left/right pair after camera warm-up and
+    before generating the first policy action.
+    """
+    if not getattr(bundle, "has_gelsight_reference_inputs", False):
+        return {}
+    if not hasattr(camera, "read_tactile"):
+        raise RuntimeError("Model requires GelSight reference inputs, but camera rig has none")
+    left, right = camera.read_tactile()
+    references = {
+        "gsmini_left_reference_rgb": np.asarray(left, dtype=np.uint8),
+        "gsmini_right_reference_rgb": np.asarray(right, dtype=np.uint8),
+    }
+    for name, value in references.items():
+        expected = bundle.gelsight_input_shapes[name]
+        if value.shape != expected:
+            raise ValueError(
+                f"Expected {name} shape {expected}, got {value.shape}"
+            )
+        references[name] = np.array(value, dtype=np.uint8, order="C", copy=True)
+    bundle._deployment_tactile_references = references
+    return references
 
 
 def _make_run_dir(config: BundleDeployConfig) -> Path:
@@ -1807,7 +3362,13 @@ def run_bundle_deploy(
     save_step_data: bool = False,
     allow_full_scale: bool = False,
     streaming_check: bool = False,
+    hil_settings: HILSettings | None = None,
+    residual_settings: ResidualDeploySettings | None = None,
+    real_rl_settings: RealRLDeploySettings | None = None,
 ) -> dict[str, Any]:
+    hil_enabled = bool(hil_settings is not None and hil_settings.enabled)
+    if hil_settings is not None:
+        hil_settings.validate()
     if config.control_mode == "streaming" or streaming_check:
         from .streaming import run_streaming_bundle_deploy
 
@@ -1818,12 +3379,21 @@ def run_bundle_deploy(
             save_step_data=save_step_data,
             allow_full_scale=allow_full_scale,
             streaming_check=streaming_check,
+            hil_settings=hil_settings,
+            residual_settings=residual_settings,
+            real_rl_settings=real_rl_settings,
         )
 
     if config.control_mode != "blocking":
         raise ValueError("control_mode must be 'blocking' or 'streaming'")
     if allow_full_scale:
         raise ValueError("allow_full_scale is only valid for streaming control")
+    if hil_enabled:
+        raise ValueError("--hil is only valid with server9 streaming control")
+    if residual_settings is not None:
+        raise ValueError("Residual BC is only valid with server9 streaming control")
+    if real_rl_settings is not None:
+        raise ValueError("Real-RL is only valid with server9 streaming control")
     run_dir = _make_run_dir(config)
     (run_dir / "rgb").mkdir(exist_ok=True)
     if config.tactile_camera.enabled:
@@ -1860,12 +3430,21 @@ def run_bundle_deploy(
         rma_oracle_cube_position_root=config.model.rma_oracle_cube_position_root,
     )
     _validate_bundle_action_dims(bundle, config)
+    reject_evaluation_only_motion(bundle, execute_motion)
     action_history_buffer = ActionHistoryBuffer(
         history_dim=bundle.history_dim,
         source=config.model.history_source,
         scale=config.model.history_scale,
         delay_steps=config.model.history_delay_steps,
         processed_action_scale=config.action_adapter.scales,
+    )
+    rgb_history_buffer = (
+        WristRGBHistoryBuffer(
+            bundle.rgb_history_frames,
+            (bundle.rgb_height, bundle.rgb_width, 3),
+        )
+        if getattr(bundle, "uses_wrist_rgb_history", False) is True
+        else None
     )
 
     env = RealFrankaEnv(env_config)
@@ -1906,6 +3485,18 @@ def run_bundle_deploy(
         env.close()
         raise
 
+    try:
+        tactile_references = capture_gelsight_reference_frames(camera, bundle)
+        if tactile_references:
+            reference_dir = run_dir / "tactile_reference_rgb"
+            reference_dir.mkdir(exist_ok=True)
+            for name, image in tactile_references.items():
+                Image.fromarray(image).save(reference_dir / f"{name}.png")
+    except Exception:
+        camera.close()
+        env.close()
+        raise
+
     desired_gripper_width = observation.gripper_width
     summary: dict[str, Any] = {
         "run_dir": str(run_dir),
@@ -1926,6 +3517,11 @@ def run_bundle_deploy(
                 raise ValueError(
                     f"Expected RGB frame {(bundle.rgb_height, bundle.rgb_width)}, got {wrist_rgb.shape[:2]}"
                 )
+            model_rgb = (
+                rgb_history_buffer.update(wrist_rgb)
+                if rgb_history_buffer is not None
+                else wrist_rgb
+            )
             rgb_path = run_dir / "rgb" / f"step_{step_index:04d}.png"
             rgb_relpath = str(rgb_path.relative_to(run_dir))
             if config.camera.save_rgb or save_step_data:
@@ -1959,12 +3555,16 @@ def run_bundle_deploy(
             step_timing["input_pack_ms"] = (time.perf_counter() - pack_start) * 1000.0
 
             infer_start = time.perf_counter()
+            contact_force_n = build_rma_contact_force_input(observation, bundle, config)
             raw_action = bundle.predict(
                 action_history,
                 proprio,
-                wrist_rgb,
+                model_rgb,
                 tactile_images.get("gsmini_left_rgb"),
                 tactile_images.get("gsmini_right_rgb"),
+                tactile_references.get("gsmini_left_reference_rgb"),
+                tactile_references.get("gsmini_right_reference_rgb"),
+                contact_force_n,
             )
             step_timing["policy_infer_ms"] = (time.perf_counter() - infer_start) * 1000.0
 
@@ -1989,10 +3589,16 @@ def run_bundle_deploy(
                     step_data_path,
                     action_history=np.asarray(action_history, dtype=np.float32),
                     proprio_obs=np.asarray(proprio, dtype=np.float32),
-                    wrist_rgb=np.asarray(wrist_rgb, dtype=np.uint8),
+                    **{bundle.rgb_input_name: np.asarray(model_rgb, dtype=np.uint8)},
+                    **(
+                        {"contact_force_n": np.asarray(contact_force_n, dtype=np.float32)}
+                        if contact_force_n is not None
+                        else {}
+                    ),
                     raw_action=np.asarray(raw_action, dtype=np.float32),
                     clipped_action=np.asarray(clipped_action, dtype=np.float32),
                     **tactile_images,
+                    **tactile_references,
                 )
                 step_data_relpath = str(step_data_path.relative_to(run_dir))
 
@@ -2050,12 +3656,22 @@ def run_bundle_deploy(
                     "proprio_obs": np.asarray(proprio, dtype=np.float32).tolist(),
                     "rgb_path": rgb_relpath,
                     "rgb_shape": list(wrist_rgb.shape),
+                    "rgb_history_shape": (
+                        list(model_rgb.shape) if rgb_history_buffer is not None else None
+                    ),
                     "tactile_rgb_paths": tactile_relpaths,
                     "tactile_rgb_shapes": {
                         name: list(image.shape)
                         for name, image in tactile_images.items()
                     },
+                    "tactile_reference_rgb_paths": {
+                        name: str(Path("tactile_reference_rgb") / f"{name}.png")
+                        for name in tactile_references
+                    },
                     "step_data_path": step_data_relpath,
+                    "contact_force_n": (
+                        None if contact_force_n is None else contact_force_n.tolist()
+                    ),
                     "rma_actor_input": dict(bundle.last_inference_info),
                 },
                 "raw_action": raw_action.tolist(),

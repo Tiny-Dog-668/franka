@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 from franka_sim2real.e2e_bundle import ActionHistoryBuffer, BundleDeployConfig, load_bundle_config
@@ -76,6 +79,21 @@ class NumericStreamingTests(unittest.TestCase):
             streaming.pose_error(pose, target),
             [0.01, -0.02, 0.03, 0.0, 0.0, 0.0],
             atol=1e-12,
+        )
+
+    def test_physical_tool_tcp_rotates_the_gelsight_surface_offset(self) -> None:
+        config = streaming_config()
+        config.tool_tcp_offset_ee_m = [0.0, 0.0, 0.027408]
+        pose = np.eye(4)
+        # The deployed reference orientation points the EE local +Z toward
+        # the table, so the physical GelSight surface is below O_T_EE.
+        pose[:3, :3] = np.diag([1.0, -1.0, -1.0])
+        pose[:3, 3] = [0.4375, -0.0152, 0.0422]
+        np.testing.assert_allclose(
+            streaming.physical_tool_tcp_translation(pose, config),
+            [0.4375, -0.0152, 0.014792],
+            rtol=0.0,
+            atol=1e-9,
         )
 
     def test_commissioning_and_full_scale_history_match_executed_action(self) -> None:
@@ -247,6 +265,22 @@ class ContractAndSchedulingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "realtime='enforce'"):
             streaming.validate_streaming_contract(bundle, bad)
 
+    def test_cartesian_impedance_requires_six_axis_stiffness_without_joint_stiffness(self) -> None:
+        bundle = types.SimpleNamespace(
+            action_dim=4,
+            history_dim=4,
+            metadata={"policy_contract": policy_contract()},
+        )
+        config = streaming_config()
+        config.streaming.impedance_mode = "cartesian"
+        config.streaming.joint_impedance = None
+        config.streaming.cartesian_impedance = [1000.0, 1000.0, 500.0, 30.0, 30.0, 30.0]
+        streaming.validate_streaming_contract(bundle, config)
+
+        config.streaming.cartesian_impedance = None
+        with self.assertRaisesRegex(ValueError, "cartesian_impedance is required"):
+            streaming.validate_streaming_contract(bundle, config)
+
     def test_rma_streaming_contract_allows_longer_operator_selected_run(self) -> None:
         bundle = types.SimpleNamespace(
             action_dim=4,
@@ -293,18 +327,21 @@ class ContractAndSchedulingTests(unittest.TestCase):
         queue = streaming.AsyncGripperQueue(gripper, speed=0.03, tolerance=1e-4)
         queue.stop()
         self.assertEqual(gripper.stop_calls, 0)
-        queue.mark_control_session_active()
-        queue.stop()
+        active_queue = streaming.AsyncGripperQueue(
+            gripper, speed=0.03, tolerance=1e-4
+        )
+        active_queue.mark_control_session_active()
+        active_queue.stop()
         self.assertEqual(gripper.stop_calls, 1)
 
     def test_gripper_queue_converts_blocked_close_to_grasp(self) -> None:
         class FakeFuture:
             def __init__(self, result: bool) -> None:
                 self.result = result
-                self.ready = False
+                self.ready = threading.Event()
 
             def wait(self, timeout: float) -> bool:
-                return self.ready
+                return self.ready.wait(timeout)
 
             def get(self) -> bool:
                 return self.result
@@ -318,16 +355,23 @@ class ContractAndSchedulingTests(unittest.TestCase):
                 self.grasp_future = FakeFuture(True)
                 self.move_calls: list[tuple[float, float]] = []
                 self.grasp_calls: list[tuple[float, float, float]] = []
+                self.move_started = threading.Event()
+                self.grasp_started = threading.Event()
 
             def move_async(self, width: float, speed: float) -> FakeFuture:
                 self.move_calls.append((width, speed))
+                self.move_started.set()
                 return self.move_future
 
             def grasp_async(
                 self, width: float, speed: float, force: float
             ) -> FakeFuture:
                 self.grasp_calls.append((width, speed, force))
+                self.grasp_started.set()
                 return self.grasp_future
+
+            def stop(self) -> None:
+                return None
 
         gripper = FakeGripper()
         queue = streaming.AsyncGripperQueue(
@@ -335,22 +379,25 @@ class ContractAndSchedulingTests(unittest.TestCase):
         )
         queue.command(0.0)
         queue.command(0.0)
+        self.assertTrue(gripper.move_started.wait(1.0))
         self.assertEqual(gripper.move_calls, [(0.0, 0.03)])
 
         gripper.state = types.SimpleNamespace(
             width=0.0516, max_width=0.0798, is_grasped=False
         )
-        gripper.move_future.ready = True
-        queue.poll()
+        gripper.move_future.ready.set()
+        self.assertTrue(gripper.grasp_started.wait(1.0))
         self.assertEqual(gripper.grasp_calls, [(0.0516, 0.03, 20.0)])
 
         gripper.state = types.SimpleNamespace(
             width=0.0515, max_width=0.0798, is_grasped=True
         )
-        gripper.grasp_future.ready = True
-        queue.poll()
+        gripper.grasp_future.ready.set()
+        queue.wait_idle()
         queue.command(0.0)
+        queue.wait_idle()
         self.assertEqual(gripper.move_calls, [(0.0, 0.03)])
+        queue.stop()
 
     def test_gripper_queue_reports_non_contact_move_failure(self) -> None:
         class FakeFuture:
@@ -363,10 +410,48 @@ class ContractAndSchedulingTests(unittest.TestCase):
         state = types.SimpleNamespace(width=0.04, max_width=0.0798, is_grasped=False)
         gripper = types.SimpleNamespace(state=state)
         gripper.move_async = lambda width, speed: FakeFuture()
+        gripper.stop = lambda: None
         queue = streaming.AsyncGripperQueue(gripper, speed=0.03, tolerance=1e-4)
         queue.command(0.07)
         with self.assertRaisesRegex(RuntimeError, "kind=move"):
-            queue.poll()
+            queue.wait_idle()
+        with self.assertRaisesRegex(RuntimeError, "kind=move"):
+            queue.stop()
+
+    def test_gripper_queue_never_calls_hand_api_on_command_thread(self) -> None:
+        class PendingFuture:
+            def wait(self, timeout: float) -> bool:
+                return False
+
+        main_thread = threading.get_ident()
+        api_thread: list[int] = []
+        started = threading.Event()
+        state = types.SimpleNamespace(width=0.04, max_width=0.08, is_grasped=False)
+
+        class FakeGripper:
+            @property
+            def state(self):
+                return state
+
+            def move_async(self, _width, _speed):
+                api_thread.append(threading.get_ident())
+                started.set()
+                return PendingFuture()
+
+            def stop(self):
+                return None
+
+        queue = streaming.AsyncGripperQueue(
+            FakeGripper(), speed=0.1, tolerance=1e-4
+        )
+        started_at = time.perf_counter()
+        queue.command(0.08)
+        elapsed = time.perf_counter() - started_at
+        self.assertLess(elapsed, 0.02)
+        self.assertTrue(started.wait(1.0))
+        self.assertNotEqual(api_thread, [main_thread])
+        queue.poll()
+        queue.stop()
 
     def test_policy_deadline_miss_holds_and_watchdog_aborts(self) -> None:
         period = 33_333_333
@@ -422,6 +507,40 @@ class ContractAndSchedulingTests(unittest.TestCase):
         observation.tcp_translation = [0.7, 0.0, 0.3]
         outside = streaming.evaluate_streaming_check_state(observation, config)
         self.assertFalse(outside["checks"]["workspace"]["passed"])
+
+
+class StreamingArtifactTests(unittest.TestCase):
+    def test_fast_png_writer_preserves_rgb_values_losslessly(self) -> None:
+        image = np.asarray(
+            [[[255, 0, 0], [0, 255, 0]], [[0, 0, 255], [13, 29, 47]]],
+            dtype=np.uint8,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.png"
+            streaming._save_rgb_png(path, image)
+            decoded = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+        np.testing.assert_array_equal(decoded, image)
+
+    def test_compact_profile_releases_duplicate_model_and_tactile_arrays(self) -> None:
+        config = streaming_config()
+        config.camera.save_rgb = False
+        config.tactile_camera.save_rgb = False
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        record = {
+            "_model_rgb": image,
+            "_tactile_images": {"left": image},
+            "_tactile_references": {"left_reference": image},
+            "_raw_image": image,
+        }
+        result = types.SimpleNamespace(image=image)
+        retained = streaming._retain_artifact_arrays(
+            record, result, config, save_step_data=False
+        )
+        self.assertIsNone(retained)
+        self.assertNotIn("_model_rgb", record)
+        self.assertNotIn("_tactile_images", record)
+        self.assertNotIn("_tactile_references", record)
+        self.assertIn("_raw_image", record)
 
 
 class FakeStreamingIntegrationTests(unittest.TestCase):

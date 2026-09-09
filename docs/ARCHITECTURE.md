@@ -79,10 +79,10 @@
 | --- | --- | --- |
 | 顶层 | `BundleDeployConfig` | `robot_ip`、`realtime`（`enforce`/`ignore`）、`control_mode`（`blocking`/`streaming`）、`speed`、夹爪参数、`async_gripper_commands` |
 | `camera` | `BundleCameraConfig` | `source`、`serial`、分辨率、`warmup_frames`、`enable_crop` 与 crop 四元组 |
-| `tactile_camera` | `BundleTactileCameraConfig` | `enabled`、`left_device`/`right_device`、分辨率、`first_frame_timeout_s` |
+| `tactile_camera` | `BundleTactileCameraConfig` | `enabled`、运行时 `auto_discover`、`left_device`/`right_device`、分辨率、`first_frame_timeout_s` |
 | `action_adapter` | `BundleActionAdapterConfig` | `labels`、`scales`、`clip_low`/`clip_high`、`gripper_mode` |
 | `runner` | `BundleRunnerConfig` | `steps`、`log_dir`、`run_name` |
-| `model` | `BundleModelConfig` | `model_path`、`metadata_path`、`device`、`history_source`/`history_scale`/`history_delay_steps`、`enforce_policy_contract` |
+| `model` | `BundleModelConfig` | `model_path`、`metadata_path`、`device`、`history_source`/`history_scale`/`history_delay_steps`、`enforce_policy_contract`；0809 XY RMA 另有 `rma_contact_force_source` |
 | `initial_state` | `BundleInitialStateConfig` | `enforce`、目标关节角/TCP/夹爪宽度及各自容差、`required_robot_mode` |
 | `streaming` | `BundleStreamingConfig` | `backend`、频率、`control_law`、增益与三阶限幅、`joint_impedance`、watchdog |
 | `streaming.collision_behavior` | `BundleCollisionBehaviorConfig` | 关节力矩与笛卡尔力的上下阈值 |
@@ -91,6 +91,33 @@
 `control_mode` 只接受 `blocking` 和 `streaming`；`streaming.backend` 只接受 `async_position` 和 `server9_joint_position`，其它值在校验阶段直接报错。
 
 **版本演进约定**：每个新部署版本新增一份 `configs/e2e_bundle_real_exported_<日期><变体>.json`，绝不覆盖旧配置。这保证任何历史实验都能原样复现。
+
+0809 XY RMA Student 的输入还包含 `contact_force_n[2]`。真机没有独立的左右指尖力读数，配置
+`rma_contact_force_source: "gripper_is_grasped"` 因而只把 Franka gripper 的单一
+`is_grasped` 标志映射为 `[1,1]` 或 `[0,0]`，以复现 Actor 使用的“双侧均超过 1 N”二值特征。
+这是用于效果验证的近似，不能用腕部 `O_F_ext_hat_K` 代替，也不能视为左右指尖力测量；运行记录会保存
+实际送入的二元输入。`"zeros"` 只适用于无接触基线测试。
+
+0809 Direct-Action RMA Student 只输入 `wrist_rgb[224,224,3]`、`proprio_obs[15]` 和
+`action_history[4]`，没有运行时接触力或其他 privileged input。部署层按 metadata kind
+`tacex_rma_direct_action_student_torchscript` v1 单独校验 SHA、输入顺序、无接触输入、模型契约、
+历史动作、相机 crop 和四维动作适配；streaming 路径仍使用机器人基座系 XYZ。每个 checkpoint 的
+metadata 必须记录独立的 CPU/GPU 一致性验证，严格校验才允许 `cuda:0` 部署：0010000 使用九组仿真
+rollout 输入（最大绝对误差 `0.000737`），0040000 使用四个 episode 的 12 组输入（最大绝对误差
+`0.000704`），0060000 使用同样的 12 组输入（最大绝对误差 `0.000450`），0100000 使用同样的
+12 组输入（最大绝对误差 `0.000749`）；四者容差均为 `0.001`。
+动作尺度暂与其共用 teacher 的 0809 配置保持一致；direct metadata 未携带完整训练环境动作契约，
+部署前仍须从训练/export manifest 复核。
+
+0809 X040-Wide Direct-Action Student 使用独立 metadata kind
+`tacex_rma_x040_wide_direct_action_torchscript` v1。它同样只接受 RGB、本体状态和物理 action history，
+训练时 cube XYZ 仅用于 Teacher 与辅助 position loss，绝不能作为真机输入。契约固定动作尺度
+`[0.05,0.05,0.05,0.01]`、训练初始关节状态、D435 crop `(100,34,400,398)`，并要求真机工作空间包含
+训练 reset 方块范围 `x=[0.32,0.48]`、`y=[-0.10,0.10]`、`z=0.026`；这只是覆盖校验，不会扩展工作空间。
+该 checkpoint 使用 12 组离线 rollout 输入完成 CPU/GPU 一致性验证，最大绝对误差 `0.000722`，容差 `0.001`。
+若只用 `forward_with_position()` 做相机/AprilTag 位置诊断，checkpoint metadata 仍必须携带其训练时
+`normalization.cube_position_center`、`cube_position_scale` 和 `position_frame`，以便把归一化输出还原为
+`robot_root` 米单位；这不等价于完成可进入真机部署的完整契约验证。
 
 ## 4. 入口层
 
@@ -124,6 +151,11 @@ if __name__ == "__main__":
 
 `--streaming-check` 会强制走 streaming 分支，即使配置写的是 blocking。streaming 路径不支持 `--confirm-each-step`。
 
+统一入口还负责操作者错误呈现：默认把部署异常归类为中文的故障含义和安全处理建议，并保留未改写的原始错误；
+`--debug` 才会重新抛出完整 Python traceback。该层只改变终端诊断文本，不修改动作、频率、看门狗、初始状态
+门禁或 native worker 通信协议。server9 动作锁存超时的原始错误额外包含等待时长、worker 状态/错误码、控制
+周期数、IK tick 数和当前动作已执行 tick 数，便于区分 worker 调度问题与策略推理问题。
+
 ### 4.3 分发
 
 `run_bundle_deploy()`（`e2e_bundle.py:1803`）按 `control_mode` 分发；streaming 再由 `run_streaming_bundle_deploy()`（`streaming.py:854`）按 `backend` 二次分发：
@@ -138,6 +170,17 @@ run_bundle_deploy
 ```
 
 当前真机是 FCI server version 9，`async_position` 路径依赖 pylibfranka 0.21.1 / server v10，**在本机不可用**；实际生产路径是 `server9_joint_position`。
+
+### 4.4 HIL Residual BC 运行时扩展
+
+统一 CLI 的 `--hil` / `--hil-speed-m-s` 只形成 `HILSettings` 运行时对象，不写入既有部署 JSON。
+该模式仅允许 `server9_joint_position` streaming；blocking、async backend 和 `--streaming-check`
+在连接硬件前拒绝。`--validate-only` 会验证这些组合但不创建键盘窗口；Pygame 只在真正进入 HIL
+preview 或控制会话时由 `franka_sim2real/hil.py` 懒加载。
+
+Pygame 独立线程仅维护焦点和 `Space/W/S/A/D/R/F` 按键状态，不持有机器人对象，也不发送命令。
+主策略循环在实际 30 Hz 发送边界读取一次快照，因此保留下一步 policy 预计算时，不会把 Space 状态
+提前一拍。焦点丢失会清空全部按键；Escape 或窗口关闭通过主循环现有异常清理路径请求安全停止。
 
 ## 5. 感知层
 
@@ -156,7 +199,15 @@ crop 改错等于给模型喂了分布外输入，症状是策略输出方向系
 
 ### 5.2 GelSight 触觉（0808）
 
-`GelSightPairCamera` 通过 OpenCV 打开左右两个 GelSight Mini（device 0 和 6，3280x2464@25），仅在配置中 `tactile_camera.enabled` 为 true 时启用。目前只有 `configs/e2e_bundle_real_exported_0808_gelsight.json` 打开。
+`GelSightPairCamera` 通过 OpenCV 打开左右两个 GelSight Mini（3280x2464@25），仅在配置中
+`tactile_camera.enabled` 为 true 时启用。默认严格使用配置的 `left_device/right_device`。
+
+统一 CLI 的 `--auto-gelsight` 只在本次运行中设置 `auto_discover=true`。相机创建前，
+`gelsight_devices.py` 枚举 `/sys/class/video4linux/video*`，要求设备名称包含 GelSight 且 UVC
+`index=0`，从而跳过 RealSense、普通 webcam 和同一 UVC 设备的辅助流。恰好两路时按当前 video 编号
+排序绑定为 left/right，并打印编号、label、serial；零路、一路或多于两路均 fail closed。解析后的实际
+`left_device/right_device` 会进入该次 server9 运行产物的 `config.json`。自动选择不能识别物理安装方向，
+设备换边后必须先运行 `scripts/camera/gelsight_start.py` 预览确认。
 
 ### 5.3 相机装配
 
@@ -186,6 +237,40 @@ crop 改错等于给模型喂了分布外输入，症状是策略输出方向系
 `enforce_policy_contract: true` 时，`_validate_policy_contract()` 和 `_validate_tacex_rma_student_contract()` 会校验输入输出维度、metadata 版本、SHA256 和动作维度是否与 `action_adapter` 一致；`validate_bundle_artifacts()` 是 `--validate-only` 的实现，完全不连硬件。
 
 `ActionHistoryBuffer` 按 `history_source`、`history_scale` 和 `history_delay_steps` 维护动作历史；默认用 `processed_action` 且延迟 1 步，与训练时的时序对齐。
+
+HIL 下 Actor 仍在每步执行，得到 `base_action[4]`。键盘方向先归一化，再按
+`hil_speed_m_s / policy_frequency_hz` 得到基座系米增量，除以既有 XYZ scales 后成为限幅前归一化
+`human_xyz`。Space 按住时选择 `[human_xyz, base_action[3]]`，否则选择 base action。Residual BC 标签
+定义在同一限幅前归一化层：介入时为 `human_xyz - base_action[:3]`，未介入时为零。
+
+### 6.1 独立 Residual BC 训练
+
+`franka_sim2real/residual_bc.py` 与 `scripts/training/train_residual_bc.py` 是纯离线模块，不被现有部署
+runner 导入。数据扫描以 `policy_action_accepted` 为唯一执行过滤条件，并逐 NPZ 校验 human-base 标签关系。
+数据切分单位是完整 episode，避免连续视觉帧跨 train/validation/test 泄漏。
+
+冻结的 0814 TorchScript 通过 `encode_visual`、`tactile_encoder` 和 `normalizer` 构造原 action head 的
+1043 维输入，再与采集时保存的 `base_action[4]` 拼接。训练网络为 `1047→256→128→3`，只输出
+pre-limit normalized XYZ residual；base Student、gripper、安全限幅和控制链均不属于训练参数。特征抽取
+阶段还会用原 `action_head` 重算 base action 并与日志比对，checkpoint 则记录 base-model SHA256，防止
+策略错配。为复现部署数值，DataLoader 可以批量读取 NPZ，但 TorchScript 特征推理固定为 batch=1；
+这避免 CUDA CNN 在大 batch 下选择不同 kernel 后造成可观测的 action/feature 漂移。训练产物默认仍是
+独立 artifact；需要通过下一节的显式 runtime 参数才能进入 streaming 部署路径。
+
+### 6.2 Residual BC server9 部署
+
+`ResidualDeploySettings` 是 CLI 创建的临时运行时对象，不进入部署 JSON。`ResidualPolicyRuntime` 加载
+TorchScript head 和训练 metadata，强校验 kind/version、1043+4→3 契约、base gripper 来源及训练记录的
+base-model SHA。当前只允许 0814 GelSight size-buckets Student。
+
+`BundleTorchScriptPolicy.predict()` 先执行原 base forward，再用相同的 batch=1 输入张量通过公开的
+visual/tactile encoders 和 normalizer 复现 actor feature。Residual head 输出先乘 runtime scale、做逐轴
+cap，再执行 `final_xyz=base_xyz+applied_residual_xyz`；第 4 维直接复制 base gripper。返回后的 final raw
+action 不走任何旁路，仍由 server9 的 `clip_streaming_action`、history、workspace、DLS 和 FCI 处理。
+
+Residual 推理信息进入每步 JSONL/NPZ；deadline miss 不更新 history。CLI 禁止 residual 与 HIL 等含义不清
+的动作选择组合，真机模式还要求独立 enable flag 且禁止无交互 `--yes`。默认不开启时 policy 构造、推理、
+日志和依赖路径保持原状。
 
 ## 7. 动作映射
 
@@ -228,9 +313,16 @@ IK 层核心函数：
 - `latch_tcp_target(current_pose, executed_xyz)`：锁存目标，避免误差在多个 tick 间累积漂移。
 - `_apply_joint_limits(q_target, margin)`：按 `joint_limit_margin_rad` 留出关节限位余量。
 
-夹爪走 `AsyncGripperQueue`，在独立线程执行，不阻塞 1 kHz 控制回路。
+server9 的夹爪走 `ProcessGripperQueue`：独立 `spawn` 进程独占 Hand API，避免 native binding 持有 GIL 时
+阻塞 30 Hz Python 策略循环。普通非 server9 streaming 仍使用线程版 `AsyncGripperQueue`。两者都不进入
+1 kHz C++ 控制回路。
 
 策略结果带时效性检查：`policy_result_is_timely()` 结合 `policy_watchdog_s`（0.25 s）判断，超时的结果被丢弃，worker 端的 generation 编号因此允许跳号。
+
+HIL 选择动作复用完全相同的 `clip_streaming_action`、commissioning limit、action scales、workspace、
+DLS 和 FCI 路径。仅当 worker 按期接受动作时才执行
+`ActionHistoryBuffer.update(selected_raw, selected_limited)`；因此下一次模型输入中的 processed
+history 是最终限幅后的实际接受组合动作。deadline miss 继续 hold/brake，且不更新 history。
 
 ### 8.3 控制律
 
@@ -274,7 +366,7 @@ Python 与 C++ worker 通过共享内存通信，布局由 `franka_sim2real/serv
 
 1. **离线契约校验**（`--validate-only`）：模型输入输出维度、metadata 版本、SHA256、动作维度与配置一致性。
 2. **streaming 契约校验**（`validate_streaming_contract`）：频率、增益、限幅、backend 与控制律取值合法性。
-3. **初始状态门禁**（`evaluate_initial_state`）：关节角、关节速度、TCP 平移与朝向、夹爪宽度、机器人模式为 `Idle`、无 FCI 错误、夹爪未夹持。`enforce: true` 时不满足直接拒绝启动。门禁失败的正确处理是用 `scripts/robot/go_to_zero_pose.py` 回到训练初始姿态，不是放宽容差。
+3. **初始状态门禁**（`evaluate_initial_state`）：关节角、关节速度、TCP 平移与朝向、夹爪宽度、机器人模式为 `Idle`、无 FCI 错误、夹爪未夹持。`enforce: true` 时不满足直接拒绝启动。门禁失败的正确处理是用 `scripts/robot/go_to_zero_pose.py` 回到训练初始姿态，不是放宽容差；该脚本在移动前拒绝 `max_width <= 0` 的未 homing 夹爪，必须先显式运行单独的 gripper homing。回零默认使用一条连续 `JointMotion`，避免多段轨迹在 motion generator 边界重新起停；显式 `--staged` 模式则在每段后确认实测关节速度已归零才发送下一段。
 4. **人工确认**：单步模式打印拟执行的位移与夹爪宽度，只有输入 `y` 或 `yes` 才运动。`--allow-full-scale` 禁止与 `--yes` 组合，且始终要求一次会话确认。
 5. **调试期动作限幅**（`commissioning_action_limit`）：默认把归一化动作限制在 `[-0.10, 0.10]`。
 6. **工作空间限制**（`_validate_workspace_target`）：目标 TCP 超出 `workspace` 立即中止。
@@ -291,11 +383,20 @@ Python 与 C++ worker 通过共享内存通信，布局由 `franka_sim2real/serv
 | 文件 | 内容 |
 | --- | --- |
 | `config.json` | 本次实际生效的完整配置 |
-| `rollout.jsonl` | 逐步 observation、action、timing；oracle 模式下还含 `model_input.rma_actor_input` |
+| `rollout.jsonl` | 逐步 observation、action、timing；0809 XY RMA 额外记录实际 `contact_force_n`；Direct-Action 的该字段为 `null`；oracle 模式下还含 `model_input.rma_actor_input` |
 | `summary.json` | 运行汇总 |
 | `rgb/step_XXXX.png` | 模型实际看到的 RGB |
 | `control_trace.jsonl` | streaming 专有，逐周期控制 trace |
 | `timing_summary.json` | streaming 专有，时序统计 |
+| `step_data/step_XXXX.npz` | `--hil` 强制生成；精确 RGB/视觉历史、GelSight/reference、proprio、action history 与 HIL 标签 |
+
+HIL 的 `rollout.jsonl` 仍沿用既有逐步记录，仅追加 `episode_id`、`step_id`、`intervention`、
+`base_action`、可空 `human_action` 和 `residual_target_xyz`。既有 `raw_action` 表示最终选择的限幅前动作，
+`limited_action` 表示限幅后候选，`executed_action` 只在 worker 接受时非空；它是被接受的控制命令，
+不是测量到的 TCP 实际位移。NPZ 同步保存标签，非介入步不创建 `human_action` 数组，并保存
+`policy_action_accepted` 供训练过滤 deadline miss。不开 `--hil` 时 JSONL 和依赖加载行为保持原样。
+HIL preview 没有 worker 动作发送，其样本也明确记录 `policy_action_accepted=false`；仅保留候选动作与
+Residual 数据流用于检查。
 
 streaming 路径在控制期间**只缓存不落盘**，`stop_control()` 之后才一次性写出，避免磁盘 IO 干扰 1 kHz 回路。`scripts/diagnostics/analyze_streaming_tracking.py` 读取这些 trace 计算 ratio、slope 和方向误差，理想值分别接近 1、1、0。
 
@@ -314,10 +415,92 @@ configs/eye_to_hand_d435_215322076207.json
         │
         ▼
 live_apriltag_cube_pose.py（tag36h11 ID 0，40 mm；50 mm 方块中心位于 Tag -Z 方向 25 mm）
-evaluate_policy_vs_apriltag.py（把 AprilTag 位姿与策略视觉头预测对比）
+record_cube_pose_dataset.py（只采集 D435 静态 RGB burst，不连接 Franka）
+        │
+        ▼
+evaluate_policy_vs_apriltag.py（离线将 AprilTag 位姿与策略视觉头预测对比，输出 RMSE/中位/P95/偏差）
 ```
 
+`RMAPolicyCubePredictor` 仅用于这一只读诊断链路。除旧 RMA Student 的视觉 adaptation head 外，也支持
+X040-Wide 的 `forward_with_position(wrist_rgb, proprio_obs, action_history)`：该导出方法的 position
+branch 实际只读取 RGB，评估器仅提供零值本体/历史张量以满足 TorchScript 签名，并丢弃 action 输出。
+还原后的 XYZ 使用 metadata 中 `cube_position * scale + center`，坐标系为 `robot_root`。X040-Wide
+没有 contact head，CSV 使用 `NaN`，摘要明确 `contact_prediction_available: false`。上述输出绝不能进入
+部署 observation 或控制路径。
+
 流程细节见 [`HAND_EYE_CALIBRATION.md`](HAND_EYE_CALIBRATION.md)。首次使用必须先跑 `--camera-check` 和 `--dry-run`。
+
+除几何标定外，`measure_camera_noise.py` 标定相机的辐射特性，供仿真侧对齐图像噪声：
+
+```text
+measure_camera_noise.py（场景静止，逐 (exposure, gain) 工况连拍）
+        │  复用 e2e_bundle 的 RealSenseRGBCamera 与 _apply_camera_crop，
+        │  默认在模型输入域（crop -> 双线性 224x224）统计，与仿真加噪的域一致
+        ▼
+逐像素时间统计 -> 扣除整帧亮度漂移 -> 按亮度分箱取 sigma 中位数
+        │
+        ▼
+runs/<时间戳>_camera_noise/{noise_report.json, noise_lut.csv, mean_*.png, sigma_*.png}
+```
+
+输出的 `sigma_lut` 与 `affine_fit`（`sigma^2 = a*mu + b`，a 为散粒噪声项、b 为读出噪声项）供 `TacEx/` 侧把同方差高斯噪声替换为信号相关噪声。该脚本只读相机，不连接机器人。模型输入尺寸从 bundle config 的 `model.metadata_path` → `input_signature.wrist_rgb` 解析，不硬编码。
+
+### 12.1 Real-world Residual SAC
+
+Real-RL 是 server9 的可选旁路，不改变 native worker 或安全控制：
+
+```text
+0814 frozen feature[1043] + base_action[4]
+        ├─ Actor → unit residual XYZ → ±2 mm 映射 → base XYZ 相加
+        │                                      ↓
+        │                       既有 limit/workspace/DLS/FCI
+        └─ Replay + AprilTag relative XYZ/height → privileged Q1/Q2（仅离线训练）
+```
+
+`collect` 启动前用 AprilTag 完成静止高度预检，随后关闭检测线程。每个真实 policy deadline 到达时，
+控制路径直接快照 `LatestFrameCamera` 的最新 raw packet；该 packet 独立于上一周期提前计算的模型输入帧，
+从而使下一边界帧通常位于上一动作之后。30 Hz 路径同时向 SQLite WAL 后台 writer 提交尚未标注的
+transition skeleton。
+机械臂 worker 停止后才压缩原始帧、逐帧离线检测（上一帧 ROI 放大优先、整帧 fallback）并原子回写奖励。
+唯一训练门是 Replay v2 的
+`trainable/trainable_reason`，Normalizer、high-watermark、UTD 和 sampler 均查询同一字段。
+相机帧与命令使用 monotonic `capture_timestamp/action_timestamp`，只有 accepted 且满足
+`tag_t <= action_time < tag_t1` 的 transition 可训练；Tag 缺失、过期、复用或不包围 action 时仍记录。
+Deadline miss 不更新 history，且不进入训练。`train` 不连接硬件，Actor state 为 1047D，Critic 额外读取
+relative XYZ＋height 4D privileged state；height 明确定义为
+`object_z_in_base - initial_object_z_in_base`。
+
+Normalizer 固定由最早 1000 条 trainable Replay 拟合：只经验归一化 policy feature[1043]，base
+action[4] 按固定 contract 原样（仅 contract clip）传入，privileged[4] 单独经验归一化。首次训练使用固定
+`bootstrap_updates`，后续才以新增 trainable transition 数乘 UTD（默认 2，限制 1–4）。随机 warmup
+使用有时间相关性的 AR(1) Gaussian。Replay 还保存 safety 前后 action、是否介入及其 4D normalized
+L2 幅度。checkpoint 校验失败时 residual=0 且默认在 worker 启动前拒绝 episode；只有显式 fallback
+开关才允许继续采 base-only 数据。
+
+server9 夹爪使用单 owner 子进程：子进程内才构造 `franky.Gripper`，`move_async/grasp_async`、future
+`wait/get`、完成后的 `gripper.state` 和 `stop` 都在该进程串行执行。policy `command()` 只把带 generation
+的最新目标宽度写入共享内存，`poll()` 只检查本地缓存错误；因此 native Hand 调用即使持有 GIL，也只会
+阻塞 owner 子进程。物体阻挡 close 后自动转换为 force grasp 的状态机不变，停止时先停机械臂 worker，
+再通知 Hand owner 在同一子进程执行 stop，避免并发调用。
+
+单个 RealSense pipeline 同时保留原始 640×480 packet 给离线 AprilTag，并将既有 crop/resize 224×224
+交给策略。Replay 通过 `run_dir/rollout_step` 关联现有 RGB、原始边界帧、GelSight、JSONL 和 step NPZ。
+Real-RL 数据根目录是 `real_rl_logs/`，不与通用部署的 `runs/` 混放。
+
+`scripts/diagnostics/compare_sim_real_images.py` 是纯离线的外观对齐分析，不碰硬件：
+
+```text
+真机：runs/<部署运行>/rgb/ 或 runs/<时间戳>_camera_noise/mean_*.png
+仿真：TacEx collect_rma_student_rollouts.py 的 episode NPZ（键 wrist_rgb，[T,224,224,3] uint8，已过 DR）
+        │  两侧都必须是模型输入域，尺寸不同直接报错
+        ▼
+亮度直方图 / 分位数 / 明暗分区通道平衡 / Wasserstein-1 与 KS 距离
+        │
+        ▼
+runs/<时间戳>_sim_real_image_stats/{image_stats.json, comparison.png}
+```
+
+Wasserstein-1 的单位是 DN，含义是"仿真整体平均需要平移多少 DN 才能对上真机"。两份同场景真机数据之间的 W1 约 10 DN，可作为该指标的本底。
 
 ## 13. 构建产物
 

@@ -30,7 +30,7 @@
 namespace {
 
 constexpr uint64_t kMagic = 0x46524B4139535452ULL;  // "FRKA9STR"
-constexpr uint32_t kAbiVersion = 8;
+constexpr uint32_t kAbiVersion = 11;
 constexpr size_t kTraceCapacity = 1024;
 constexpr size_t kFciLogCapacity = 1024;
 constexpr size_t kCommandReadRetries = 8;
@@ -67,6 +67,7 @@ enum class Command : uint32_t { kWait = 0, kStart = 1, kStop = 2 };
 // qd = (stiffness / damping) * dq_ik, which is proportional to the action.
 // kSimActuatorVelocity reproduces that proportional law.
 enum class ControlLaw : uint64_t { kJointPositionPursuit = 0, kSimActuatorVelocity = 1 };
+enum class ImpedanceMode : uint64_t { kJoint = 0, kCartesian = 1 };
 enum class Status : uint32_t {
   kInitializing = 0,
   kReady = 1,
@@ -123,6 +124,8 @@ struct SharedData {
   double target_pose[16];
   double maximum_joint_velocities[7];
   double joint_impedance[7];
+  double cartesian_impedance[6];
+  uint64_t impedance_mode;
   double maximum_joint_accelerations[7];
   double maximum_joint_jerks[7];
   double dls_lambda;
@@ -132,6 +135,7 @@ struct SharedData {
   double control_watchdog_s;
   double workspace_minimum[3];
   double workspace_maximum[3];
+  double tool_tcp_offset_ee[3];
   uint64_t control_law;
   // Gain applied to the DLS joint delta to obtain a joint velocity. Set it to
   // the simulator's stiffness/damping ratio to match the trained dynamics.
@@ -156,6 +160,7 @@ struct SharedData {
   double q[7];
   double dq[7];
   double O_T_EE[16];
+  double F_T_EE[16];
   double external_wrench[6];
   double q_target[7];
   char error_message[256];
@@ -307,6 +312,7 @@ void copyState(SharedData& shared,
   std::copy(state.q.begin(), state.q.end(), std::begin(shared.q));
   std::copy(state.dq.begin(), state.dq.end(), std::begin(shared.dq));
   std::copy(state.O_T_EE.begin(), state.O_T_EE.end(), std::begin(shared.O_T_EE));
+  std::copy(state.F_T_EE.begin(), state.F_T_EE.end(), std::begin(shared.F_T_EE));
   std::copy(state.O_F_ext_hat_K.begin(), state.O_F_ext_hat_K.end(),
             std::begin(shared.external_wrench));
   std::copy(q_target.begin(), q_target.end(), std::begin(shared.q_target));
@@ -317,6 +323,20 @@ void copyState(SharedData& shared,
 
 std::array<double, 3> translation(const std::array<double, 16>& pose) {
   return {pose[12], pose[13], pose[14]};
+}
+
+std::array<double, 3> toolTcpTranslation(const std::array<double, 16>& pose,
+                                         const SharedData& shared) {
+  // O_T_EE is column-major. The offset is local to EE, never a fixed world-Z
+  // correction.
+  return {
+      pose[12] + pose[0] * shared.tool_tcp_offset_ee[0] +
+          pose[4] * shared.tool_tcp_offset_ee[1] + pose[8] * shared.tool_tcp_offset_ee[2],
+      pose[13] + pose[1] * shared.tool_tcp_offset_ee[0] +
+          pose[5] * shared.tool_tcp_offset_ee[1] + pose[9] * shared.tool_tcp_offset_ee[2],
+      pose[14] + pose[2] * shared.tool_tcp_offset_ee[0] +
+          pose[6] * shared.tool_tcp_offset_ee[1] + pose[10] * shared.tool_tcp_offset_ee[2],
+  };
 }
 
 bool insideWorkspace(const std::array<double, 3>& position, const SharedData& shared) {
@@ -568,8 +588,8 @@ void validateCurrentState(const franka::RobotState& state, const SharedData& sha
       throw std::runtime_error("current joint position is outside Panda limits");
     }
   }
-  if (!insideWorkspace(translation(state.O_T_EE), shared)) {
-    throw std::runtime_error("current TCP is outside configured workspace");
+  if (!insideWorkspace(toolTcpTranslation(state.O_T_EE, shared), shared)) {
+    throw std::runtime_error("current physical tool TCP is outside configured workspace");
   }
 }
 
@@ -653,7 +673,8 @@ int run(const std::string& robot_ip, const std::string& shared_path) {
   }
   if (!finiteArray(shared.maximum_joint_velocities, 7) ||
       !finiteArray(shared.maximum_joint_accelerations, 7) ||
-      !finiteArray(shared.maximum_joint_jerks, 7) || shared.dls_lambda <= 0.0 ||
+      !finiteArray(shared.maximum_joint_jerks, 7) ||
+      !finiteArray(shared.tool_tcp_offset_ee, 3) || shared.dls_lambda <= 0.0 ||
       !std::isfinite(shared.maximum_joint_target_delta_rad) ||
       shared.maximum_joint_target_delta_rad <= 0.0 || shared.control_watchdog_s <= 0.0 ||
       shared.policy_watchdog_s <= 0.0) {
@@ -663,6 +684,11 @@ int run(const std::string& robot_ip, const std::string& shared_path) {
   if (control_law != ControlLaw::kJointPositionPursuit &&
       control_law != ControlLaw::kSimActuatorVelocity) {
     throw std::runtime_error("unknown control_law");
+  }
+  const ImpedanceMode impedance_mode = static_cast<ImpedanceMode>(shared.impedance_mode);
+  if (impedance_mode != ImpedanceMode::kJoint &&
+      impedance_mode != ImpedanceMode::kCartesian) {
+    throw std::runtime_error("unknown impedance_mode");
   }
   if (control_law == ControlLaw::kSimActuatorVelocity) {
     if (!std::isfinite(shared.reference_velocity_gain) || shared.reference_velocity_gain <= 0.0 ||
@@ -689,6 +715,34 @@ int run(const std::string& robot_ip, const std::string& shared_path) {
         throw std::runtime_error("joint_impedance values must be in (0, 14250]");
       }
     }
+  }
+  const bool set_cartesian_impedance = finiteArray(shared.cartesian_impedance, 6);
+  if (!set_cartesian_impedance) {
+    for (const double value : shared.cartesian_impedance) {
+      if (!std::isnan(value)) {
+        throw std::runtime_error(
+            "cartesian_impedance must be either six finite values or disabled (all NaN)");
+      }
+    }
+  } else {
+    for (size_t axis = 0; axis < 6; ++axis) {
+      const double lower = axis < 3 ? 10.0 : 1.0;
+      const double upper = axis < 3 ? 3000.0 : 300.0;
+      if (shared.cartesian_impedance[axis] < lower ||
+          shared.cartesian_impedance[axis] > upper) {
+        throw std::runtime_error(
+            "cartesian_impedance must be [10, 3000] N/m for XYZ and [1, 300] Nm/rad for rotation");
+      }
+    }
+  }
+  if (impedance_mode == ImpedanceMode::kJoint && set_cartesian_impedance) {
+    throw std::runtime_error("cartesian_impedance requires impedance_mode='cartesian'");
+  }
+  if (impedance_mode == ImpedanceMode::kCartesian && !set_cartesian_impedance) {
+    throw std::runtime_error("cartesian_impedance is required in Cartesian impedance mode");
+  }
+  if (impedance_mode == ImpedanceMode::kCartesian && set_joint_impedance) {
+    throw std::runtime_error("joint_impedance must be disabled in Cartesian impedance mode");
   }
   if (shared.collision_behavior_enabled > 1U) {
     throw std::runtime_error("collision_behavior_enabled must be zero or one");
@@ -737,6 +791,12 @@ int run(const std::string& robot_ip, const std::string& shared_path) {
       std::copy(std::begin(shared.joint_impedance), std::end(shared.joint_impedance),
                 joint_impedance.begin());
       robot.setJointImpedance(joint_impedance);
+    }
+    if (set_cartesian_impedance) {
+      std::array<double, 6> cartesian_impedance{};
+      std::copy(std::begin(shared.cartesian_impedance), std::end(shared.cartesian_impedance),
+                cartesian_impedance.begin());
+      robot.setCartesianImpedance(cartesian_impedance);
     }
     franka::Model model = robot.loadModel();
     state = robot.readOnce();
@@ -898,9 +958,9 @@ int run(const std::string& robot_ip, const std::string& shared_path) {
             throw std::runtime_error("action target contains NaN or Inf");
           }
           target_pose = command.target_pose;
-          if (!insideWorkspace(translation(target_pose), shared)) {
+          if (!insideWorkspace(toolTcpTranslation(target_pose, shared), shared)) {
             error_code = ErrorCode::kWorkspace;
-            throw std::runtime_error("latched TCP target is outside configured workspace");
+            throw std::runtime_error("latched physical tool TCP target is outside configured workspace");
           }
           latched_generation = command.action_generation;
           dls_ticks_on_generation = 0;
@@ -958,7 +1018,10 @@ int run(const std::string& robot_ip, const std::string& shared_path) {
             maximum_joint_jerk, q_dls_target, state.q_d, state.dq_d, state.ddq_d);
       }
       return franka::JointPositions(q_command);
-    }, franka::ControllerMode::kJointImpedance, false, franka::kMaxCutoffFrequency);
+    }, impedance_mode == ImpedanceMode::kCartesian
+           ? franka::ControllerMode::kCartesianImpedance
+           : franka::ControllerMode::kJointImpedance,
+       false, franka::kMaxCutoffFrequency);
     copyState(shared, state, q_command, Status::kStopped, ErrorCode::kNone, "");
     return 0;
   } catch (const franka::ControlException& exception) {
@@ -1014,11 +1077,11 @@ int main(int argc, char** argv) {
         return 1;
       }
     }
-    if (sizeof(SharedData) != 443816 || sizeof(TraceEntry) != 144 ||
-        sizeof(FciLogEntry) != 288 || offsetof(SharedData, fci_log) != 148688 ||
-        offsetof(SharedData, control_law) != 520 || offsetof(SharedData, state_seq) != 544 ||
-        offsetof(SharedData, trace) != 1224 ||
-        offsetof(SharedData, collision_behavior_enabled) != 443600) {
+    if (sizeof(SharedData) != 444024 || sizeof(TraceEntry) != 144 ||
+        sizeof(FciLogEntry) != 288 || offsetof(SharedData, fci_log) != 148896 ||
+        offsetof(SharedData, control_law) != 600 || offsetof(SharedData, state_seq) != 624 ||
+        offsetof(SharedData, trace) != 1432 ||
+        offsetof(SharedData, collision_behavior_enabled) != 443808) {
       std::cerr << "shared-memory layout self-test failed\n";
       return 1;
     }

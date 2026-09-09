@@ -1,0 +1,156 @@
+{
+  "kind": "tacex_rma_gelsight_x040_dr_three_frame_student_torchscript",
+  "version": 1,
+  "student_checkpoint": "/data2/skrl/sim2real_cube_real_alignment_rma_gelsight_x040_dr_three_frame_student_x040_normalized_heatmap_init/2026-08-15_14-38-57_distillation/checkpoints/student_0030000.pt",
+  "student_checkpoint_sha256": "51a89f7f95b95461c04130dd55a8229855003a273e673a6bdd25216ee2286321",
+  "torchscript_sha256": "93cb2825dbe684ae94cb4bd07d0c6a186f35fdaa2bc7046a52db18653fecc437",
+  "input_order": [
+    "wrist_rgb_history",
+    "proprio_obs",
+    "action_history",
+    "gsmini_left_rgb",
+    "gsmini_right_rgb",
+    "gsmini_left_reference_rgb",
+    "gsmini_right_reference_rgb"
+  ],
+  "input_signature": {
+    "input_order": [
+      "wrist_rgb_history",
+      "proprio_obs",
+      "action_history",
+      "gsmini_left_rgb",
+      "gsmini_right_rgb",
+      "gsmini_left_reference_rgb",
+      "gsmini_right_reference_rgb"
+    ],
+    "wrist_rgb_history": [
+      3,
+      224,
+      224,
+      3
+    ],
+    "proprio_obs": [
+      15
+    ],
+    "action_history": [
+      4
+    ],
+    "tactile_delta": "signed_float32_current_minus_reference_div_255",
+    "runtime_output": {
+      "action": [
+        4
+      ],
+      "left_right_contact_probability": [
+        2
+      ],
+      "cube_position_root_m": [
+        3
+      ]
+    },
+    "training_only_labels": [
+      "rma_cube_pos",
+      "rma_contact_state"
+    ],
+    "gsmini_left_rgb": [
+      96,
+      128,
+      3
+    ],
+    "gsmini_right_rgb": [
+      96,
+      128,
+      3
+    ],
+    "gsmini_left_reference_rgb": [
+      96,
+      128,
+      3
+    ],
+    "gsmini_right_reference_rgb": [
+      96,
+      128,
+      3
+    ]
+  },
+  "output_signature": {
+    "action": [
+      4
+    ],
+    "left_right_contact_probability": [
+      2
+    ],
+    "cube_position_root_m": [
+      3
+    ]
+  },
+  "student_model_contract": {
+    "model_version": 3,
+    "runtime_input_order": [
+      "wrist_rgb_history",
+      "proprio_obs",
+      "action_history",
+      "gsmini_left_rgb",
+      "gsmini_right_rgb",
+      "gsmini_left_reference_rgb",
+      "gsmini_right_reference_rgb"
+    ],
+    "runtime_output": {
+      "action": [
+        4
+      ],
+      "left_right_contact_probability": [
+        2
+      ],
+      "cube_position_root_m": [
+        3
+      ]
+    },
+    "visual_encoder": "shared_resnet18_layer4_global_average_pool_per_frame",
+    "frame_order": "oldest_to_newest",
+    "temporal_fusion": [
+      1536,
+      512
+    ],
+    "tactile_feature": "shared_cnn_signed_current_minus_reference_256_per_side",
+    "actor_feature_order": [
+      "temporal_visual[512]",
+      "left_tactile[256]",
+      "right_tactile[256]",
+      "normalized_proprio[15]",
+      "normalized_action_history[4]"
+    ],
+    "actor_feature_dim": 1043,
+    "action_head": [
+      1043,
+      512,
+      256,
+      128,
+      64,
+      4
+    ],
+    "position_head": [
+      512,
+      256,
+      128,
+      3
+    ],
+    "position_head_output": "unbounded_normalized_robot_root_xyz",
+    "contact_head": "shared_tactile_feature_256_to_logit_per_side",
+    "heatmap": "absent",
+    "runtime_privileged_inputs": [],
+    "position_normalization": "x040_wide_robot_root_xyz"
+  },
+  "validation": {
+    "cpu_batch_1_max_abs_error": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "cpu_batch_8_max_abs_error": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "cuda_validation": true
+}

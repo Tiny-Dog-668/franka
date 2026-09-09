@@ -4,7 +4,7 @@ import json
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
@@ -15,18 +15,26 @@ from .e2e_bundle import (
     _make_camera,
     _make_run_dir,
     _validate_bundle_action_dims,
+    capture_gelsight_reference_frames,
     evaluate_initial_state,
+    reject_evaluation_only_motion,
 )
 from .server9_ipc import STATUS_ABORTED, STATUS_RUNNING, Server9Worker, WorkerSnapshot
+from .gripper_process import ProcessGripperQueue
+from .hil import HILSettings, PygameHILKeyboard
+from .residual_runtime import ResidualDeploySettings
+from .real_rl.runtime import RealRLDeploySettings
 from .streaming import (
-    AsyncGripperQueue,
     _PolicyResult,
     _policy_record,
+    _retain_artifact_arrays,
     _rotation_to_quaternion_xyzw,
     _run_policy_tick,
     _sleep_until,
     _write_streaming_artifacts,
+    apply_hil_action,
     evaluate_streaming_check_state,
+    physical_tool_tcp_translation,
     policy_result_is_timely,
     reshape_column_major,
     validate_streaming_contract,
@@ -38,6 +46,9 @@ from .types import (
     print_error_wrench_report,
 )
 
+if TYPE_CHECKING:
+    from .real_rl.collector import RealRLCollector
+
 
 ROBOT_MODE_NAMES = {
     0: "Other", 1: "Idle", 2: "Move", 3: "Guiding", 4: "Reflex",
@@ -46,13 +57,30 @@ ROBOT_MODE_NAMES = {
 PROGRESS_INTERVAL_STEPS = 30
 
 
+def _offline_boundary_snapshot(camera: Any) -> tuple[np.ndarray, dict[str, Any]]:
+    """Snapshot the latest raw frame at the real action boundary without waiting."""
+
+    packet = camera.read_raw_packet()
+    metadata = {
+        "sequence": int(packet.sequence),
+        "capture_timestamp": float(packet.capture_timestamp),
+        "host_monotonic_s": float(packet.capture_timestamp),
+        "camera_timestamp_ms": packet.camera_timestamp_ms,
+        "camera_intrinsics": camera.camera_intrinsics(),
+        "source": "real_policy_boundary_latest_packet",
+    }
+    # read_raw_packet() already returns an isolated copy; avoid a second
+    # 640x480x3 copy on the policy boundary.
+    return np.asarray(packet.raw_rgb, dtype=np.uint8), metadata
+
+
 def _should_print_streaming_progress(completed_steps: int, total_steps: int) -> bool:
     return completed_steps % PROGRESS_INTERVAL_STEPS == 0 or completed_steps == total_steps
 
 
 def _print_server9_error_snapshot(
     worker: Server9Worker,
-    gripper_queue: AsyncGripperQueue | None,
+    gripper_queue: ProcessGripperQueue | None,
     *,
     context: str,
     force: bool = False,
@@ -100,9 +128,9 @@ def _print_streaming_progress(
         return
     accepted_steps = completed_steps - deadline_misses
     lines = [
-        "Streaming progress: "
-        f"{completed_steps}/{total_steps} steps "
-        f"(accepted={accepted_steps}, deadline_misses={deadline_misses})"
+        "========== STREAMING PROGRESS: "
+        f"{completed_steps}/{total_steps} STEPS ==========",
+        f"  accepted={accepted_steps}, deadline_misses={deadline_misses}",
     ]
     if observation is not None:
         force_norm, torque_norm = external_wrench_norms(observation)
@@ -114,17 +142,25 @@ def _print_streaming_progress(
         lines.append(
             "  robot: "
             f"mode={observation.robot_mode} "
-            f"tcp=[{observation.tcp_translation[0]:+.4f}, "
-            f"{observation.tcp_translation[1]:+.4f}, "
-            f"{observation.tcp_translation[2]:+.4f}]m "
             f"gripper={gripper} "
             f"|F|={force_norm:.2f}N |M|={torque_norm:.2f}Nm"
         )
     if result is not None:
         rma = result.inference_info
         cube_position = rma.get("cube_position_root")
-        contact_state = rma.get("contact_state")
-        if cube_position is not None or contact_state is not None:
+        # Current three-frame GelSight exports return the contact head's
+        # sigmoid probabilities directly from regular forward(). Older RMA
+        # diagnostics use ``contact_state`` for the same two-value quantity.
+        contact_probability = rma.get("contact_probability", rma.get("contact_state"))
+        xy_contact_force = rma.get("rma_contact_force_n")
+        if xy_contact_force is not None:
+            contact_text = ", ".join(f"{float(value):.2f}" for value in xy_contact_force)
+            lines.append(
+                "  policy_obs: "
+                f"contact_force_n=[{contact_text}] "
+                f"grasped={bool(rma.get('rma_grasped', False))}"
+            )
+        elif cube_position is not None or contact_probability is not None:
             cube_text = (
                 "none"
                 if cube_position is None
@@ -132,23 +168,51 @@ def _print_streaming_progress(
                 + ", ".join(f"{float(value):+.4f}" for value in cube_position)
                 + "]m"
             )
-            contact_text = (
+            contact_probability_text = (
                 "none"
-                if contact_state is None
-                else "[" + ", ".join(f"{float(value):.3f}" for value in contact_state) + "]"
+                if contact_probability is None
+                else "["
+                + ", ".join(f"{float(value):.3f}" for value in contact_probability)
+                + "]"
+            )
+            contact_active = rma.get("contact_active")
+            contact_active_text = (
+                ""
+                if contact_active is None
+                else " active_lr="
+                + "["
+                + ", ".join("yes" if bool(value) else "no" for value in contact_active)
+                + "]"
             )
             lines.append(
                 "  policy_obs: "
                 f"cube_position_root={cube_text} "
-                f"contact_lr={contact_text} "
-                f"source=pos:{rma.get('rma_position_source', '?')}/"
-                f"contact:{rma.get('rma_contact_source', '?')}"
+                f"contact_head_probability_lr={contact_probability_text} "
+                f"{contact_active_text}"
+                f"source=pos:{rma.get('rma_position_source', 'forward')}/"
+                f"contact:{rma.get('rma_contact_source', 'forward')}"
             )
         else:
             lines.append(
                 "  policy_obs: "
-                "cube_position_root/contact_state not collected on this step"
+                "cube_position_root/contact_head_probability not collected on this step"
             )
+        history_text = ", ".join(f"{float(value):+.4f}" for value in result.action_history)
+        proprio_text = ", ".join(f"{float(value):+.4f}" for value in result.proprio)
+        contact_input_text = (
+            "none"
+            if result.contact_force_n is None
+            else "[" + ", ".join(
+                f"{float(value):.2f}" for value in result.contact_force_n
+            ) + "]"
+        )
+        lines.append(
+            "  policy_input: "
+            f"rgb={list(result.image.shape)} "
+            f"action_history=[{history_text}] "
+            f"proprio_obs=[{proprio_text}] "
+            f"contact_force_n={contact_input_text}"
+        )
         robot_action = result.robot_action
         status = "accepted" if accepted else "held"
         raw = ", ".join(f"{float(value):+.3f}" for value in result.raw_action)
@@ -165,6 +229,35 @@ def _print_streaming_progress(
             f"{robot_action.dy:+.4f}, {robot_action.dz:+.4f}]m "
             f"gripper_target={gripper_target}"
         )
+        real_rl = result.inference_info.get("real_rl")
+        if isinstance(real_rl, dict):
+            residual_mm = [1000.0 * float(value) for value in real_rl["residual_action_m"]]
+            unit = [float(value) for value in real_rl["sac_unit_action"]]
+            lines.append(
+                "  real_rl: "
+                f"mode={real_rl['mode']} "
+                f"unit=[{unit[0]:+.3f}, {unit[1]:+.3f}, {unit[2]:+.3f}] "
+                f"residual_mm=[{residual_mm[0]:+.3f}, {residual_mm[1]:+.3f}, "
+                f"{residual_mm[2]:+.3f}] fallback={bool(real_rl['fallback'])}"
+            )
+        if result.hil_step is not None:
+            base = ", ".join(
+                f"{float(value):+.3f}" for value in result.hil_step.base_action
+            )
+            human = (
+                "none"
+                if result.hil_step.human_action is None
+                else "["
+                + ", ".join(
+                    f"{float(value):+.3f}" for value in result.hil_step.human_action
+                )
+                + "]"
+            )
+            lines.append(
+                "  hil: "
+                f"intervention={result.hil_step.intervention} "
+                f"base=[{base}] human={human}"
+            )
     if timing_ms:
         lines.append(
             "  timing_ms: "
@@ -180,9 +273,14 @@ def _print_streaming_progress(
 
 
 def snapshot_to_observation(
-    snapshot: WorkerSnapshot, gripper_state: Any | None, *, in_control: bool
+    snapshot: WorkerSnapshot,
+    gripper_state: Any | None,
+    *,
+    in_control: bool,
+    config: BundleDeployConfig | None = None,
 ) -> RobotObservation:
     pose = reshape_column_major(snapshot.O_T_EE, 4, 4)
+    flange_to_tcp = reshape_column_major(snapshot.F_T_EE, 4, 4)
     observation = RobotObservation(
         joint_positions=list(snapshot.q),
         joint_velocities=list(snapshot.dq),
@@ -201,8 +299,14 @@ def snapshot_to_observation(
             "latched_action_generation": snapshot.latched_action_generation,
             "ik_tick_count": snapshot.ik_tick_count,
             "control_cycle_count": snapshot.control_cycle_count,
+            "flange_to_tcp_translation_m": flange_to_tcp[:3, 3].tolist(),
+            "flange_to_tcp_transform_column_major": list(snapshot.F_T_EE),
         },
     )
+    if config is not None:
+        observation.metadata["physical_tool_tcp_translation_m"] = (
+            physical_tool_tcp_translation(pose, config).tolist()
+        )
     if gripper_state is not None:
         observation.gripper_width = float(gripper_state.width)
         observation.gripper_max_width = float(gripper_state.max_width)
@@ -350,7 +454,7 @@ def _write_fci_diagnostics(
 
 def _stop_resources(
     worker: Server9Worker | None,
-    gripper_queue: AsyncGripperQueue | None,
+    gripper_queue: ProcessGripperQueue | None,
     run_dir: Path,
     config: BundleDeployConfig,
 ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -380,23 +484,45 @@ def _preview(
     history: ActionHistoryBuffer,
     observation: RobotObservation,
     first_policy: _PolicyResult,
-    gripper_queue: AsyncGripperQueue | None,
+    gripper_queue: ProcessGripperQueue | None,
     config: BundleDeployConfig,
     allow_full_scale: bool,
     timing: dict[str, Any],
     records: list[dict[str, Any]],
-    images: list[np.ndarray],
+    images: list[np.ndarray | None],
     clock_ns: Callable[[], int],
     sleep: Callable[[float], None],
+    hil_settings: HILSettings | None = None,
+    hil_keyboard: PygameHILKeyboard | None = None,
+    episode_id: str | None = None,
+    real_rl_collector: "RealRLCollector | None" = None,
+    save_step_data: bool = False,
 ) -> None:
     period_ns = round(1e9 / config.streaming.policy_frequency_hz)
     start_ns = clock_ns()
     for step_index in range(config.runner.steps):
         _sleep_until(start_ns + step_index * period_ns, clock_ns, sleep)
+        offline_raw_image: np.ndarray | None = None
+        offline_camera_frame: dict[str, Any] | None = None
+        if real_rl_collector is not None:
+            offline_raw_image, offline_camera_frame = _offline_boundary_snapshot(camera)
         result = first_policy if step_index == 0 else _run_policy_tick(
             bundle, camera, history, observation, config, allow_full_scale,
             float(gripper_queue.desired_width if gripper_queue else 0.0), clock_ns,
         )
+        if hil_settings is not None and hil_settings.enabled:
+            if hil_keyboard is None:
+                raise RuntimeError("HIL preview is missing its keyboard listener")
+            result = apply_hil_action(
+                result,
+                hil_keyboard.sample(),
+                hil_settings,
+                config,
+                allow_full_scale,
+                float(gripper_queue.desired_width if gripper_queue else 0.0),
+            )
+        if real_rl_collector is not None:
+            real_rl_collector.observe_boundary(step_index, observation, result)
         timing["maximum_policy_elapsed_ms"] = max(
             timing["maximum_policy_elapsed_ms"], result.elapsed_ns / 1e6
         )
@@ -404,11 +530,45 @@ def _preview(
             result.elapsed_ns, period_ns, round(config.streaming.policy_watchdog_s * 1e9)
         )
         if timely:
-            history.update(result.raw_action, result.executed_action)
+            if real_rl_collector is None:
+                history.update(result.raw_action, result.executed_action)
         else:
             timing["policy_deadline_misses"] += 1
-        records.append(_policy_record(step_index, observation, result, timely, False))
-        images.append(result.image)
+        if real_rl_collector is not None:
+            real_rl_collector.record_action(result, False)
+        record = _policy_record(
+            step_index,
+            observation,
+            result,
+            timely,
+            False,
+            episode_id=episode_id,
+            policy_action_accepted=(
+                False
+                if (hil_settings is not None and hil_settings.enabled)
+                or real_rl_collector is not None
+                else None
+            ),
+        )
+        if offline_raw_image is not None:
+            record["_raw_image"] = offline_raw_image
+            record["_offline_boundary_camera_frame"] = dict(
+                offline_camera_frame or {}
+            )
+        records.append(record)
+        images.append(_retain_artifact_arrays(record, result, config, save_step_data))
+    if real_rl_collector is not None:
+        final_raw_image, final_camera_frame = _offline_boundary_snapshot(camera)
+        final_result = _run_policy_tick(
+            bundle, camera, history, observation, config, allow_full_scale,
+            float(gripper_queue.desired_width if gripper_queue else 0.0), clock_ns,
+        )
+        real_rl_collector.observe_boundary(
+            config.runner.steps, observation, final_result, truncate=True
+        )
+        if records:
+            records[-1]["_offline_next_raw_image"] = final_raw_image
+            records[-1]["_offline_next_camera_frame"] = final_camera_frame
     elapsed_s = max(0.0, (clock_ns() - start_ns) / 1e9)
     timing.update({
         "preview_only": True,
@@ -427,13 +587,33 @@ def run_server9_streaming_bundle_deploy(
     save_step_data: bool = False,
     allow_full_scale: bool = False,
     streaming_check: bool = False,
+    hil_settings: HILSettings | None = None,
+    residual_settings: ResidualDeploySettings | None = None,
+    real_rl_settings: RealRLDeploySettings | None = None,
     *,
     clock_ns: Callable[[], int] = time.monotonic_ns,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
+    hil_enabled = bool(hil_settings is not None and hil_settings.enabled)
+    if hil_settings is not None:
+        hil_settings.validate()
+    if hil_enabled and streaming_check:
+        raise ValueError("--hil cannot be combined with --streaming-check")
+    if residual_settings is not None and streaming_check:
+        raise ValueError("Residual BC cannot be combined with --streaming-check")
+    if residual_settings is not None and hil_enabled:
+        raise ValueError("Residual BC cannot be combined with --hil")
+    if real_rl_settings is not None and streaming_check:
+        raise ValueError("Real-RL cannot be combined with --streaming-check")
+    if real_rl_settings is not None and hil_enabled:
+        raise ValueError("Real-RL cannot be combined with HIL")
+    if real_rl_settings is not None and residual_settings is not None:
+        raise ValueError("Real-RL cannot be combined with Residual BC")
+    if hil_enabled:
+        save_step_data = True
     run_dir = _make_run_dir(config)
     records: list[dict[str, Any]] = []
-    images: list[np.ndarray] = []
+    images: list[np.ndarray | None] = []
     control_trace: list[dict[str, Any]] = []
     timing: dict[str, Any] = {
         "backend": "server9_joint_position",
@@ -447,10 +627,26 @@ def run_server9_streaming_bundle_deploy(
         "maximum_latch_wait_ms": 0.0,
         "maximum_loop_body_ms": 0.0,
     }
+    if hil_enabled:
+        assert hil_settings is not None
+        timing.update({
+            "hil_enabled": True,
+            "hil_speed_m_s": float(hil_settings.speed_m_s),
+        })
+    if residual_settings is not None:
+        timing.update({
+            "residual_bc_enabled": True,
+            "residual_scale": float(residual_settings.scale),
+            "residual_max_abs": float(residual_settings.max_abs),
+        })
+    if real_rl_settings is not None:
+        timing["real_rl_enabled"] = True
     bundle: BundleTorchScriptPolicy | None = None
     camera: Any | None = None
-    gripper_queue: AsyncGripperQueue | None = None
+    gripper_queue: ProcessGripperQueue | None = None
     worker: Server9Worker | None = None
+    hil_keyboard: PygameHILKeyboard | None = None
+    real_rl_collector: "RealRLCollector | None" = None
     initial_report: dict[str, Any] = {"passed": False, "checks": {}, "failures": []}
     stopped = False
     printed_error_report = False
@@ -465,23 +661,35 @@ def run_server9_streaming_bundle_deploy(
                 rma_position_source=config.model.rma_position_source,
                 rma_contact_source=config.model.rma_contact_source,
                 rma_oracle_cube_position_root=config.model.rma_oracle_cube_position_root,
+                residual_settings=residual_settings,
+                real_rl_settings=real_rl_settings,
             )
             _validate_bundle_action_dims(bundle, config)
+            reject_evaluation_only_motion(bundle, execute_motion)
             validate_streaming_contract(bundle, config)
+            if bundle.residual_runtime is not None:
+                timing["residual_bc"] = bundle.residual_runtime.report()
+            if bundle.real_rl_runtime is not None:
+                timing["real_rl"] = bundle.real_rl_runtime.report()
+                if bundle.real_rl_runtime.requires_episode_refusal:
+                    raise RuntimeError(
+                        "Real-RL checkpoint validation failed; refusing episode start. "
+                        "Residual is zero, but fallback collection requires the explicit "
+                        "--allow-checkpoint-fallback-collect opt-in. Reason: "
+                        + str(bundle.real_rl_runtime.fallback_reason)
+                    )
 
         worker = Server9Worker(config, worker_path=_worker_binary(config))
         initial_snapshot = worker.wait_ready()
         if not streaming_check:
-            from franky import Gripper
-
-            gripper_queue = AsyncGripperQueue(
-                Gripper(config.robot_ip), config.gripper_speed,
+            gripper_queue = ProcessGripperQueue(
+                config.robot_ip, config.gripper_speed,
                 config.gripper_command_tolerance_m, config.gripper_force,
             )
             worker.set_abort_callback(gripper_queue.stop)
         initial_observation = snapshot_to_observation(
             initial_snapshot, gripper_queue.cached_state if gripper_queue else None,
-            in_control=False,
+            in_control=False, config=config,
         )
         initial_report = (
             evaluate_streaming_check_state(initial_observation, config)
@@ -505,6 +713,19 @@ def run_server9_streaming_bundle_deploy(
                 tactile_config=config.tactile_camera,
                 gelsight_input_shapes=getattr(bundle, "gelsight_input_shapes", {}),
             )
+            capture_gelsight_reference_frames(camera, bundle)
+            if real_rl_settings is not None:
+                from .real_rl.collector import RealRLCollector
+
+                print(
+                    "Real-RL AprilTag preflight: waiting for "
+                    f"{real_rl_settings.config.apriltag.preflight_valid_detections} valid detections...",
+                    flush=True,
+                )
+                real_rl_collector = RealRLCollector(real_rl_settings, camera, run_dir)
+                timing["real_rl_initial_object_z_in_base"] = (
+                    real_rl_collector.initial_object_z_in_base
+                )
             history = ActionHistoryBuffer(
                 bundle.history_dim, config.model.history_source,
                 config.model.history_scale, config.model.history_delay_steps,
@@ -517,16 +738,41 @@ def run_server9_streaming_bundle_deploy(
             warmup_args = (
                 np.zeros(bundle.history_dim, dtype=np.float32),
                 np.zeros(bundle.proprio_dim, dtype=np.float32),
-                np.zeros((bundle.rgb_height, bundle.rgb_width, 3), dtype=np.uint8),
+                np.zeros(
+                    getattr(
+                        bundle,
+                        "rgb_input_shape",
+                        (bundle.rgb_height, bundle.rgb_width, 3),
+                    ),
+                    dtype=np.uint8,
+                ),
+            )
+            warmup_contact_force = (
+                np.zeros(getattr(bundle, "contact_force_dim", 0), dtype=np.float32)
+                if getattr(bundle, "contact_force_dim", 0)
+                else None
             )
             if tactile_zeros:
                 bundle.predict(
                     *warmup_args,
                     tactile_zeros["gsmini_left_rgb"],
                     tactile_zeros["gsmini_right_rgb"],
+                    gsmini_left_reference_rgb=tactile_zeros.get(
+                        "gsmini_left_reference_rgb"
+                    ),
+                    gsmini_right_reference_rgb=tactile_zeros.get(
+                        "gsmini_right_reference_rgb"
+                    ),
+                    contact_force_n=warmup_contact_force,
                 )
             else:
-                bundle.predict(*warmup_args)
+                if warmup_contact_force is None:
+                    bundle.predict(*warmup_args)
+                else:
+                    bundle.predict(*warmup_args, contact_force_n=warmup_contact_force)
+            if bundle.real_rl_runtime is not None:
+                # 模型 dummy warmup 不得消耗 episode 的首个 AR(1) 探索样本。
+                bundle.real_rl_runtime.reset_episode()
             # The first D435 frame can exceed one 30 Hz policy period despite
             # camera startup warmup. Consume it before the proposed action and
             # before the FCI control loop; it cannot affect action history or motion.
@@ -542,10 +788,25 @@ def run_server9_streaming_bundle_deploy(
                 raise ValueError("--streaming-check cannot be combined with --preview-only")
             assert bundle is not None and camera is not None and history is not None
             assert first_policy is not None
+            if hil_enabled:
+                assert hil_settings is not None
+                hil_keyboard = PygameHILKeyboard(hil_settings)
+                hil_keyboard.start()
+                print("HIL window opened; focus it and press Enter to arm preview.")
+                hil_keyboard.wait_until_ready()
             _preview(
                 bundle, camera, history, initial_observation, first_policy, gripper_queue,
                 config, allow_full_scale, timing, records, images, clock_ns, sleep,
+                hil_settings=hil_settings,
+                hil_keyboard=hil_keyboard,
+                episode_id=run_dir.name if hil_enabled else None,
+                real_rl_collector=real_rl_collector,
+                save_step_data=save_step_data,
             )
+            if real_rl_collector is not None:
+                real_rl_collector.close()
+                timing["real_rl_collection"] = real_rl_collector.report()
+                real_rl_collector = None
             cleanup_errors, control_trace = _stop_resources(
                 worker, gripper_queue, run_dir, config
             )
@@ -574,6 +835,13 @@ def run_server9_streaming_bundle_deploy(
                     save_step_data,
                 )
 
+        if hil_enabled:
+            assert hil_settings is not None
+            hil_keyboard = PygameHILKeyboard(hil_settings)
+            hil_keyboard.start()
+            print("HIL window opened; focus it and press Enter before control starts.")
+            hil_keyboard.wait_until_ready()
+
         worker.start(streaming_check=streaming_check)
         _wait_running(worker, 2.0)
         if gripper_queue is not None:
@@ -594,17 +862,24 @@ def run_server9_streaming_bundle_deploy(
             assert bundle is not None and camera is not None and history is not None
             pending_result = first_policy
             last_accepted_generation: int | None = None
+            stopped_for_success = False
             for step_index in range(config.runner.steps):
                 loop_started_ns = clock_ns()
                 deadline_ns = start_ns + step_index * period_ns
                 lateness_ns = _sleep_until(deadline_ns, clock_ns, sleep)
+                offline_raw_image: np.ndarray | None = None
+                offline_camera_frame: dict[str, Any] | None = None
+                if real_rl_collector is not None:
+                    offline_raw_image, offline_camera_frame = _offline_boundary_snapshot(
+                        camera
+                    )
                 timing["maximum_control_lateness_ms"] = max(
                     timing["maximum_control_lateness_ms"], max(0, lateness_ns) / 1e6
                 )
                 snapshot = worker.snapshot()
                 observation = snapshot_to_observation(
                     snapshot, gripper_queue.cached_state if gripper_queue else None,
-                    in_control=True,
+                    in_control=True, config=config,
                 )
                 if observation.has_errors:
                     print_error_wrench_report(
@@ -634,6 +909,23 @@ def run_server9_streaming_bundle_deploy(
                             config.runner.steps,
                         ),
                     )
+                if hil_enabled:
+                    assert hil_settings is not None and hil_keyboard is not None
+                    result = apply_hil_action(
+                        result,
+                        hil_keyboard.sample(),
+                        hil_settings,
+                        config,
+                        allow_full_scale,
+                        float(gripper_queue.desired_width if gripper_queue else 0.0),
+                    )
+                if real_rl_collector is not None:
+                    stopped_for_success = real_rl_collector.observe_boundary(
+                        step_index, observation, result
+                    )
+                    if stopped_for_success:
+                        print("Real-RL success condition reached; ending episode.", flush=True)
+                        break
                 timing["maximum_policy_elapsed_ms"] = max(
                     timing["maximum_policy_elapsed_ms"], result.elapsed_ns / 1e6
                 )
@@ -662,7 +954,10 @@ def run_server9_streaming_bundle_deploy(
                     "gripper_poll": 0.0,
                     "latch_wait": 0.0,
                 }
+                action_timestamp: float | None = None
                 if timely:
+                    # 与 CameraFramePacket.capture_timestamp 使用同一 monotonic 时钟域。
+                    action_timestamp = time.monotonic()
                     worker.send_action(step_index + 1, [
                         result.robot_action.dx, result.robot_action.dy, result.robot_action.dz,
                     ], snapshot.O_T_EE)
@@ -682,7 +977,7 @@ def run_server9_streaming_bundle_deploy(
                         next_observation = snapshot_to_observation(
                             next_snapshot,
                             gripper_queue.cached_state if gripper_queue else None,
-                            in_control=True,
+                            in_control=True, config=config,
                         )
                         pending_result = _run_policy_tick(
                             bundle,
@@ -721,6 +1016,10 @@ def run_server9_streaming_bundle_deploy(
                     if absolute_deadline_expired:
                         timing["absolute_policy_deadline_misses"] += 1
                     worker.hold_policy_target()
+                if real_rl_collector is not None:
+                    real_rl_collector.record_action(
+                        result, timely, action_timestamp=action_timestamp
+                    )
                 if gripper_queue is not None:
                     gripper_poll_started_ns = clock_ns()
                     gripper_queue.poll()
@@ -742,16 +1041,25 @@ def run_server9_streaming_bundle_deploy(
                 timing["maximum_loop_body_ms"] = max(
                     timing["maximum_loop_body_ms"], step_timing_ms["loop_body"]
                 )
-                records.append(_policy_record(
+                record = _policy_record(
                     step_index,
                     observation,
                     result,
                     timely,
                     True,
+                    episode_id=run_dir.name if hil_enabled else None,
                     deadline_lateness_ns=decision_lateness_ns,
                     timing_ms=step_timing_ms,
-                ))
-                images.append(result.image)
+                )
+                if offline_raw_image is not None:
+                    record["_raw_image"] = offline_raw_image
+                    record["_offline_boundary_camera_frame"] = dict(
+                        offline_camera_frame or {}
+                    )
+                records.append(record)
+                images.append(
+                    _retain_artifact_arrays(record, result, config, save_step_data)
+                )
                 _print_streaming_progress(
                     step_index + 1,
                     config.runner.steps,
@@ -785,6 +1093,36 @@ def run_server9_streaming_bundle_deploy(
                         force=True,
                     )
                     raise
+
+            if real_rl_collector is not None and not stopped_for_success:
+                final_raw_image, final_camera_frame = _offline_boundary_snapshot(camera)
+                final_snapshot = worker.snapshot()
+                final_observation = snapshot_to_observation(
+                    final_snapshot,
+                    gripper_queue.cached_state if gripper_queue else None,
+                    in_control=True,
+                    config=config,
+                )
+                final_result = _run_policy_tick(
+                    bundle,
+                    camera,
+                    history,
+                    final_observation,
+                    config,
+                    allow_full_scale,
+                    float(gripper_queue.desired_width if gripper_queue else 0.0),
+                    clock_ns,
+                )
+                real_rl_collector.observe_boundary(
+                    len(records), final_observation, final_result, truncate=True
+                )
+                if records:
+                    records[-1]["_offline_next_raw_image"] = final_raw_image
+                    records[-1]["_offline_next_camera_frame"] = final_camera_frame
+            if real_rl_collector is not None:
+                real_rl_collector.close()
+                timing["real_rl_collection"] = real_rl_collector.report()
+                real_rl_collector = None
 
         cleanup_errors, control_trace = _stop_resources(
             worker, gripper_queue, run_dir, config
@@ -831,6 +1169,13 @@ def run_server9_streaming_bundle_deploy(
         timing.update({
             "aborted": True, "exception_type": type(exc).__name__, "exception": str(exc),
         })
+        if real_rl_collector is not None:
+            try:
+                real_rl_collector.close()
+                timing["real_rl_collection"] = real_rl_collector.report()
+            except Exception as collector_exc:
+                timing["real_rl_collector_close_error"] = str(collector_exc)
+            real_rl_collector = None
         try:
             _write_streaming_artifacts(
                 run_dir, config, initial_report, records, images, control_trace, timing,
@@ -849,8 +1194,19 @@ def run_server9_streaming_bundle_deploy(
                 warnings.warn("; ".join(cleanup_errors), RuntimeWarning, stacklevel=2)
         if worker is not None:
             worker.close()
+        if real_rl_collector is not None:
+            try:
+                real_rl_collector.close()
+                timing["real_rl_collection"] = real_rl_collector.report()
+            except Exception as exc:
+                warnings.warn(f"Real-RL collector close: {exc}", RuntimeWarning, stacklevel=2)
         if camera is not None:
             try:
                 camera.close()
             except Exception as exc:
                 warnings.warn(f"camera close: {exc}", RuntimeWarning, stacklevel=2)
+        if hil_keyboard is not None:
+            try:
+                hil_keyboard.close()
+            except Exception as exc:
+                warnings.warn(f"HIL keyboard close: {exc}", RuntimeWarning, stacklevel=2)

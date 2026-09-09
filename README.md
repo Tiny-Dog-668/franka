@@ -4,6 +4,27 @@ Franka 真机控制、RealSense 图像采集、TorchScript policy 部署和基�
 
 > 真机运行前请清空工作空间、准备急停，并先使用 `--preview-only` 或单步确认。
 
+## 目录
+
+- [快速开始](#快速开始)
+- [常用命令速查](#常用命令速查)
+- [常用机器人操作](#常用机器人操作)
+- Policy 部署
+  - [0809 Direct-Action Policy 部署](#0809-direct-action-policy-部署)
+  - [0809 X040-Wide Direct-Action Policy 部署](#0809-x040-wide-direct-action-policy-部署)
+  - [0809 XY Policy 部署](#0809-xy-policy-部署)
+  - [0726 Policy 部署](#0726-policy-部署)
+  - [0801 Policy Streaming 部署](#0801-policy-streaming-部署)
+  - [HIL Residual BC 数据采集](#hil-residual-bc-数据采集)
+  - [0802 比例控制律部署（sim_actuator_velocity）](#0802-比例控制律部署sim_actuator_velocity)
+  - [Policy 真机测试（0711 默认入口）](#policy-真机测试0711-默认入口)
+- [相机和对齐](#相机和对齐)
+- [常用诊断](#常用诊断)
+- [重要配置](#重要配置)
+- [输出日志](#输出日志)
+- [目录结构](#目录结构)
+- [安全原则](#安全原则)
+
 ## 快速开始
 
 ```bash
@@ -22,6 +43,94 @@ bash tools/system/verify_franka_host.sh
 bash tools/system/check_franka_network.sh 172.16.0.2
 python scripts/robot/read_franka_state.py --ip 172.16.0.2
 ```
+
+## 常用命令速查
+
+下面按任务归纳最常用的命令，详细说明和参数见后续对应章节。所有命令默认在
+`/home/td/franka` 下、已 `source .venv/bin/activate` 且已 `export FRANKA_ROBOT_IP=172.16.0.2`。
+
+### 环境与连接检查
+
+| 目的 | 命令 |
+| --- | --- |
+| 检查主机 realtime/权限 | `bash tools/system/verify_franka_host.sh` |
+| 检查网络到机器人 | `bash tools/system/check_franka_network.sh 172.16.0.2` |
+| 读取一次机器人状态 | `python scripts/robot/read_franka_state.py --ip 172.16.0.2` |
+
+### 机器人基础操作
+
+| 目的 | 命令 |
+| --- | --- |
+| 连续读取状态 | `python scripts/robot/read_franka_state.py --ip 172.16.0.2 --count 0 --interval 1` |
+| 回到 policy 初始姿态 | `python scripts/robot/go_to_zero_pose.py --ip 172.16.0.2 --realtime ignore --speed 0.3 --transit-joint-impedance 1500 1500 1500 1200 1200 1000 1000` |
+| 松开夹爪 | `python scripts/robot/minimal_franka_move.py --ip 172.16.0.2 --gripper-open --gripper-speed 0.03` |
+| 小幅 Cartesian 位移 | `python scripts/robot/minimal_franka_move.py --ip 172.16.0.2 --dx 0.01 --speed 0.02 --realtime ignore` |
+| 键盘遥操作并采集真机轨迹 | `python scripts/robot/teleop_record_real_trajectory.py --ip 172.16.0.2` |
+
+### Policy 部署（通用验收顺序）
+
+先离线校验，再逐级放开，每一步确认无误后再进入下一步。把 `<runner>` 换成下表中对应日期的入口：
+
+```bash
+python scripts/policy/<runner> --validate-only          # 1. 不连接硬件的契约校验
+python scripts/policy/<runner> --steps 1 --preview-only  # 2. 只读状态和相机，不发送运动
+python scripts/policy/<runner> --streaming-check         # 3. streaming 入口的额外时序检查
+python scripts/policy/<runner> --steps 1                 # 4. 单步真机（需手动确认，勿加 --yes）
+python scripts/policy/<runner> --steps 15 --confirm-each-step  # 5. 多步逐步确认
+```
+
+部署入口遇到配置、相机、GPU、初始状态或 streaming 控制异常时，会打印“中文说明”“建议处理”和未改写的
+“原始错误”。需要保留完整 Python 调用栈供开发排查时，在原命令末尾加 `--debug`；这不会改变控制参数或
+安全门禁。
+
+| 部署版本 | 入口脚本 | 说明 |
+| --- | --- | --- |
+| 0711（默认） | `run_exported_0711.py` | 基础 blocking 部署入口 |
+| 0726 | `run_exported_0726.py` | 严格训练契约动作尺度 |
+| 0801 | `run_exported_0801.py` | server v9 原生 streaming backend |
+| 0802 比例控制律 | `run_exported_0802_dr_simactuator.py` | `sim_actuator_velocity`，速度与动作成正比 |
+| 0802 GPU | `run_exported_0802_dr_simactuator_gpu.py` | portable v6 DR，`cuda:0` |
+| 0803 heatmap | `run_exported_0803_dr_heatmap.py` | 需 `--model` / `--metadata` |
+| 0809 Direct-Action | `run_exported_0809_direct_action.py` | 仅 RGB、本体状态和动作历史 |
+| 0809 X040-Wide Direct-Action | `run_exported_0809_x040_wide_direct_action.py` | X040-Wide XYZ、无接触输入 |
+| 0809 XY | `run_exported_0809_xy_only.py` | XY RMA，需运行时抓取状态 |
+| 0823 GelSight | `run_exported_0823_gelsight.py` | 修正 161.3 mm 夹爪几何的三帧 RGB＋双 GelSight Student |
+
+> `--streaming-check` 仅 streaming 配置支持（包括 0801/0802/0823）；`0726` 只有 `--validate-only` / `--preview-only` / `--steps`。
+
+0823 GelSight 策略使用三帧腕部 RGB、左右 GelSight 当前帧和每回合固定参考帧。部署配置将物理
+workspace 检查点放在相对 `O_T_EE` 的 `+57.9 mm`，对应
+`panda_hand→最低点 161.3 mm - F_T_EE 103.4 mm`；它只改变安全检查点，不改变 IK 控制帧。
+默认关闭逐帧 RGB 落盘以降低 30 Hz 控制期间的 I/O 压力，结构化 rollout 写入
+`real_policy_logs/`。首次部署必须依次运行：
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0823_gelsight.py --validate-only
+.venv/bin/python scripts/policy/run_exported_0823_gelsight.py --steps 1 --preview-only --auto-gelsight
+.venv/bin/python scripts/policy/run_exported_0823_gelsight.py --streaming-check
+.venv/bin/python scripts/policy/run_exported_0823_gelsight.py --steps 1 --auto-gelsight
+```
+
+单步运动会要求人工确认，首次验收不要加 `--yes`、`--allow-full-scale` 或提高
+`--action-limit`。确认动作方向、最低点 workspace 和夹爪行为正确后，再逐渐增加步数。
+
+### 相机、对齐与视觉验证
+
+| 目的 | 命令 |
+| --- | --- |
+| 预览相机原图/crop/模型输入 | `python scripts/camera/preview_camera_crop.py --open` |
+| 实时查看 RMA 物体位置预测 | `python scripts/policy/monitor_rma_object_position.py --device cuda:0 --exposure 80 --gain 64` |
+| 用真值验证位置预测 | `python scripts/policy/validate_rma_object_position.py --realsense --ground-truth 0.50 0.00 0.026` |
+| 实时 AprilTag 方块位姿 | `python scripts/calibration/live_apriltag_cube_pose.py --ground-truth 0.50 0.00 0.026` |
+
+### 诊断
+
+| 目的 | 命令 |
+| --- | --- |
+| 静止外力/力矩 | `python scripts/diagnostics/test_franka_force_sensor.py --ip 172.16.0.2` |
+| action 坐标方向 | `python scripts/diagnostics/diagnose_franka_directions.py --robot-ip 172.16.0.2 --cases dx+ dx-` |
+| streaming 跟踪质量 | `python scripts/diagnostics/analyze_streaming_tracking.py --latest 1` |
+| 对比仿真/真机图像 | `python scripts/diagnostics/compare_sim_real_images.py --real <rgb 目录> --sim <episode.npz>` |
 
 ## 常用机器人操作
 
@@ -51,20 +160,95 @@ python scripts/robot/minimal_franka_move.py \
 python scripts/robot/go_to_zero_pose.py \
   --ip 172.16.0.2 \
   --realtime ignore \
-  --speed 0.3 \
-  --max-step-rad 0.3 \
+  --speed 0.1 \
+  --transit-joint-impedance 1500 1500 1500 1200 1200 1000 1000 \
   --gripper-speed 0.3
 ```
 
+默认使用一条连续 `JointMotion` 回到初始姿态，避免旧的多段轨迹在段间重新启动 motion generator 而触发
+速度/加速度不连续 reflex。只有需要兼容旧方式时才显式加 `--staged`；该模式会在每段后确认实测关节速度
+已归零，未归零则拒绝发送下一段。`--single-step` 会自动选择分段模式。
+
+回零脚本会在**发送任何机械臂或夹爪运动前**读取夹爪宽度和 `max_width`。如果 `max_width` 为 0，
+表示夹爪未 homing 或没有有效行程，脚本会拒绝执行，绝不会把 0.04 m 目标夹紧到零宽度。确认夹爪内
+没有物体、手或线缆后，先单独执行 homing：
+
+```bash
+python scripts/robot/minimal_franka_move.py \
+  --ip 172.16.0.2 \
+  --gripper-homing
+```
+
+若只需要回到机械臂初始关节姿态，显式加 `--skip-gripper`。
+
 执行推理
 
-```
-python scripts/policy/run_exported_0802_dr_simactuator_gpu.py   
-  --model checkpoint/0803_dr3/rma_student_e2e_student_0040000.pt   
-  --device cuda:0   
-  --steps 1000 
+```bash
+python scripts/policy/run_exported_0803_dr_heatmap.py \
+  --model checkpoint/0803_dr3/rma_student_e2e_student_0040000.pt \
+  --metadata checkpoint/0803_dr3/rma_student_e2e_student_0040000.json \
+  --device cuda:0 \
+  --exposure 100 \
+  --gain 64 \
+  --steps 1000 \
   --yes
 ```
+
+Policy 部署入口也支持 RealSense 颜色相机控制。指定 `--exposure` 或 `--gain` 会在相机
+预热前关闭自动曝光；使用 `--auto-exposure` 可恢复自动曝光，且不能与两个手动参数同时使用。
+
+## 0809 Direct-Action Policy 部署
+
+0809 Direct-Action RMA Student 只接收 RGB、本体状态和动作历史，不接收 `contact_force_n`；不要把
+XY 版的夹爪状态近似套用到此策略。配置保持 D435 `640x480@30`、crop `(100,34,400,398)`、四维
+`[dx, dy, dz, gripper]` 与既有 streaming 安全限幅。专用配置使用 `cuda:0`；已用九组仿真
+rollout 输入完成 CPU/GPU 一致性验证，最大绝对误差为
+`0.000737`（容差 `0.001`）。
+
+动作尺度沿用与该 checkpoint 共用 teacher 的 0809 配置 `[0.05, 0.05, 0.05, 0.01]`；direct
+metadata 本身未带完整训练环境动作契约，部署前仍应从训练/export manifest 核实这一约定。
+
+先进行不连接硬件的契约校验：
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0809_direct_action.py --validate-only
+```
+
+真机验收顺序不变：`--preview-only` → `--streaming-check` → 人工确认的 `--steps 1`。首次单步不要
+加入 `--yes`，也不要使用 `--allow-full-scale`。该 checkpoint 与 XY 版共用 teacher，但不能假定两者
+输出动作相同；保持 `commissioning_action_limit: 0.1` 直到完成真机单步验收。
+
+## 0809 X040-Wide Direct-Action Policy 部署
+
+X040-Wide Student 同样只接收 RGB、本体状态和动作历史；训练时的 cube XYZ 只是 Teacher/辅助 loss 标签，
+不得在真机端传入。训练方块范围为机器人基座系 `x=[0.32,0.48] m`、`y=[-0.10,0.10] m`，已被配置中既有
+安全工作空间覆盖；配置不会为此扩大工作空间。动作尺度保持训练确认的 `[0.05, 0.05, 0.05, 0.01]`，并强制
+同一初始关节状态、D435 `640x480@30` crop `(100,34,400,398)` 和物理 action history。已完成 CPU/GPU
+一致性验证，最大绝对误差为 `0.000722`（容差 `0.001`）。
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0809_x040_wide_direct_action.py --validate-only
+```
+
+验收顺序必须为 `--preview-only`、`--streaming-check`、人工确认的 `--steps 1`，之后才可多步运行；首次单步
+不要添加 `--yes`，并保持 `commissioning_action_limit: 0.1`。
+
+## 0809 XY Policy 部署
+
+0809 XY RMA policy 需要运行时抓取状态。部署配置使用 Franka gripper 的 `is_grasped` 作为近似：
+抓住时送入 `[1, 1]`，否则送入 `[0, 0]`；这不是左右指尖力测量，不能以腕部外力替代。先进行不连接
+硬件的契约校验：
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0809_xy_only.py --device cpu --validate-only
+```
+
+真机验收仍按安全顺序执行：先 `--preview-only`，再 `--streaming-check`，最后在操作者确认后使用
+`--steps 1`。不要为首次单步加入 `--yes`。
+
+streaming 会每 30 步（及最后一步）在终端打印累计 accepted/deadline misses、模型输入的 RGB 尺寸、
+`action_history`、`proprio_obs`、`contact_force_n`，以及 raw/实际动作和 timing；完整数值仍写入运行目录。
+
 执行小幅 Cartesian 位移：
 
 ```bash
@@ -76,6 +260,30 @@ python scripts/robot/minimal_franka_move.py \
 ```
 
 `minimal_franka_move.py` 还支持 `--dy`、`--dz`、`--roll`、`--pitch`、`--yaw` 和夹爪命令，执行前会要求确认。
+
+### 键盘遥操作采集真实轨迹
+
+下面的脚本会连续保存 D435 原图、按键动作和机械臂本体状态。所有记录以主机
+`host_monotonic_ns` 为共同时间轴；结束时会写出 `alignment.jsonl`，为每个动作/状态标记
+时间上最近的一帧 RGB。它采用**单次按键、小步、阻塞式** Cartesian 位移，避免按住按键产生不可控连续运动。
+
+```bash
+python scripts/robot/teleop_record_real_trajectory.py \
+  --ip 172.16.0.2 \
+  --step-m 0.005 \
+  --speed 0.05
+```
+
+请从真实终端运行（而非 IDE 的 Output 面板），并确保急停可用。启动时会要求确认；先用
+`--preview-only` 检查相机、按键和落盘。按键为：`w/s` X 正/负、`a/d` Y 正/负、`r/f` Z
+正/负、`j/l` yaw 正/负、`o/c` 夹爪开/合，`p` 立即记录一条状态，`m` 插入时间标记，`q` 正常结束。
+默认工作空间与真机配置一致：`x=[0.2, 0.65]`、`y=[-0.3, 0.3]`、`z=[0.0, 0.45]` m；可通过
+`--workspace-min` / `--workspace-max` 修改。
+
+每次运行写入 `runs/<timestamp>_real_teleop_trajectory/`：`rgb/`（图片）、`frames.jsonl`
+（相机时间戳）、`states.jsonl`（本体状态）、`actions.jsonl`（请求与实际发送的动作）、
+`markers.jsonl` 和 `alignment.jsonl`。RealSense 设备时间戳也会保留在 `frames.jsonl`，但跨流对齐应使用
+主机 monotonic 时间轴，因为设备时钟与主机时钟的原点不同。
 
 ## 0726 Policy 部署
 
@@ -149,6 +357,149 @@ python scripts/policy/run_exported_0801.py --steps 1 --allow-full-scale
 
 Streaming 的 XYZ 是机器人基座坐标系，且不使用 legacy blocking 路径的 Y/Z 取反。
 控制期间只缓存数据，`stop_control()` 后才写入 RGB、rollout、control trace 和 timing。
+
+## HIL Residual BC 数据采集
+
+采用 `[dx,dy,dz,gripper]` contract 的 server9 streaming 策略可加 `--hil`。Pygame 窗口只在
+HIL 模式下加载；若环境缺少依赖，先运行：
+
+```bash
+.venv/bin/python -m pip install pygame
+```
+
+启动后聚焦 HIL 窗口并按 Enter 就绪。每个 30 Hz 边界仍先计算 base policy；按住 Space 时，
+`W/S`、`A/D`、`R/F` 分别控制基座系 `+X/-X`、`+Y/-Y`、`+Z/-Z`，夹爪继续使用 base policy。
+松开 Space 或窗口失焦会立即恢复 base policy，Escape/关闭窗口会请求安全停止。相反方向抵消，
+斜向输入归一化；按住 Space 但不按方向键表示人工 XYZ 为零。
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0814_gelsight.py \
+  --device cuda:0 \
+  --steps 150 \
+  --auto-gelsight \
+  --hil \
+  --hil-speed-m-s 0.05
+```
+
+人工速度先按 `speed / policy_frequency` 转为每步米增量，再除以既有 XYZ action scales，得到
+限幅前归一化 `human_action`。最终选择的动作仍统一经过 commissioning limit、action scaling、
+workspace、DLS IK 和 FCI；没有绕过安全链。仅在 worker 接受该步时，用最终限幅后的选择动作更新
+`action_history`，deadline miss 保持 hold 且不更新 history。
+
+`--hil` 强制保存 `step_data/*.npz`。`rollout.jsonl` 每步增加 `episode_id`、`step_id`、
+`intervention`、`base_action`、`human_action`、`residual_target_xyz`；`raw_action` 是最终选择的限幅前
+动作，`limited_action` 是 contract/commissioning limit 后候选，`executed_action` 只在 worker 接受时
+非空。Residual 标签是限幅前归一化层的 `human_action[:3] - base_action[:3]`，无介入时固定为零。
+训练时应使用 `policy_action_accepted` 过滤 deadline-miss 样本。
+HIL preview 不向 worker 发送动作，因此其 `policy_action_accepted` 同样为 `false`，不能混入执行样本。
+
+### 独立 Residual BC 训练
+
+`scripts/training/train_residual_bc.py` 读取现有 `step_data/*.npz`，冻结采集数据时使用的 0814
+TorchScript Student，并复现送入原 `action_head` 的 1043 维融合特征：视觉 512、左右 GelSight
+各 256、归一化 proprio 15、归一化 action history 4。独立 MLP 的输入是该特征与日志中的
+`base_action[4]`，输出仅为限幅前归一化 `residual_xyz[3]`；夹爪仍来自 base policy。
+
+下面的命令会自动跳过没有 step NPZ 的空 run，按 episode 名排序，将最后一条作为 test、倒数第二条
+作为 validation，其余作为 train。相邻 timestep 不会被随机拆到不同数据集：
+
+```bash
+.venv/bin/python scripts/training/train_residual_bc.py \
+  --runs-root runs \
+  --run-pattern '20260822_23*_e2e_bundle_real_exported_0814_gelsight' \
+  --base-model checkpoint/0814_gelsight/gelsight_reference_student_latest.pt \
+  --output-dir checkpoint/residual_bc_0823 \
+  --device cuda:0 \
+  --epochs 100 \
+  --batch-size 64
+```
+
+也可重复指定 `--run-dir`、`--validation-run`、`--test-run` 覆盖自动发现和切分。训练只接收
+`policy_action_accepted=true` 的样本，并在优化前用冻结模型重算每个 `base_action`；误差超过
+`--base-action-tolerance` 会停止，防止把某个 base policy 的 residual 标签用于另一 checkpoint。
+NPZ 可按 `--feature-batch-size` 批量读取，但冻结 policy 始终按真机相同的 batch=1 抽取特征，避免
+CUDA 卷积在较大 batch 下产生数值漂移并改变 Residual MLP 的输入分布。
+训练默认按 normal、人工 hold、人工 moving 三组做逆频率采样，使用 SmoothL1 loss 和 early stopping。
+
+输出目录必须为空，产物包括：
+
+- `residual_bc_best.pt`：权重、结构、数据切分、base-model SHA 和验证契约；
+- `residual_bc_best.ts`：独立 Residual MLP TorchScript；
+- `metadata.json`：验证/test 指标及每组样本数量；
+- `training_history.json`：逐 epoch 训练记录。
+
+该脚本只训练和离线评估，不会连接相机或机器人，也不会自动把 residual 接入真机控制。部署时仍须先做
+离线 replay，并保证 `base_xyz + residual_xyz` 之后继续经过现有完整安全链。
+
+### Residual BC 部署接口
+
+0814 server9 策略可用 `--residual-model` 加载独立 head。运行时先正常计算 base action，再从同一模型输入
+复现 1043 维 Actor feature，得到 predicted residual；依次乘 `--residual-scale`、按
+`--residual-max-abs` 做逐轴 cap，并只叠加到 base XYZ。base gripper 原样保留，组合动作随后仍统一进入
+既有 action contract、commissioning limit、action scaling、workspace、DLS IK 和 FCI。
+
+先做完全离线验证：
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0814_gelsight.py \
+  --device cuda:0 \
+  --steps 1 \
+  --residual-model checkpoint/residual_bc_0823/residual_bc_best.ts \
+  --residual-scale 0.25 \
+  --residual-max-abs 0.02 \
+  --validate-only
+```
+
+再做有相机/机器人状态读取、但不发送运动命令的 preview：
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0814_gelsight.py \
+  --device cuda:0 \
+  --steps 150 \
+  --auto-gelsight \
+  --residual-model checkpoint/residual_bc_0823/residual_bc_best.ts \
+  --residual-scale 0.25 \
+  --residual-max-abs 0.02 \
+  --preview-only
+```
+
+真机 residual motion 额外要求 `--enable-residual-control`，禁止 `--yes`，仍会显示首步组合动作并要求
+人工输入 y/yes。第一次只运行一步：
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0814_gelsight.py \
+  --device cuda:0 \
+  --steps 1 \
+  --auto-gelsight \
+  --residual-model checkpoint/residual_bc_0823/residual_bc_best.ts \
+  --residual-scale 0.25 \
+  --residual-max-abs 0.02 \
+  --enable-residual-control
+```
+
+默认 residual cap 是每轴归一化 `0.1`；当前 `residual_bc_0823` 在 normal test 上输出偏大，因此首次验收
+建议显式使用上面的 scale `0.25` 和 cap `0.02`，不要直接使用默认值。Residual v1 只支持采集它的 0814
+GelSight checkpoint，并校验 base-model SHA；禁止与 HIL、streaming-check、blocking、async backend、RMA
+输入 override 或 `optimize_for_inference` 组合。
+
+Residual 模式强制保存 step NPZ。`rollout.jsonl`/NPZ 记录 `base_action`、
+`predicted_residual_xyz`、`applied_residual_xyz`、最终 `raw_action`、限幅后/accepted 动作、scale、cap 和
+residual SHA；下一步 action history 使用真正被接受的最终组合动作。
+
+真机验收依次执行 `--hil --preview-only`、不带 HIL 的 `--streaming-check`、`--steps 1 --hil`，
+确认方向、Space 释放、日志和 history 后再运行多步。`--hil` 不支持 blocking、async backend 或
+`--streaming-check`；`--hil --validate-only` 只做离线契约验证，不启动 Pygame 或硬件。
+
+`--auto-gelsight` 会在打开触觉相机前读取 `/sys/class/video4linux`，只保留名称含 GelSight 且
+UVC `index=0` 的主图像流，从而排除普通 webcam、RealSense 和每台 GelSight 的第二个 metadata 流。
+它要求恰好发现两路，打印设备号、名称和序列号后，按当前设备号顺序绑定为 left/right；数量不等于二时
+直接停止。设备物理位置改变后应先用下面的自动预览确认左右顺序：
+
+```bash
+.venv/bin/python scripts/camera/gelsight_start.py
+```
+
+不加 `--auto-gelsight` 时仍严格使用部署 JSON 中的 `left_device/right_device`，用于复现实验或显式覆盖。
 
 ## 0802 比例控制律部署（sim_actuator_velocity）
 
@@ -320,10 +671,63 @@ python scripts/calibration/live_apriltag_cube_pose.py \
   --ground-truth 0.50 0.00 0.026
 ```
 
+使用 `checkpoint/0803_dr4` 的 RMA 视觉头与 AprilTag 实时对照时，显式指定该导出模型：
+
+```bash
+.venv/bin/python scripts/calibration/live_apriltag_cube_pose.py \
+  --policy-config configs/e2e_bundle_real_exported_0803_dr_heatmap.json \
+  --policy-model checkpoint/0803_dr4/rma_student_e2e_student_0100000.pt \
+  --policy-metadata checkpoint/0803_dr4/rma_student_e2e_student_0100000.json \
+  --policy-device cuda:0 \
+  --ground-truth 0.50 0.00 0.026
+```
+
+这条命令会同时显示 AprilTag 解算位置、0803_dr4 policy 的物块位置预测及二者误差；它仅连接
+D435 相机，不连接或移动 Franka。
+
+X040-Wide 的位置头采用不同的 `forward_with_position()` 导出接口，现已可用同一条 AprilTag
+链路做**离线精度评估**。先在训练范围内手工摆放方块（建议覆盖 `x=0.32~0.48 m`、
+`y=-0.10~0.10 m` 的至少 5 个静态位置），每个位置按 `s` 录制一段画面，最后按 `q`：
+
+```bash
+.venv/bin/python scripts/calibration/record_cube_pose_dataset.py --burst-frames 60
+```
+
+然后将输出目录替换到下列命令中。它只读取已录制的图片，不打开相机、不连接或移动 Franka；结果中的
+`position_summary.csv` 和 `summary.json` 给出相对于 AprilTag 真值的 XYZ RMSE、中位 3D 误差、P95
+和轴向偏差。X040-Wide 不训练 contact head，因此 contact 列会明确为 `NaN` / 不适用。
+
+```bash
+.venv/bin/python scripts/calibration/evaluate_policy_vs_apriltag.py \
+  runs/<时间>_cube_pose_dataset \
+  --policy-config configs/e2e_bundle_real_exported_0809_x040_wide_direct_action.json \
+  --policy-device cuda:0 \
+  --family tag36h11 --id 2 \
+  --marker-length-m 0.038 \
+  --tag-to-object 0 0 -0.025
+```
+
+`--tag-to-object 0 0 -0.025` 只适用于 50 mm 方块、38 mm 标签居中贴在一个表面且标签 +Z 朝外的情况；
+标签位置或方块尺寸不同，必须先按实际几何修改该偏移，不能把几何误差当成 policy 误差。
+
 `--ground-truth` 必须替换为独立测量的方块中心基座坐标；如果暂时没有真值，可以省略。
 默认假设 50x50 mm 标签纸与方块表面对齐，因此方块中心位于 Tag 的 `-Z` 方向 25 mm。
 程序只连接 D435，不连接或移动 Franka。实时窗口中按 `s` 保存截图、`c` 清空平滑窗口、
 `q` 或 `Esc` 退出；逐帧完整位姿写入 `detections.csv`，统计结果写入 `summary.json`。
+
+要比较不同手动曝光下的位置误差，可以固定 gain 后自动扫描。下面每个曝光采集 120 帧，
+分别保存原始结果，并生成汇总 `exposure_results.csv` 和 `exposure_report.json`：
+
+```bash
+python scripts/calibration/sweep_apriltag_exposure.py \
+  --exposures 40 60 80 100 120 160 200 \
+  --gain 64 \
+  --frames-per-exposure 120
+```
+
+没有独立真值时，排名使用 policy 预测与 AprilTag 标定位置之间的 3D RMSE；若传入
+`--ground-truth X Y Z`，排名改用 policy 相对该真值的 3D RMSE。默认只有 AprilTag 检出率
+达到 50% 的曝光才参与最佳曝光选择。
 
 因为控制律是比例的，`commissioning_action_limit` 现在真正线性地控制速度，可以作为唯一的调速旋钮
 按 `0.1 → 0.3 → 0.6 → 1.0` 逐级放开，对应 0.83 → 2.5 → 5.0 → 8.33 mm/步。
@@ -335,7 +739,7 @@ python scripts/calibration/live_apriltag_cube_pose.py \
 python scripts/diagnostics/analyze_streaming_tracking.py --latest 1
 ```
 
-## Policy 真机测试
+## Policy 真机测试（0711 默认入口）
 
 默认入口使用：
 
@@ -409,6 +813,22 @@ python scripts/calibration/collect_eye_to_hand.py --phase calibration --continuo
 首次使用前必须先执行 `--camera-check` 和 `--dry-run`；完整流程与续采方法见
 `docs/HAND_EYE_CALIBRATION.md`。
 
+测量相机的信号相关噪声模型 `sigma(mu)`，用于把仿真的图像噪声对齐到真机（只读相机，
+不连接机器人）：
+
+```bash
+python scripts/calibration/measure_camera_noise.py \
+  --exposures 100 \
+  --gains 16 32 64 \
+  --frames 200
+```
+
+执行期间视野必须完全静止，机械臂、手和光源都不能动，否则运动会被当成噪声。运动像素
+占比超过 `--maximum-motion-fraction` 时脚本会判定该工况作废并以非零码退出。结果写到
+`runs/<时间戳>_camera_noise/`，其中 `noise_lut.csv` 是按像素亮度分箱的 `sigma` 查找表，
+`noise_report.json` 还包含 `sigma^2 = a*mu + b` 的拟合系数和暗区单独统计。默认在模型
+输入域（crop 后 224x224）测量，`--domain raw` 可切到 640x480 原始分辨率。
+
 ## 常用诊断
 
 检查静止状态下的外力和力矩：
@@ -442,6 +862,21 @@ python scripts/diagnostics/diagnose_franka_directions.py \
 
 所有会运动的诊断都应从小位移和单次确认开始。
 
+比较仿真与真机策略输入图像的外观差异（纯离线，不碰硬件）：
+
+```bash
+python scripts/diagnostics/compare_sim_real_images.py \
+  --real runs/20260808_223325_e2e_bundle_real_exported_0803_dr_heatmap/rgb \
+  --sim /path/to/episode_0000.npz
+```
+
+两侧都必须是模型输入域（224x224）的图像，尺寸不一致会直接报错。真机侧用部署运行的
+`rgb/` 目录，或 `measure_camera_noise.py` 输出的 `mean_*.png`；仿真侧用 `TacEx/` 的
+`collect_rma_student_rollouts.py` 产出的 episode NPZ（键 `wrist_rgb`，已含 DR 后处理）。
+输出写到 `runs/<时间戳>_sim_real_image_stats/`，包含亮度分位数、明暗分区的通道平衡，
+以及亮度直方图的 Wasserstein-1 距离（单位 DN，即仿真整体平均需平移多少才能对上真机）。
+两份同场景真机数据之间的 W1 约 10 DN，可作为判断差距是否显著的本底。
+
 ## 重要配置
 
 主要部署配置位于 `configs/`。常改字段：
@@ -463,16 +898,83 @@ python scripts/diagnostics/diagnose_franka_directions.py \
 - `summary.json`：完整运行汇总。
 - `rgb/step_XXXX.png`：模型实际看到的 RGB 图像。
 - Streaming 另存 `control_trace.jsonl` 和 `timing_summary.json`，且仅在停止控制后落盘。
+- HIL 另强制保存 `step_data/step_XXXX.npz`，其中包含精确模型输入和 Residual BC 标签。
 
 `runs/` 默认被 Git 忽略，因为其中可能包含真机图像和大量实验数据。
 
-## 目录
+## Real-world Residual SAC
+
+0814 视觉＋双 GelSight 策略支持独立的 XYZ Residual SAC。Base Student、gripper、DLS、FCI 和既有
+安全限幅保持不变；AprilTag 只用于 reward 和 privileged Critic，不进入部署 Actor。
+
+先做无硬件校验：
+
+```bash
+.venv/bin/python scripts/real_rl/run_residual_sac.py validate \
+  --config configs/real_residual_sac_0814.json --device cuda:0
+```
+
+Base-only 或小幅随机 warmup（二选一）。随机 warmup 使用配置中的 AR(1) 相关高斯噪声，默认
+`rho=0.9`、`sigma=0.5 mm`、裁剪到 `±1 mm`，不再逐拍 IID 跳变：
+
+```bash
+.venv/bin/python scripts/real_rl/run_residual_sac.py collect \
+  --config configs/real_residual_sac_0814.json --steps 300 --device cuda:0 \
+  --auto-gelsight --zero-residual --enable-real-rl-control
+
+.venv/bin/python scripts/real_rl/run_residual_sac.py collect \
+  --config configs/real_residual_sac_0814.json --steps 300 --device cuda:0 \
+  --auto-gelsight --warmup-random-residual --enable-real-rl-control
+```
+
+首次离线训练固定执行配置中的 `bootstrap_updates`（默认 1000），不使用 `N×UTD`；之后才按
+checkpoint high-watermark 之后新增的 `trainable` transition 计算更新量，默认 UTD=2：
+
+```bash
+.venv/bin/python scripts/real_rl/run_residual_sac.py train \
+  --config configs/real_residual_sac_0814.json --device cuda:0 --utd-ratio 2
+```
+
+Real-RL 的运行目录和 Replay 分别位于 `real_rl_logs/<时间戳>_*/` 与
+`real_rl_logs/replay.sqlite3`，不再写入通用 `runs/`；checkpoint 仍位于
+`checkpoints/real_residual_sac/`。真机 collect 永远要求 `--enable-real-rl-control` 和交互确认；
+先使用 `--preview-only`，再进行单步和小批量验收。checkpoint 缺失、损坏或 contract/SHA 不匹配时
+默认拒绝 episode 启动；只有明确接受 base-only fallback 数据时才能额外给
+`--allow-checkpoint-fallback-collect`。
+
+Replay v2 用统一的 `trainable/trainable_reason` 判定训练样本，并保存同一 monotonic 时钟域的
+`capture_timestamp` 与 action timestamp；严格要求 `tag_t <= action_time < tag_t1`。同时记录
+`pre_safety_action`、`post_safety_action`、`safety_intervened` 和归一化 4D action contract 下的 L2
+`intervention_magnitude`。物体高度固定定义为
+`object_z_in_base - initial_object_z_in_base`。Normalizer 仅对 1043D policy feature 和 4D privileged
+state 做经验归一化；base action 使用固定 action contract，不做 z-score。
+
+AprilTag 仅在启动前做 15 次静止预检；预检通过后检测线程立即停止。每个真实策略 deadline 到达时，
+系统独立快照相机最新的 640×480 raw packet；它与提前算好的 policy frame 分开审计。机械臂控制停止后
+才写入 `raw_rgb/boundary_XXXX.png`，再按帧离线检测、
+计算 reward 并回写 Replay。检测先在上一帧 Tag 周围的扩大 ROI 搜索，失败自动退回整帧；结果位于
+`offline_apriltag_labels.jsonl` 和 `offline_apriltag_report.json`。如采集完成后标签阶段被中断，可单独重跑：
+
+```bash
+.venv/bin/python scripts/real_rl/run_residual_sac.py label \
+  --config configs/real_residual_sac_0814.json \
+  --run-dir real_rl_logs/<采集目录>
+```
+
+server9 Real-RL 的 Franka Hand 由独立 `spawn` 进程独占：`move_async/grasp_async`、future 完成查询、
+`gripper.state` 和 `stop` 都不在主进程执行。30 Hz 策略线程只向共享内存写入最新目标宽度并检查缓存错误，
+所以 Hand native binding 即使持有 Python GIL，也不会冻结机械臂策略循环。
+缺少 capture/action timestamp 的 Replay v1 不会被自动升级或伪造成可训练数据；若已有 v1 数据库，
+请在配置中使用新的 Replay 路径重新采集，旧库会以 schema mismatch 明确拒绝。
+
+## 目录结构
 
 - `scripts/robot/`：状态读取、回零和直接控制。
 - `scripts/policy/`：TorchScript policy 部署入口。
 - `scripts/camera/`：RealSense 和 GelSight 工具。
 - `scripts/calibration/`：真机视觉与状态对齐。
 - `scripts/diagnostics/`：力传感器、运动和方向诊断。
+- `scripts/real_rl/`：Residual SAC 的校验、真机采集和离线训练入口。
 - `franka_sim2real/`：运行时、真实机器人 backend、安全限制和日志。
 - `configs/`：部署配置。
 - `tools/system/`：网络、realtime 和主机检查。

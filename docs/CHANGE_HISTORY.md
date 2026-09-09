@@ -34,6 +34,361 @@
 
 # 变更时间线
 
+## 2026-08-23 修正几何的 0823 三帧 GelSight 真机部署
+
+**变更**：新增 0823 三帧 RGB＋双 GelSight TorchScript 的独立配置和入口；沿用 4D 动作、30 Hz、
+首帧重复历史和固定触觉参考帧，并将物理 workspace 点设为相对 `O_T_EE` 的 `+57.9 mm`。
+**影响**：不修改模型权重、观测或动作尺度；旧三帧配置的 `27.408 mm` 安全点会被契约校验拒绝。
+**验证**：CPU artifact SHA/contract/dummy inference 通过，相关 54 项回归测试通过；当前自动化环境无法
+初始化 CUDA，故 GPU 校验未运行。未连接相机或 Franka。文件：`configs/e2e_bundle_real_exported_0823_gelsight.json`、
+`scripts/policy/run_exported_0823_gelsight.py`、`franka_sim2real/e2e_bundle.py`。
+
+## 2026-08-23 Real-RL CUDA checkpoint RNG 恢复兼容
+
+**变更**：恢复 Residual SAC checkpoint 时，将 `cuda_rng_state_all` 中的状态 buffer 显式搬回 CPU 后再调用
+`torch.cuda.set_rng_state_all()`。
+
+**动机**：训练续跑通过 `map_location=cuda:0` 加载 checkpoint 时，序列化的 RNG ByteTensor 也会被搬到
+GPU，而 PyTorch RNG 恢复接口要求 CPU ByteTensor，导致续训在任何 gradient update 前报
+`TypeError: RNG state must be a torch.ByteTensor`。
+
+**影响**：只修复 CUDA checkpoint 的随机数状态恢复；不改变权重、优化器、Normalizer、Replay
+high-watermark、UTD 计划或动作契约。失败的续训没有覆盖已有 checkpoint。
+
+**验证**：新增映射后 RNG state 回到 CPU 的单元测试；Real-RL 20 项测试通过；现有 `latest.pt` 在
+`cuda:0` 上恢复通过，保持 `update_count=1000`、`replay_high_watermark=4253`。未执行 gradient update。
+
+**文件**：`franka_sim2real/real_rl/residual_sac.py`、`tests/test_real_rl.py`、
+`docs/CHANGE_HISTORY.md`
+
+## 2026-08-23 Real-RL Hand API 进程隔离
+
+**变更**：server9 Real-RL 将 Franka Hand owner 从 Python 后台线程迁移到独立 `spawn` 进程。主进程通过
+共享内存发布带 generation 的最新目标宽度，子进程独占构造和调用 `franky.Gripper`，并通过单向状态通道
+返回宽度、抓取状态和错误。命令继续 latest-only 合并，不建立过期动作队列；blocked close 转 force grasp
+和安全停止语义保持不变。
+
+**动机**：`20260823_133347` 中，Hand 状态缓存更新的 9 个 step 全部对应主循环约 `100–132 ms` 停顿，
+相关连续组造成 23/27 次 deadline miss。虽然 Hand API 已不在 policy 线程调用，但这一一对应关系表明 native
+binding 很可能在后台调用期间持有进程级 Python GIL；线程隔离无法消除这种阻塞，进程隔离可以。
+
+**影响**：仅 server9 的 Hand owner 和进程生命周期改变；机械臂 C++ worker、FCI 共享内存 ABI、策略模型、
+夹爪速度/力/宽度目标、动作尺度、workspace、安全门禁和 Replay schema 均不变。普通非 server9 streaming
+仍保留原 `AsyncGripperQueue`。
+
+**验证**：新增无硬件 `spawn` 测试，以 120 ms 忙等模拟 Hand 调用持有 GIL，确认父进程 `command/poll`
+仍低于 20 ms；同时覆盖 blocked-close 转 force grasp 和失败错误回传。相关 gripper、streaming、server9
+测试通过；未连接机器人执行真机运动。
+
+**文件**：`franka_sim2real/gripper_process.py`、`franka_sim2real/streaming_server9.py`、
+`tests/test_gripper_process.py`、`README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-23 Real-RL 夹爪非阻塞化与动作边界采帧
+
+**变更**：将 Franka Hand 的 `move_async/grasp_async`、future `get` 和 `gripper.state` 全部移入专属 owner
+线程；30 Hz policy 线程的 `command/poll` 仅更新合并目标和读取缓存错误。保留 blocked-close 自动转为
+force grasp 的逻辑。Real-RL 不再把提前推理时取得的 raw frame 当作 transition 边界，而是在每个真实
+policy deadline 独立读取 `LatestFrameCamera` 最新 packet；rollout 同时保留 policy frame 和 reward boundary
+frame 元数据，离线标注优先读取后者，旧日志仍可按旧字段重标。
+
+**动机**：`20260823_132048` 中 Hand 完成查询反复阻塞 `77–99 ms`，产生 32 次 deadline miss；同时下一
+policy inference 在动作后立即读取的 latest frame 实际平均早于动作 `28.5 ms`，导致 300 条 transition
+只有 2 条可训练。
+
+**影响**：不改变 Hand 力、目标宽度、受阻接触语义、机械臂控制、安全限幅、Replay schema 或模型输入。
+新采集的 `model_input.offline_apriltag_boundary` 明确记录 reward 图像路径、形状、相机 sequence 和 monotonic
+时间戳。
+
+**验证**：streaming、server9、Real-RL、Residual runtime 和 HIL 相关 75 项单元测试通过；包含后台 Hand
+API owner、受阻转 grasp、错误传播、动作边界 packet 选择及离线字段优先级测试。CPU Real-RL validate
+通过。全量 208 项中 207 项通过，唯一失败仍是既有 live AprilTag 工具指向已迁移的标定路径。未连接
+机器人或相机执行真机验证。
+
+**文件**：`franka_sim2real/streaming.py`、`franka_sim2real/streaming_server9.py`、
+`franka_sim2real/real_rl/offline_apriltag.py`、`tests/test_streaming.py`、`tests/test_server9_streaming.py`、
+`tests/test_real_rl.py`、`README.md`、`docs/ARCHITECTURE.md`
+
+## 2026-08-23 0814 GelSight 夹爪速度调整
+
+**变更**：将 `e2e_bundle_real_exported_0814_gelsight.json` 的夹爪移动速度从 `0.03 m/s` 提高到
+`0.20 m/s`；夹爪力保持 `20 N`，机械臂速度、动作限幅、workspace、DLS 和 FCI 参数不变。
+
+**动机**：Real-RL 采集 `20260823_131030` 中，夹爪异步命令完成期间出现最长约 `99 ms` 的 command/poll
+延迟，并在其后形成连续 policy deadline miss；提高物理开合速度可缩短长距离宽度调整的持续时间。
+
+**影响**：使用该 0814 GelSight bundle 配置的部署和 Real-RL 采集均使用 `0.20 m/s`；其它 bundle 配置
+不变。
+
+**验证**：运行 Real-RL CPU `validate` 和相关配置/streaming 单元测试；未连接机器人执行夹爪运动。
+
+**文件**：`configs/e2e_bundle_real_exported_0814_gelsight.json`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-23 Franka Real-world Residual SAC
+
+**变更**：为 0814 视觉＋双 GelSight Student 新增独立 Real-RL 模块和 `validate/collect/train` 入口。
+Actor 使用 frozen policy feature 1043D＋base action 4D，仅输出每轴最大 ±2 mm 的 XYZ residual；Q1/Q2
+从第一版读取 AprilTag object-relative XYZ＋height 4D privileged state。新增 SQLite WAL Replay、后台
+latest-only AprilTag/Replay writer、progress/lift/success/action reward、双 Q SAC、自动 entropy、冻结
+normalizer、UTD high-watermark、原子 checkpoint 和 deterministic Actor artifact。Warmup 支持 residual=0，
+也支持 σ=0.5 mm、裁剪 ±1 mm、默认相关系数 0.9 的 AR(1) 随机 residual。Replay v2 新增统一
+`trainable/trainable_reason`、严格 `tag_t <= action_time < tag_t1` 的 capture/action 时间契约、基座系
+物体高度命名，以及 safety 前后 action、介入标志和介入幅度。Normalizer 改为只经验归一化 1043D
+policy feature 与 4D privileged state，base action 固定 contract、不做 z-score；首次训练使用独立
+`bootstrap_updates`，后续才使用 UTD。checkpoint 校验失败默认在 worker 启动前拒绝 episode，显式
+`--allow-checkpoint-fallback-collect` 才可用零 residual 继续采集。随后将 reward 标注改为离线逐帧模式：
+AprilTag 只在启动前预检，控制期间保存原始边界帧，停止 worker 后使用扩大 ROI＋整帧 fallback 检测并
+回写 Replay；新增可恢复重跑的 `label` 命令。Real-RL run 和 Replay 移至独立 `real_rl_logs/` 根目录。
+
+**影响**：只新增 server9 的显式 Real-RL 路径。Base Student、gripper、action contract、commissioning limit、
+workspace、DLS、FCI、native worker、IPC ABI 和 deadline-miss/history 规则未修改。不开 Real-RL 时不会加载
+AprilTag/OpenCV collector，现有 HIL 与 Residual BC 行为保持不变。
+
+**验证**：Real-RL、Residual BC、streaming、server9、bundle 等 46 项相关测试通过；compileall、
+0814 CPU `validate` 通过实际 TorchScript SHA、1043D feature/base action 复现和
+Real-RL 零 residual smoke test，未连接相机或机器人；缺失 checkpoint 的 validate 已验证 fail closed。
+全量 205 项测试中 204 项通过；唯一失败是既有
+`live_apriltag_cube_pose.DEFAULT_CALIBRATION_REPORT` 仍指向已从 `runs/` 移到 `runs_old/` 的报告，与本改动无关。
+未执行真机 preview 或运动。
+
+**文件**：`franka_sim2real/real_rl/`、`franka_sim2real/policy_features.py`、
+`scripts/real_rl/run_residual_sac.py`、`configs/real_residual_sac_0814.json`、
+`franka_sim2real/e2e_bundle.py`、`franka_sim2real/streaming.py`、
+`franka_sim2real/streaming_server9.py`、`tests/test_real_rl.py`、`README.md`、`docs/ARCHITECTURE.md`
+
+## 2026-08-22 GelSight 双相机运行时自动枚举
+
+**变更**：新增公共 GelSight V4L2 枚举模块，并让相机预览与 policy 部署共用同一筛选逻辑。统一部署 CLI
+新增 `--auto-gelsight`：相机启动前读取 sysfs，只选择名称包含 GelSight 且 UVC `index=0` 的主图像流，
+要求恰好两路，然后按当前 video 编号绑定 left/right，并打印设备号、label 和 serial。实际解析后的设备号
+覆盖本次运行时配置；未修改历史部署 JSON，不加开关时仍使用其中的显式设备号。
+
+**动机**：Linux 的 `/dev/videoN` 会随 USB 连接和其它相机枚举变化。0814 配置中的旧 `4/6` 在当前机器
+已变为 GelSight `10/12`，手动修改编号容易误选 RealSense、webcam 或同一 UVC 设备的辅助流。
+
+**影响**：只改变显式请求 `--auto-gelsight` 的相机选择步骤；模型输入、左右张量顺序、图像尺寸、参考帧、
+HIL、动作、控制、安全参数、native worker 和共享内存 ABI 均未修改。自动模式不能从图像推断物理左右，
+换插口或交换安装位置后仍须先预览确认；发现数量不等于二时 fail closed，且不会尝试打开候选相机。
+
+**验证**：当前 sysfs 只读枚举得到 `/dev/video10`（serial `2G7W6P6N`）和 `/dev/video12`
+（serial `2G7KGVER`），选择结果为 left 10/right 12；全量 unittest 171 项通过，compileall 与
+`git diff --check` 通过；0814 CUDA 的 `--auto-gelsight --hil --validate-only` 通过且未打开相机或连接
+Franka。未运行 GelSight 实时预览或真机策略运动。
+
+**文件**：`franka_sim2real/gelsight_devices.py`、`franka_sim2real/e2e_bundle.py`、
+`scripts/camera/gelsight_start.py`、`scripts/policy/run_exported_0711.py`、
+`tests/test_gelsight_devices.py`、`tests/test_run_exported_cli.py`、`README.md`、
+`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`、`order.txt`
+
+## 2026-08-22 server9 HIL Residual BC 数据采集
+
+**变更**：统一 policy CLI 新增 `--hil` 与 `--hil-speed-m-s`。新增懒加载 Pygame 的焦点键盘线程，
+在 server9 的 30 Hz 实际发送边界采样 Space 与 `W/S/A/D/R/F`，介入时用基座系人工 XYZ 替换
+Actor XYZ，同时保留 Actor gripper。Actor 在介入期间仍每步推理；选择动作继续经过既有 contract、
+commissioning limit、action scaling、workspace、DLS IK 和 FCI。HIL 强制复用 step NPZ，并在既有
+JSONL/NPZ 中追加 base/human/executed/intervention/residual 与 accepted 标签。
+
+**动机**：采集 observation/policy feature 与 base action 对应的人工 XYZ Residual BC 标签，同时保证
+人工接管不绕过已经验收的真机控制与安全链，并保证下一步 action history 使用实际接受的人工组合动作。
+
+**影响**：仅增加 server9 streaming 的可选运行时路径；不开 `--hil` 时不加载 Pygame，现有日志结构和
+运行行为保持不变。未修改 PPO/Student、checkpoint、部署 JSON、动作维度/尺度、commissioning limit、
+workspace、DLS、FCI、native worker、共享内存 ABI、碰撞阈值、坐标系或停止时序。blocking、async backend
+与 `--hil --streaming-check` 会在硬件资源创建前拒绝。
+
+**验证**：`.venv/bin/python -m unittest discover -s tests -p 'test_*.py'` 共 165 项通过；
+`.venv/bin/python -m compileall -q franka_sim2real scripts tests` 与 `git diff --check` 通过；
+`.venv/bin/python scripts/policy/run_exported_0814_gelsight.py --device cuda:0 --steps 150 --hil --validate-only`
+通过 TorchScript SHA、输入输出、CUDA dummy inference 和 streaming contract 校验，且未启动 Pygame、相机或
+Franka。未执行 HIL preview、streaming-check 或任何真机运动测试。
+
+**文件**：`franka_sim2real/hil.py`、`franka_sim2real/e2e_bundle.py`、
+`franka_sim2real/streaming.py`、`franka_sim2real/streaming_server9.py`、
+`scripts/policy/run_exported_0711.py`、`tests/test_hil.py`、`tests/test_run_exported_cli.py`、
+`README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-23 独立 HIL Residual BC 训练模块
+
+**变更**：新增纯离线 Residual BC 数据扫描、episode-level split、冻结 0814 Actor 特征提取、三组平衡
+采样、XYZ Residual MLP、SmoothL1 训练、early stopping、分组指标和 TorchScript/checkpoint 导出。训练前
+重算并校验日志 base action，产物绑定 base-model SHA256。
+
+**影响**：不修改 PPO/Student 权重、部署配置、streaming、安全或机器人控制。训练模块不连接硬件，导出
+的 residual head 也不会自动进入真机路径。
+
+**文件**：`franka_sim2real/residual_bc.py`、`scripts/training/train_residual_bc.py`、
+`tests/test_residual_bc.py`、`README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-23 Residual BC server9 部署接口
+
+**变更**：统一 policy CLI 新增 residual model/metadata、scale、逐轴 cap 和显式真机 enable 参数。运行时绑定
+训练记录的 base SHA，复现 0814 的 1043 维 actor feature，只叠加 XYZ 并保留 base gripper；JSONL/NPZ
+记录 predicted/applied residual 和最终动作。
+
+**安全**：默认 cap 为 0.1；真机禁止 `--yes` 并要求 `--enable-residual-control`，禁止 HIL、blocking、
+async、streaming-check、RMA override 和 optimized base graph。最终动作继续经过原 safety/control pipeline。
+当前模型 normal residual 偏大，文档首次验收使用 scale 0.25、cap 0.02。
+
+**文件**：`franka_sim2real/residual_runtime.py`、`franka_sim2real/e2e_bundle.py`、
+`franka_sim2real/streaming.py`、`franka_sim2real/streaming_server9.py`、
+`scripts/policy/run_exported_0711.py`、`tests/test_residual_runtime.py`、
+`tests/test_run_exported_cli.py`、`README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-09 X040-Wide 0030000 位置评估 metadata
+
+**变更**：为 `checkpoint/0809_30000/rma_x040_wide_student_0030000.json` 补齐训练导出时遗漏的
+`normalization`。数值由同一 distillation run 的 X040-Wide 训练源码与该 TorchScript 的 normalizer buffers
+交叉确认，包含 cube position 的 center `[0.4,0,0.026]`、scale `[0.08,0.1,0.1]` 及 `robot_root` 坐标系。
+
+**影响**：使相机/AprilTag 位置评估器能够将 0030000 的归一化 position head 输出还原为米单位。没有添加
+CPU/GPU 一致性记录、完整部署模型契约或新真机入口，故该 metadata 补全本身不构成真机部署验收；未触及动作
+尺度、限幅、工作空间、初始状态门禁、坐标系约定、停止时序或共享内存 ABI。
+
+**验证**：已校验 metadata 中 TorchScript SHA-256 为 `79aea3ec6e26c59d7595f298942d03982279189a84d3fdaa37c3e7ae28b23538`，并在 CPU 加载模型读取 normalizer buffers；实时相机测试由操作者后续执行，未连接 D435 或 Franka。
+
+**文件**：`checkpoint/0809_30000/rma_x040_wide_student_0030000.json`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-09 X040-Wide 位置预测 AprilTag 离线评估
+
+**变更**：`RMAPolicyCubePredictor` 支持读取 X040-Wide 导出模型的 `forward_with_position()` 视觉辅助 position head；新增对输出 `[N,4]` actions 与 `[N,3]` normalized XYZ 的形状校验，并按 metadata 的 cube center/scale 还原 `robot_root` 米单位坐标。离线 AprilTag 评估摘要写入 policy kind、坐标系和 contact 可用性；X040-Wide 的无 contact head 以 `NaN` / `false` 明确表示。README 补充静态多位置采集与离线 RMSE/中位/P95 评估命令。
+
+**影响**：仅改变相机/文件只读诊断路径。没有变更部署模型输入、动作尺度、限幅、工作空间、初始状态门禁、坐标系约定、停止时序或共享内存 ABI；位置辅助输出仍不会进入真实机器人控制。
+
+**验证**：已在 CPU 加载 X040-Wide TorchScript 并直接调用 `forward_with_position()`，确认输出 actions `[2,4]`、normalized position `[2,3]` 均为有限值；`tests.test_live_apriltag_cube_pose` 6 项通过，`compileall scripts/calibration tests` 通过，GPU 批量预测 `[3,3]` 全为有限值且 contact `[3,2]` 全为 `NaN`。使用已有 20260803 静态数据集的 252 帧（203 帧检出 Tag、19 个有效位置）在 RTX 5060 上完成离线评估：位置中位 3D 误差 `37.1 mm`、P95 `44.3 mm`、中位偏差 `[-28.8,+16.4,+14.5] mm`（policy - AprilTag）。该数据仅覆盖 X040 范围中的 `x=0.4035~0.4573 m`、`y=-0.0382~0.0211 m`，不能代表完整训练范围。未连接 D435 或 Franka。
+
+**文件**：`scripts/calibration/live_apriltag_cube_pose.py`、`scripts/calibration/evaluate_policy_vs_apriltag.py`、`tests/test_live_apriltag_cube_pose.py`、`README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-09 0809 X040-Wide Direct-Action 真机部署适配
+
+**变更**：新增 X040-Wide 专用配置 `e2e_bundle_real_exported_0809_x040_wide_direct_action.json` 与入口 `run_exported_0809_x040_wide_direct_action.py`；部署运行时识别 `tacex_rma_x040_wide_direct_action_torchscript` v1，并对三输入/四输出、无 contact/GelSight 输入、TorchScript SHA、normalization、模型结构、训练初始关节状态、D435 crop、动作/历史尺度及训练方块范围的工作空间覆盖执行 fail-closed 校验。为 metadata 补齐由训练环境和导出模型确定的模型/环境契约，并写入 CUDA 验证记录。
+
+**动机**：X040-Wide Student 不是旧 Direct-Action checkpoint：Teacher 只使用 cube XYZ、无接触输入，方块中心为 `x=0.40 m` 且 reset 范围为 `x±0.08 m`、`y±0.10 m`。原始 exporter JSON 未携带部署所需的环境/模型契约和 CUDA 验证，通用路径无法安全判断它能否进入真机 streaming。
+
+**影响**：新配置保持现有 `[0.05,0.05,0.05,0.01]` 动作尺度、`commissioning_action_limit: 0.1`、工作空间、初始状态门禁、碰撞阈值、基座系 XYZ、30/60/1000 Hz、停止时序与共享内存 ABI；只额外确认既有工作空间覆盖训练方块范围，未放宽任何安全参数。
+
+**验证**：训练环境源文件确认 30 Hz、动作尺度、初始关节、D435 crop 及 X040-Wide cube range；CPU `--validate-only` 通过；12 组离线 rollout 输入经部署运行时 CPU 与 RTX 5060 CUDA 推理，全部输出有限 `[4]`，最大绝对误差 `0.0007221698760986328 < 0.001`。未连接相机或机器人，未执行 preview、streaming-check 或运动测试。
+
+**文件**：`franka_sim2real/e2e_bundle.py`、`franka_sim2real/streaming.py`、`configs/e2e_bundle_real_exported_0809_x040_wide_direct_action.json`、`scripts/policy/run_exported_0809_x040_wide_direct_action.py`、`checkpoint/0809_extend_xy_10000/rma_x040_wide_student_latest.json`、`tests/test_e2e_bundle_runtime.py`、`README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-09 0809 Direct-Action 0100000 的 CUDA 一致性验证
+
+**变更**：为 `checkpoint/0809_direct_100000/rma_direct_action_student_student_0100000.json` 写入 CUDA 验证记录：`available: true`、最大 CPU/GPU 输出绝对误差 `0.00074923038482666016`、容差 `0.001`。
+
+**动机**：Direct-Action GPU 部署契约要求每个 TorchScript checkpoint 独立记录成功的 CUDA 一致性验证；0100000 缺少该记录，无法安全进入 CUDA 部署。
+
+**影响**：0100000 可以通过 CUDA 部署契约；不改变模型权重 SHA、输入输出签名、动作尺度、限幅、工作空间、初始状态门禁、坐标系、停止时序或共享内存 ABI。
+
+**验证**：先以 CPU 运行 `--validate-only` 通过 SHA、输入输出与 Direct-Action 契约校验；再使用 `sim_rollout/0809_rollout/episode_0000.npz` 至 `episode_0003.npz` 的开头、中段、末段共 12 组 `wrist_rgb`、`proprio_obs`、`action_history` 输入，经部署运行时 `BundleTorchScriptPolicy.predict()` 分别在 CPU 与 RTX 5060 CUDA 上推理；输出均为有限 `[4]`，最大绝对误差小于 `0.001`。未连接相机或机器人。
+
+**文件**：`checkpoint/0809_direct_100000/rma_direct_action_student_student_0100000.json`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-09 回零关节轨迹的连续执行与段间静止门禁
+
+**变更**：`go_to_zero_pose.py` 默认从当前关节姿态到 policy 初始姿态只发送一条连续 `franky.JointMotion`；旧的多段方式改为显式 `--staged`，并在起动前和每段结束后确认实测关节速度不超过既有 `--velocity-tolerance-rad-s`，否则拒绝发送下一条轨迹。对 libfranka 的 joint motion 速度/加速度不连续 reflex 添加中文处理提示。
+
+**动机**：真机在默认 7 段回零的第 4 段报告 `Motion finished commanded, but the robot is still moving`，同时触发 `joint_motion_generator_velocity_discontinuity` 和 `joint_motion_generator_acceleration_discontinuity`。每段都是一次独立 motion generator 会话，段间重新起停无法保证连续轨迹导数。
+
+**影响**：默认回零路径仍是相同的当前关节位置到固定 policy 初始关节位置的关节空间直线，但由 Franka motion generator 在单一会话内连续规划。未放宽 speed、关节限位、工作空间、初始状态门禁、停止时序或共享内存 ABI；外力、碰撞或 FCI 反射仍会中止，不自动重试。
+
+**验证**：新增离线 mock 测试确认默认只构造/发送一条 `JointMotion`，并覆盖不连续 reflex 的中文提示；未连接机器人或夹爪，未执行真机回零。
+
+**文件**：`scripts/robot/go_to_zero_pose.py`、`tests/test_go_to_zero_pose.py`、`README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-09 0809 Direct-Action 0060000 的 CUDA 一致性验证
+
+**变更**：为 `checkpoint/0809_direct_60000/rma_direct_action_student_student_0060000.json` 写入 CUDA 验证记录：`available: true`、最大 CPU/GPU 输出绝对误差 `0.00044992566108703613`、容差 `0.001`。
+
+**动机**：Direct-Action GPU 部署契约要求每个 TorchScript checkpoint 独立记录成功的 CUDA 一致性验证；0060000 缺少该记录，无法安全进入 CUDA 部署。
+
+**影响**：0060000 可以通过 CUDA 部署契约；不改变模型权重 SHA、输入输出签名、动作尺度、限幅、工作空间、初始状态门禁、坐标系、停止时序或共享内存 ABI。
+
+**验证**：先以 CPU 运行 `--validate-only` 通过 SHA、输入输出与 Direct-Action 契约校验；再使用 `sim_rollout/0809_rollout/episode_0000.npz` 至 `episode_0003.npz` 的开头、中段、末段共 12 组 `wrist_rgb`、`proprio_obs`、`action_history` 输入，经部署运行时 `BundleTorchScriptPolicy.predict()` 分别在 CPU 与 RTX 5060 CUDA 上推理；输出均为有限 `[4]`，最大绝对误差小于 `0.001`。未连接相机或机器人。
+
+**文件**：`checkpoint/0809_direct_60000/rma_direct_action_student_student_0060000.json`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-09 0809 Direct-Action 0040000 的 CUDA 一致性验证
+
+**变更**：为 `checkpoint/0809_direct_40000/rma_direct_action_student_student_0040000.json` 写入 CUDA 验证记录：`available: true`、最大 CPU/GPU 输出绝对误差 `0.0007036328315734863`、容差 `0.001`。
+
+**动机**：Direct-Action GPU 部署契约要求每个 TorchScript checkpoint 独立记录成功的 CUDA 一致性验证；0040000 缺少该记录，因此即使 CUDA 可用也会被安全校验拒绝。
+
+**影响**：0040000 可以通过 CUDA 部署契约；不改变模型权重 SHA、输入输出签名、动作尺度、限幅、工作空间、初始状态门禁、坐标系、停止时序或共享内存 ABI。
+
+**验证**：使用 `sim_rollout/0809_rollout/episode_0000.npz` 至 `episode_0003.npz` 的开头、中段、末段共 12 组 `wrist_rgb`、`proprio_obs`、`action_history` 输入，经部署运行时 `BundleTorchScriptPolicy.predict()` 分别在 CPU 与 RTX 5060 CUDA 上推理；输出均为有限 `[4]`，最大绝对误差小于 `0.001`。未连接相机或机器人。
+
+**文件**：`checkpoint/0809_direct_40000/rma_direct_action_student_student_0040000.json`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-09 部署异常的中文操作者提示
+
+**变更**：统一 `run_exported_*` 入口默认将部署异常输出为中文故障含义、建议处理和原始错误；新增 `--debug` 用于保留完整 Python traceback。server9 动作锁存超时原始错误补充等待时长、worker 状态/错误码、控制周期、IK tick 和当前动作 tick 诊断。
+
+**动机**：原先的 Python traceback 只能显示 `server9 worker did not latch policy action` 等底层英文异常，操作者难以判断该检查是在保护什么、下一步应进行无运动通信检查还是恢复机器人。
+
+**影响**：仅改变部署 CLI 的错误呈现和错误文本；正常运行路径、动作尺度、限幅、工作空间、初始状态门禁、坐标系、停止时序和共享内存 ABI 均未改变。
+
+**验证**：新增离线单元测试覆盖动作锁存超时、初始状态门禁和 `--debug` 参数；真机、相机和 native worker 未连接或执行。
+
+**文件**：`scripts/policy/run_exported_0711.py`、`franka_sim2real/server9_ipc.py`、`tests/test_run_exported_cli.py`、`README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-09 回零脚本的夹爪 homing 门禁
+
+**变更**：`go_to_zero_pose.py` 在任何机械臂或夹爪运动之前读取夹爪状态；`max_width <= 0`、状态非有限、当前宽度或目标 0.04 m 超出报告行程时直接拒绝。夹爪 homing 仍须由操作者显式调用 `minimal_franka_move.py --gripper-homing`，不会自动执行。
+
+**动机**：未 homing 的 Franka gripper 报告 `width=0`、`max_width=0` 时，旧脚本仍发送 0.04 m move，底层可能将其收敛为接近零宽度并闭合夹爪。
+
+**影响**：对有效、已 homing 的夹爪行为不变；无效夹爪状态下不再发送任何机械臂或夹爪运动。未触及策略动作尺度、工作空间、初始状态门禁容差、坐标系、停止时序或共享内存 ABI。
+
+**验证**：`tests/test_go_to_zero_pose.py` 覆盖未 homing 拒绝、行程外拒绝和正常通过；未连接机器人或夹爪。
+
+**文件**：`scripts/robot/go_to_zero_pose.py`、`tests/test_go_to_zero_pose.py`、`README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-08-09 0809 Direct-Action RMA Student 真机部署适配
+
+**变更**：新增 `tacex_rma_direct_action_student_torchscript` v1 的严格部署契约、0809 Direct-Action 配置与入口。模型固定为 RGB、本体状态、动作历史三个输入；streaming 路径不构造或传入 `contact_force_n`。九组仿真 rollout 输入的 CPU/GPU 验证通过后，metadata 记录最大误差 `0.000737`（容差 `0.001`），专用配置使用 `cuda:0`。
+
+**动机**：该 checkpoint 与 XY Student 同为四维动作，但其 TorchScript 签名不含 XY Student 所需的双侧接触输入；通用 legacy contract 又要求缺失的 `policy_contract`，无法安全进入 streaming 部署。
+
+**影响**：配置沿用共用 teacher 的 `[0.05, 0.05, 0.05, 0.01]` 动作尺度，但 direct metadata 未带完整训练环境动作契约，部署前仍须以训练/export manifest 复核。未改变 commissioning 限幅、工作空间、初始状态门禁、基座系 XYZ 约定、30/60/1000 Hz 频率、停止时序或共享内存 ABI。
+
+**验证**：`.venv/bin/python scripts/policy/run_exported_0809_direct_action.py --validate-only` 通过，已校验 SHA-256、三输入/四输出契约并完成 CPU dummy inference；九组 rollout 的 CPU/GPU 最大绝对误差为 `0.000737`，RTX 5060 上单帧 GPU 推理均值为 1.55 ms；`Exported0809DirectActionConfigTests` 3 项通过；`.venv/bin/python -m compileall franka_sim2real scripts tests` 通过；完整 `unittest discover` 共 117 项，仅有已知的 `test_streaming.py::test_rma_streaming_contract_allows_longer_operator_selected_run` 测试桩缺少 `metadata` 的 ERROR。未连接相机或机器人，未执行 preview、streaming-check 或运动测试。
+
+**文件**：`franka_sim2real/e2e_bundle.py`、`franka_sim2real/streaming.py`、`configs/e2e_bundle_real_exported_0809_direct_action.json`、`scripts/policy/run_exported_0809_direct_action.py`、`tests/test_e2e_bundle_runtime.py`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`、`README.md`
+
+## 2026-08-09 0809 XY RMA Student 真机部署适配
+
+**变更**：新增 0809 配置与入口；部署运行时识别 `tacex_rma_xy_student_torchscript` v8，并将 metadata 要求的 `contact_force_n[2]` 传给 TorchScript。配置显式选择 `rma_contact_force_source: "gripper_is_grasped"`，把真机夹爪单一抓取标志映射为 `[1,1]` 或 `[0,0]`。server9 streaming 每 30 步和末步打印累计接受/超时、实际 policy 输入与输出值。
+
+**动机**：0809 模型把视觉定位改为 XY，并移除了视觉接触预测；其 Actor 仍需要双侧接触力阈值形成的抓取二值特征。现有部署只接受旧 RMA 输入顺序，无法加载该模型。
+
+**影响**：不改变四维动作、动作尺度、工作空间、初始状态门禁、坐标系、streaming 频率或共享内存 ABI。夹爪标志不是左右指尖力读数，禁止以腕部外力替代；该近似仅供效果测试，真实力传感器接入前不应宣称与训练契约等价。
+
+**验证**：`.venv/bin/python -m compileall franka_sim2real scripts tests` 通过；`.venv/bin/python scripts/policy/run_exported_0809_xy_only.py --device cpu --validate-only` 通过，已校验 SHA-256、v8 输入契约并完成 CPU dummy inference；完整 `unittest discover` 共 113 项，仅有已记录的 `test_streaming.py::test_rma_streaming_contract_allows_longer_operator_selected_run` 测试桩缺少 `metadata` 的既有 ERROR。未连接相机或机器人，未执行 preview/streaming/运动测试。
+
+**文件**：`franka_sim2real/e2e_bundle.py`、`franka_sim2real/streaming.py`、`franka_sim2real/streaming_server9.py`、`configs/e2e_bundle_real_exported_0809_xy_only.json`、`scripts/policy/run_exported_0809_xy_only.py`、`tests/test_e2e_bundle_runtime.py`、`docs/ARCHITECTURE.md`、`README.md`
+
+## 2026-08-09 仿真与真机图像统计对比脚本
+
+**变更**：新增 `scripts/diagnostics/compare_sim_real_images.py`，比较仿真与真机策略输入图像的亮度分布、明暗分区通道平衡，以及亮度直方图的 Wasserstein-1 和 Kolmogorov-Smirnov 距离。两侧来源都支持 PNG 文件、图像目录和 NPZ（默认键 `wrist_rgb`），要求尺寸一致，否则报错提示改用模型输入域的图像。输出 `image_stats.json` 与六面板对比图 `comparison.png`。
+
+**动机**：2026-08-08 的噪声标定否定了"仿真噪声太小"的假设，同时暴露出真机图像极暗且双峰（p50 = 6 DN，74% 像素低于 16 DN），并且存在 Franka 状态指示灯造成的绿色偏色（暗区 G/R = 3.97，亮区 G/R = 1.29）。仿真侧是 4800–6200 K 的中性白 DomeLight，白平衡随机化只有 ±0.04，量级完全不匹配。需要一个可重复的工具来量化这个差距，而不是靠看图判断。
+
+**影响**：纯新增的离线分析，不连接机器人也不打开相机，不读写任何配置或 checkpoint。未触及动作尺度、限幅、工作空间、初始状态门禁、坐标系约定、停止时序或共享内存 ABI。
+
+**验证**：`.venv/bin/python -m unittest discover -s tests -p 'test_*.py'` 共 108 项，仅剩本文件“长期未决事项”中已记录的 `test_streaming.py` 既有 ERROR。`compileall` 通过。用两份真机数据（`runs/20260808_223325_.../rgb/` 300 张 与 `runs/20260809_001349_camera_noise/mean_e100_g64.png`）跑通了完整链路，包括绘图；两者 W1 = 9.7 DN、KS = 0.054，可作为该指标的本底参考。**与仿真的实际对比未运行**：`TacEx/` 侧目前没有已保存的 rollout NPZ，需要先跑 `collect_rma_student_rollouts.py`。
+
+**文件**：`scripts/diagnostics/compare_sim_real_images.py`、`tests/test_compare_sim_real_images.py`、`docs/ARCHITECTURE.md`、`README.md`
+
+## 2026-08-08 相机传感器噪声标定脚本
+
+**变更**：新增 `scripts/calibration/measure_camera_noise.py`，在场景静止的前提下用逐像素时间统计测量 D435 的信号相关噪声模型 `sigma(mu)`，并拟合 `sigma^2 = a*mu + b`。默认在模型输入域（复用 `e2e_bundle` 的 `RealSenseRGBCamera` 与 `_apply_camera_crop`，crop 后双线性缩放）统计，可用 `--domain raw` 切到 640x480。LUT 使用扣除整帧亮度漂移之后的标准差，把工频闪烁和光源热漂移与传感器噪声分开；报告中同时保留未扣除的数值。输出 `noise_report.json`、`noise_lut.csv` 和均值/标准差可视化图，并打印实测值与仿真噪声上界的倍率对照。
+
+**动机**：仿真侧的图像噪声是同方差的（全图共用一个 std），而真实传感器噪声随像素亮度变化，在高增益下的暗区尤其显著；本场景背景接近全黑，这一段正是差异最大的区域。要把仿真噪声改成信号相关模型，先要有真机实测曲线，不能猜。
+
+**影响**：纯新增，只读相机。未触及动作尺度、限幅、工作空间、初始状态门禁、坐标系约定、停止时序或共享内存 ABI。模型输入尺寸从 bundle config 的 `model.metadata_path` → `input_signature.wrist_rgb` 解析，未硬编码 224。脚本内 `--simulation-noise-std` 的默认值 0.006 引自 `TacEx/` 侧配置，仅用于打印对照，可用 CLI 覆盖，不构成跨仓库依赖。
+
+**验证**：`.venv/bin/python -m unittest discover -s tests -p 'test_*.py'` 共 96 项，仅剩本文件“长期未决事项”中已记录的 `test_streaming.py` 既有 ERROR。`.venv/bin/python -m compileall franka_sim2real scripts tests` 通过。`measure_camera_noise.py --help` 通过。**真机采集未运行**：测量结果只有在操作者确认视野静止后才有意义，需人工布置场景后执行。
+
+**文件**：`scripts/calibration/measure_camera_noise.py`、`tests/test_measure_camera_noise.py`、`docs/ARCHITECTURE.md`、`README.md`
+
 ## 2026-08-08 GelSight 触觉输入与 AprilTag 位姿验证
 
 **变更**：新增 0808 GelSight 部署配置与入口，配置中首次启用 `tactile_camera`（左右 device 0/6，3280x2464@25，`first_frame_timeout_s: 10`），模型指向 `checkpoint/0808/rma_gelsight_student_latest.pt`。工作空间 z 下限从 0.02 放宽到 0.01。同日更新了 `e2e_bundle.py`、`streaming.py`、`streaming_server9.py`、统一入口 `run_exported_0711.py`，以及原生 worker 源码；新增 AprilTag 方块位姿实时验证工具与对应测试。

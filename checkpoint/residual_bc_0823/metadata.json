@@ -1,0 +1,151 @@
+{
+  "balanced_sampling": true,
+  "base_model_path": "/home/td/franka/checkpoint/0814_gelsight/gelsight_reference_student_latest.pt",
+  "base_model_sha256": "0504ae1c22adbcb9d19c4bf94a29324a50798d86b989be8a7d429c79253a3ddb",
+  "best_epoch": 12,
+  "format_version": 1,
+  "gripper_source": "base_policy",
+  "group_counts": {
+    "test": {
+      "intervention_hold": 6,
+      "intervention_moving": 35,
+      "normal": 357
+    },
+    "train": {
+      "intervention_hold": 175,
+      "intervention_moving": 759,
+      "normal": 1152
+    },
+    "validation": {
+      "intervention_hold": 17,
+      "intervention_moving": 105,
+      "normal": 261
+    }
+  },
+  "input_contract": "actor_feature_1043_plus_base_action_4",
+  "kind": "franka_hil_residual_bc",
+  "max_base_action_error": {
+    "test": 0.0,
+    "train": 2.5093555450439453e-05,
+    "validation": 0.0
+  },
+  "model_config": {
+    "actor_feature_dim": 1043,
+    "base_action_dim": 4,
+    "hidden_dims": [
+      256,
+      128
+    ],
+    "output_dim": 3,
+    "output_scale": 1.2
+  },
+  "output_contract": "prelimit_normalized_residual_xyz_3",
+  "policy_action_filter": "policy_action_accepted == true",
+  "sample_counts": {
+    "test": 398,
+    "train": 2086,
+    "validation": 383
+  },
+  "seed": 42,
+  "test_episodes": [
+    "20260822_235956_e2e_bundle_real_exported_0814_gelsight"
+  ],
+  "test_loss": 0.03977629167949734,
+  "test_metrics": {
+    "intervention_hold": {
+      "count": 6,
+      "mae": 0.21942561864852905,
+      "mae_xyz": [
+        0.25587037205696106,
+        0.13002555072307587,
+        0.27238091826438904
+      ],
+      "rmse": 0.31119051575660706
+    },
+    "intervention_moving": {
+      "count": 35,
+      "mae": 0.04535298049449921,
+      "mae_xyz": [
+        0.06565233319997787,
+        0.047509193420410156,
+        0.022897401824593544
+      ],
+      "rmse": 0.0634801983833313
+    },
+    "normal": {
+      "count": 357,
+      "mae": 0.21816635131835938,
+      "mae_xyz": [
+        0.18412496149539948,
+        0.16075068712234497,
+        0.3096233904361725
+      ],
+      "rmse": 0.2943999767303467
+    },
+    "normal_prediction_norm_mean": 0.41979914903640747,
+    "overall": {
+      "count": 398,
+      "mae": 0.2029881626367569,
+      "mae_xyz": [
+        0.17478810250759125,
+        0.15032905340194702,
+        0.2838473618030548
+      ],
+      "rmse": 0.2820587754249573
+    }
+  },
+  "train_episodes": [
+    "20260822_235032_e2e_bundle_real_exported_0814_gelsight",
+    "20260822_235159_e2e_bundle_real_exported_0814_gelsight",
+    "20260822_235245_e2e_bundle_real_exported_0814_gelsight",
+    "20260822_235614_e2e_bundle_real_exported_0814_gelsight",
+    "20260822_235739_e2e_bundle_real_exported_0814_gelsight"
+  ],
+  "validation_episodes": [
+    "20260822_235845_e2e_bundle_real_exported_0814_gelsight"
+  ],
+  "validation_loss": 0.011600397378076565,
+  "validation_metrics": {
+    "intervention_hold": {
+      "count": 17,
+      "mae": 0.16919834911823273,
+      "mae_xyz": [
+        0.1404760777950287,
+        0.0883190706372261,
+        0.27879998087882996
+      ],
+      "rmse": 0.22202417254447937
+    },
+    "intervention_moving": {
+      "count": 105,
+      "mae": 0.11834650486707687,
+      "mae_xyz": [
+        0.1422557830810547,
+        0.11196102201938629,
+        0.10082269459962845
+      ],
+      "rmse": 0.1304595172405243
+    },
+    "normal": {
+      "count": 261,
+      "mae": 0.11886663734912872,
+      "mae_xyz": [
+        0.11980657279491425,
+        0.09535770863294601,
+        0.1414356231689453
+      ],
+      "rmse": 0.1548801064491272
+    },
+    "normal_prediction_norm_mean": 0.22645355761051178,
+    "overall": {
+      "count": 383,
+      "mae": 0.12095808237791061,
+      "mae_xyz": [
+        0.1268784999847412,
+        0.09959711134433746,
+        0.13639864325523376
+      ],
+      "rmse": 0.1523180603981018
+    }
+  }
+}

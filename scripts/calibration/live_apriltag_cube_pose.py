@@ -334,7 +334,30 @@ def _policy_crop(rgb: np.ndarray, camera_config: dict[str, Any], width: int, hei
 
 
 class RMAPolicyCubePredictor:
-    """Read cube XYZ from the RMA student's visual adaptation head."""
+    """Read cube XYZ from a supported RMA student's visual position head.
+
+    This helper is strictly for camera-only diagnostics.  Its output must not
+    be added to the real-robot policy observation or control path.
+    """
+
+    _RMA_STUDENT_KIND = "tacex_rma_student_torchscript"
+    _X040_WIDE_KIND = "tacex_rma_x040_wide_direct_action_torchscript"
+    _X040_WIDE_THREE_FRAME_KIND = (
+        "tacex_rma_x040_wide_three_frame_direct_action_torchscript"
+    )
+    _GELSIGHT_SIZE_BUCKETS_KIND = "tacex_rma_gelsight_size_buckets_student_torchscript"
+    _GELSIGHT_X040_THREE_FRAME_KIND = (
+        "tacex_rma_gelsight_x040_dr_three_frame_student_torchscript"
+    )
+    # The compact 0811/0812 exporters intentionally omit this training-only
+    # position-head normalization from their metadata.  It is fixed by the
+    # TacEx X040-Wide model contract, in robot_root metres.
+    _X040_WIDE_POSITION_CENTER = (0.40, 0.00, 0.026)
+    _X040_WIDE_POSITION_SCALE = (0.08, 0.10, 0.10)
+    # The 0814 GelSight exporter keeps this normalization in the scripted
+    # model's RMAObservationNormalizer rather than duplicating it in metadata.
+    _GELSIGHT_POSITION_CENTER = (0.50, 0.00, 0.026)
+    _GELSIGHT_POSITION_SCALE = (0.05, 0.05, 0.10)
 
     def __init__(self, model_path: Path, metadata_path: Path, device: str) -> None:
         if not model_path.is_file():
@@ -342,29 +365,88 @@ class RMAPolicyCubePredictor:
         if not metadata_path.is_file():
             raise FileNotFoundError(f"Policy metadata not found: {metadata_path}")
         self.metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if self.metadata.get("kind") != "tacex_rma_student_torchscript":
-            raise ValueError("Policy metadata is not a TacEx RMA student export")
+        self.policy_kind = str(self.metadata.get("kind", ""))
+        if self.policy_kind not in {
+            self._RMA_STUDENT_KIND,
+            self._X040_WIDE_KIND,
+            self._X040_WIDE_THREE_FRAME_KIND,
+            self._GELSIGHT_SIZE_BUCKETS_KIND,
+            self._GELSIGHT_X040_THREE_FRAME_KIND,
+        }:
+            raise ValueError(
+                "Policy metadata is not a supported TacEx RMA export with a visual position head"
+            )
+        self.has_contact_prediction = self.policy_kind == self._RMA_STUDENT_KIND
 
         expected_hash = self.metadata.get("torchscript_sha256")
         if expected_hash and _sha256(model_path) != expected_hash:
             raise ValueError("TorchScript SHA-256 differs from policy metadata")
 
-        signature = self.metadata.get("input_signature", {}).get("wrist_rgb")
-        if not isinstance(signature, list) or len(signature) != 3:
-            raise ValueError("Policy metadata is missing input_signature.wrist_rgb")
-        self.height, self.width, channels = (int(value) for value in signature)
+        input_signature = self.metadata.get("input_signature", {})
+        if self.policy_kind in {
+            self._X040_WIDE_THREE_FRAME_KIND,
+            self._GELSIGHT_X040_THREE_FRAME_KIND,
+        }:
+            signature = input_signature.get("wrist_rgb_history")
+            if not isinstance(signature, list) or len(signature) != 4:
+                raise ValueError(
+                    "Three-frame policy metadata is missing "
+                    "input_signature.wrist_rgb_history"
+                )
+            self.history_frames, self.height, self.width, channels = (
+                int(value) for value in signature
+            )
+            if self.history_frames != 3:
+                raise ValueError(
+                    "Three-frame policy diagnostics require wrist_rgb_history[3,H,W,3]"
+                )
+        else:
+            signature = input_signature.get("wrist_rgb")
+            if not isinstance(signature, list) or len(signature) != 3:
+                raise ValueError("Policy metadata is missing input_signature.wrist_rgb")
+            self.height, self.width, channels = (int(value) for value in signature)
+            self.history_frames = 1
         if channels != 3:
             raise ValueError(f"Expected RGB input with 3 channels, got {channels}")
 
         normalization = self.metadata.get("normalization", {})
-        self.position_center = _triplet(
-            "normalization.cube_position_center",
-            normalization.get("cube_position_center", []),
-        )
-        self.position_scale = _triplet(
-            "normalization.cube_position_scale",
-            normalization.get("cube_position_scale", []),
-        )
+        if self.policy_kind == self._GELSIGHT_X040_THREE_FRAME_KIND:
+            # This export's regular forward() already denormalizes the visual
+            # position head and returns cube_position_root_m directly.
+            self.position_center = np.zeros(3, dtype=np.float32)
+            self.position_scale = np.ones(3, dtype=np.float32)
+            self.position_normalization_source = "TorchScript cube_position_root_m"
+        elif "cube_position_center" in normalization and "cube_position_scale" in normalization:
+            self.position_center = _triplet(
+                "normalization.cube_position_center",
+                normalization["cube_position_center"],
+            )
+            self.position_scale = _triplet(
+                "normalization.cube_position_scale",
+                normalization["cube_position_scale"],
+            )
+            self.position_normalization_source = "metadata"
+        elif self.policy_kind in {
+            self._X040_WIDE_KIND,
+            self._X040_WIDE_THREE_FRAME_KIND,
+        }:
+            self.position_center = np.asarray(
+                self._X040_WIDE_POSITION_CENTER, dtype=np.float32
+            )
+            self.position_scale = np.asarray(
+                self._X040_WIDE_POSITION_SCALE, dtype=np.float32
+            )
+            self.position_normalization_source = "TacEx X040-Wide fixed contract"
+        elif self.policy_kind == self._GELSIGHT_SIZE_BUCKETS_KIND:
+            self.position_center = np.asarray(
+                self._GELSIGHT_POSITION_CENTER, dtype=np.float32
+            )
+            self.position_scale = np.asarray(
+                self._GELSIGHT_POSITION_SCALE, dtype=np.float32
+            )
+            self.position_normalization_source = "TacEx GelSight Size-Buckets fixed contract"
+        else:
+            raise ValueError("Policy metadata is missing cube-position normalization")
         if np.any(self.position_scale <= 0.0):
             raise ValueError("normalization.cube_position_scale must be positive")
 
@@ -382,14 +464,33 @@ class RMAPolicyCubePredictor:
             raise RuntimeError(f"CUDA was requested ({device}) but torch.cuda.is_available() is false")
         self.model = torch.jit.load(str(model_path), map_location=self.device).eval()
         self.exported_methods = set(self.model._c._method_names())
+        if self.policy_kind in {
+            self._X040_WIDE_KIND,
+            self._X040_WIDE_THREE_FRAME_KIND,
+        } and "forward_with_position" not in self.exported_methods:
+            raise ValueError(
+                "X040-Wide TorchScript export is missing forward_with_position(); "
+                "cannot evaluate its visual position head"
+            )
+        if (
+            self.policy_kind == self._GELSIGHT_SIZE_BUCKETS_KIND
+            and "forward_with_auxiliary" not in self.exported_methods
+        ):
+            raise ValueError(
+                "GelSight Size-Buckets TorchScript export is missing forward_with_auxiliary(); "
+                "cannot evaluate its visual position head"
+            )
         self._position_scale = torch.as_tensor(
             self.position_scale, dtype=torch.float32, device=self.device
         )
         self._position_center = torch.as_tensor(
             self.position_center, dtype=torch.float32, device=self.device
         )
+        self._rgb_history: deque[np.ndarray] = deque(maxlen=self.history_frames)
 
     def _predict_adaptation(self, rgb_tensor: Any) -> tuple[Any, Any]:
+        if not self.has_contact_prediction:
+            raise RuntimeError("X040-Wide does not provide the old adaptation/contact head")
         if "predict_adaptation" in self.exported_methods:
             outputs = self.model.predict_adaptation(rgb_tensor)
         else:
@@ -404,21 +505,151 @@ class RMAPolicyCubePredictor:
             raise RuntimeError(f"Expected position[3] and contact[2], got {shapes}")
         return by_dim[3], by_dim[2]
 
+    def _predict_position(self, rgb_tensor: Any) -> tuple[Any, Any | None]:
+        """Return normalized cube XYZ and optional contact logits.
+
+        X040-Wide's exported ``forward_with_position`` keeps its position head
+        as a visual-only auxiliary output.  The required proprio/history
+        tensors are supplied only to satisfy the TorchScript method signature;
+        the position branch is calculated solely from wrist RGB, as in the
+        training export.  Its policy actions are intentionally discarded.
+        """
+        if self.policy_kind in {
+            self._X040_WIDE_KIND,
+            self._X040_WIDE_THREE_FRAME_KIND,
+        }:
+            batch_size = int(rgb_tensor.shape[0])
+            proprio = self.torch.zeros((batch_size, 15), dtype=self.torch.float32, device=self.device)
+            proprio[:, 14] = 0.04
+            action_history = self.torch.zeros(
+                (batch_size, 4), dtype=self.torch.float32, device=self.device
+            )
+            outputs = self.model.forward_with_position(rgb_tensor, proprio, action_history)
+            if not isinstance(outputs, tuple) or len(outputs) != 2:
+                raise RuntimeError("X040-Wide forward_with_position returned an unexpected output")
+            actions, normalized = outputs
+            if tuple(actions.shape) != (batch_size, 4) or tuple(normalized.shape) != (batch_size, 3):
+                raise RuntimeError(
+                    "Expected X040-Wide actions[N,4] and normalized position[N,3], got "
+                    f"{tuple(actions.shape)} and {tuple(normalized.shape)}"
+                )
+            return normalized, None
+        if self.policy_kind == self._GELSIGHT_SIZE_BUCKETS_KIND:
+            batch_size = int(rgb_tensor.shape[0])
+            proprio = self.torch.zeros(
+                (batch_size, 15), dtype=self.torch.float32, device=self.device
+            )
+            proprio[:, 14] = 0.04
+            action_history = self.torch.zeros(
+                (batch_size, 4), dtype=self.torch.float32, device=self.device
+            )
+            tactile = self.torch.zeros(
+                (batch_size, 96, 128, 3), dtype=self.torch.uint8, device=self.device
+            )
+            outputs = self.model.forward_with_auxiliary(
+                rgb_tensor,
+                proprio,
+                action_history,
+                tactile,
+                tactile,
+                tactile,
+                tactile,
+            )
+            if not isinstance(outputs, tuple) or len(outputs) != 4:
+                raise RuntimeError(
+                    "GelSight forward_with_auxiliary returned an unexpected output"
+                )
+            actions, normalized, _contact_logits, _heatmap = outputs
+            if tuple(actions.shape) != (batch_size, 4) or tuple(normalized.shape) != (batch_size, 3):
+                raise RuntimeError(
+                    "Expected GelSight actions[N,4] and normalized position[N,3], got "
+                    f"{tuple(actions.shape)} and {tuple(normalized.shape)}"
+                )
+            # This auxiliary position branch is visual-only. Tactile tensors
+            # are zero-filled solely to satisfy the exported method signature.
+            return normalized, None
+        if self.policy_kind == self._GELSIGHT_X040_THREE_FRAME_KIND:
+            batch_size = int(rgb_tensor.shape[0])
+            proprio = self.torch.zeros(
+                (batch_size, 15), dtype=self.torch.float32, device=self.device
+            )
+            proprio[:, 14] = 0.04
+            action_history = self.torch.zeros(
+                (batch_size, 4), dtype=self.torch.float32, device=self.device
+            )
+            tactile = self.torch.zeros(
+                (batch_size, 96, 128, 3), dtype=self.torch.uint8, device=self.device
+            )
+            outputs = self.model(
+                rgb_tensor,
+                proprio,
+                action_history,
+                tactile,
+                tactile,
+                tactile,
+                tactile,
+            )
+            if not isinstance(outputs, tuple) or len(outputs) != 3:
+                raise RuntimeError(
+                    "GelSight X040 three-frame forward returned an unexpected output"
+                )
+            actions, _contact_probability, position_root = outputs
+            if (
+                tuple(actions.shape) != (batch_size, 4)
+                or tuple(position_root.shape) != (batch_size, 3)
+            ):
+                raise RuntimeError(
+                    "Expected GelSight X040 three-frame actions[N,4] and "
+                    f"cube_position_root_m[N,3], got {tuple(actions.shape)} and "
+                    f"{tuple(position_root.shape)}"
+                )
+            # The position branch depends only on the RGB history; tactile
+            # tensors above are zero-filled only to satisfy forward's input
+            # signature for this camera-only diagnostic.
+            return position_root, None
+        return self._predict_adaptation(rgb_tensor)
+
+    def _position_and_contact(self, rgb_tensor: Any) -> tuple[Any, Any]:
+        normalized, contact_logits = self._predict_position(rgb_tensor)
+        position = normalized * self._position_scale + self._position_center
+        if contact_logits is None:
+            contact = self.torch.full(
+                (int(rgb_tensor.shape[0]), 2), float("nan"), dtype=position.dtype, device=self.device
+            )
+        else:
+            contact = self.torch.sigmoid(contact_logits)
+        return position, contact
+
     def predict(self, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         image = np.asarray(rgb, dtype=np.uint8)
         expected = (self.height, self.width, 3)
         if image.shape != expected:
             raise ValueError(f"Expected RGB image {expected}, got {image.shape}")
+        image = np.array(image, dtype=np.uint8, order="C", copy=True)
+        if self.history_frames > 1:
+            if not self._rgb_history:
+                self._rgb_history.extend(image.copy() for _ in range(self.history_frames))
+            else:
+                self._rgb_history.append(image)
+            model_image = np.stack(tuple(self._rgb_history), axis=0)
+        else:
+            model_image = image
         with self.torch.inference_mode():
-            batch = image.reshape(1, self.height, self.width, 3)
+            batch = model_image.reshape(
+                (1, self.history_frames, self.height, self.width, 3)
+                if self.history_frames > 1
+                else (1, self.height, self.width, 3)
+            )
             tensor = self.torch.as_tensor(batch, dtype=self.torch.uint8, device=self.device)
-            normalized, contact_logits = self._predict_adaptation(tensor)
-            position = normalized * self._position_scale + self._position_center
-            contact = self.torch.sigmoid(contact_logits)
+            position, contact = self._position_and_contact(tensor)
         return (
             position[0].detach().cpu().numpy().astype(np.float64),
             contact[0].detach().cpu().numpy().astype(np.float64),
         )
+
+    def reset_history(self) -> None:
+        """Start a new camera episode for a policy requiring RGB history."""
+        self._rgb_history.clear()
 
     def predict_batch(self, images: np.ndarray, batch_size: int = 64) -> tuple[np.ndarray, np.ndarray]:
         images = np.asarray(images, dtype=np.uint8)
@@ -428,15 +659,20 @@ class RMAPolicyCubePredictor:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
 
+        if self.history_frames > 1:
+            # Dataset frames are chronological.  Reuse the live path so the
+            # first two predictions follow TacEx's repeat-first-frame reset
+            # convention rather than silently using synthetic black frames.
+            positions, contacts = zip(*(self.predict(image) for image in images))
+            return np.asarray(positions, dtype=np.float64), np.asarray(contacts, dtype=np.float64)
+
         positions: list[np.ndarray] = []
         contacts: list[np.ndarray] = []
         with self.torch.inference_mode():
             for start in range(0, len(images), batch_size):
                 batch = np.array(images[start : start + batch_size], copy=True, order="C")
                 tensor = self.torch.as_tensor(batch, dtype=self.torch.uint8, device=self.device)
-                normalized, contact_logits = self._predict_adaptation(tensor)
-                position = normalized * self._position_scale + self._position_center
-                contact = self.torch.sigmoid(contact_logits)
+                position, contact = self._position_and_contact(tensor)
                 positions.append(position.detach().cpu().numpy().astype(np.float64))
                 contacts.append(contact.detach().cpu().numpy().astype(np.float64))
         return np.concatenate(positions, axis=0), np.concatenate(contacts, axis=0)
@@ -788,6 +1024,8 @@ def main() -> int:
                         lines.append(
                             (_xyz_text("policy_pred_p_cube median", policy_median), (255, 0, 255))
                         )
+                        if not predictor.has_contact_prediction:
+                            lines.append(("policy contact: n/a (X040-Wide has no contact head)", (255, 0, 255)))
                     except RuntimeError as exc:
                         lines.append((f"POLICY PRED FAILED: {exc}", (0, 0, 255)))
                 row: dict[str, Any] | None = None
@@ -878,7 +1116,7 @@ def main() -> int:
 
                             prediction_vs_calibrated_error = math.nan
                             prediction_vs_ground_truth_error = math.nan
-                            if policy_position is not None and policy_contact is not None:
+                            if policy_position is not None:
                                 prediction_vs_calibrated_error = float(
                                     np.linalg.norm(policy_position - position)
                                 )

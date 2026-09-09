@@ -1,30 +1,78 @@
-# Python environments and caches
+# Python environments, caches, and packaging output
 .venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 
-# Local editor and Codex state
+# Local secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Editors, assistants, notebooks, and operating-system files
 .agents/
 .codex/
 .vscode/
 .idea/
+.ipynb_checkpoints/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
-# Runtime logs and real-camera data
-runs/
-
-# Generated build artifacts and archives
-artifacts/
+# Native/Python build output
+build/
 dist/
-*.zip
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+*.so
+*.whl
 
-# Large model weights (keep JSON metadata tracked)
+# Runtime logs, recorded trajectories, and camera/evaluation data
+/runs/
+/runs_old/
+/real_policy_logs/
+/real_rl_logs/
+/sim_rollout/
+/eval_dataset/
+*.log
+*.bag
+*.bag.active
+*.db3
+*.mcap
+
+# Generated artifacts and archives
+/artifacts/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Model weights (JSON export metadata remains trackable)
 *.pt
 *.pth
 *.ckpt
+*.onnx
+*.safetensors
+*.engine
+/checkpoints/
+/checkpoint/**/*.ts
 
-# Local scratch files
-text.txt
-.DS_Store
+# Separate local checkout; add it as a submodule if it becomes a dependency
+/TacEx/
+
+# Local command notes and scratch files
+/order.txt
+/text.txt

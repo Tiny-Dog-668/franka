@@ -1,0 +1,56 @@
+{
+  "kind": "tacex_rma_x040_wide_direct_action_torchscript",
+  "version": 1,
+  "student_checkpoint": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment_rma_x040_wide_direct_action_student/2026-08-09_20-37-53_distillation/checkpoints/student_0030000.pt",
+  "student_checkpoint_sha256": "de79a00ee0d53837c899cea3330f3127649523b4c58d017a14d5ef3ecfededc6",
+  "torchscript_sha256": "79aea3ec6e26c59d7595f298942d03982279189a84d3fdaa37c3e7ae28b23538",
+  "teacher_checkpoint": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment_rma_x040_wide_teacher/2026-08-09_19-35-58_ppo_torch_rma_privileged_xyz_no_contact/checkpoints/best_agent.pt",
+  "teacher_checkpoint_sha256": "1773fbcc40b972001e21c698f16a43695eb0affbc58f08d470f67072d674954a",
+  "input_signature": {
+    "wrist_rgb": [
+      224,
+      224,
+      3
+    ],
+    "proprio_obs": [
+      15
+    ],
+    "action_history": [
+      4
+    ]
+  },
+  "input_order": [
+    "wrist_rgb",
+    "proprio_obs",
+    "action_history"
+  ],
+  "output_signature": {
+    "mean_actions": [
+      4
+    ]
+  },
+  "normalization": {
+    "joint_lower": [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
+    "joint_upper": [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
+    "joint_velocity_scale": [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61],
+    "gripper_width_center_scale": [0.04, 0.04],
+    "history_scale": [0.025, 0.025, 0.025, 0.005],
+    "cube_position_center": [0.4, 0.0, 0.026],
+    "cube_position_scale": [0.08, 0.1, 0.1],
+    "gripper_position_center": [0.5, 0.0, 0.175],
+    "gripper_position_scale": [0.1, 0.1, 0.15],
+    "target_position_center": [-0.1, 0.0, -0.149],
+    "target_position_scale": [0.18, 0.1, 0.15],
+    "position_frame": "robot_root"
+  },
+  "runtime_privileged_inputs": [],
+  "training_privileged_inputs": {
+    "rma_cube_pos": [
+      3
+    ],
+    "purpose": "Teacher action and visual-position MSE labels only; never runtime input"
+  },
+  "position_head": "training-only auxiliary output; not in TorchScript signature",
+  "trace_max_abs_error": 0.0,
+  "reload_max_abs_error": 0.0
+}

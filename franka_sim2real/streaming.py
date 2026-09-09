@@ -5,24 +5,37 @@ import math
 import threading
 import time
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
+import cv2
 import numpy as np
-from PIL import Image
 
 from .e2e_bundle import (
     ActionHistoryBuffer,
     BundleDeployConfig,
     BundleTorchScriptPolicy,
+    WristRGBHistoryBuffer,
     _make_camera,
     _make_run_dir,
     _validate_bundle_action_dims,
+    capture_gelsight_reference_frames,
+    reject_evaluation_only_motion,
+    _validate_tacex_rma_direct_action_student_contract,
+    _validate_tacex_rma_gelsight_size_buckets_student_contract,
+    _validate_tacex_rma_gelsight_x040_three_frame_student_contract,
+    _validate_tacex_rma_x040_wide_direct_action_student_contract,
+    _validate_tacex_rma_x040_wide_three_frame_direct_action_student_contract,
     _validate_tacex_rma_student_contract,
+    _validate_tacex_rma_xy_student_contract,
     build_bundle_inputs,
+    build_rma_contact_force_input,
     evaluate_initial_state,
 )
+from .hil import HILInputSnapshot, HILSettings, HILStepData, human_normalized_xyz
+from .residual_runtime import ResidualDeploySettings
+from .real_rl.runtime import RealRLDeploySettings
 from .types import RobotAction, RobotObservation, print_error_wrench_report
 
 
@@ -41,6 +54,35 @@ EXPECTED_PYLIBFRANKA_VERSION = "0.21.1"
 _WORST_CASE_MANIPULABILITY = 0.2637
 
 
+def _save_rgb_png(path: Path, image: np.ndarray) -> None:
+    """Write an RGB uint8 image as a lossless PNG with OpenCV's fast encoder."""
+
+    rgb = np.asarray(image, dtype=np.uint8)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError(f"PNG artifact must be an HxWx3 RGB image, got {rgb.shape}")
+    bgr = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)
+    if not cv2.imwrite(str(path), bgr):
+        raise RuntimeError(f"Failed to write PNG artifact: {path}")
+
+
+def _retain_artifact_arrays(
+    record: dict[str, Any],
+    result: "_PolicyResult",
+    config: BundleDeployConfig,
+    save_step_data: bool,
+) -> np.ndarray | None:
+    """Drop arrays that the selected artifact profile will never write."""
+
+    save_rgb = bool(config.camera.save_rgb or save_step_data)
+    save_tactile = bool(config.tactile_camera.save_rgb or save_step_data)
+    if not save_step_data:
+        record.pop("_model_rgb", None)
+    if not save_tactile:
+        record.pop("_tactile_images", None)
+        record.pop("_tactile_references", None)
+    return result.image if save_rgb else None
+
+
 def reshape_column_major(values: Any, rows: int, columns: int) -> np.ndarray:
     array = np.asarray(values, dtype=np.float64)
     if array.shape == (rows, columns):
@@ -50,6 +92,16 @@ def reshape_column_major(values: Any, rows: int, columns: int) -> np.ndarray:
             f"Expected {rows * columns} column-major values, got {array.size}"
         )
     return array.reshape((rows, columns), order="F")
+
+
+def physical_tool_tcp_translation(pose: Any, config: BundleDeployConfig) -> np.ndarray:
+    """Return the configured physical tool point in robot-root metres."""
+
+    matrix = reshape_column_major(pose, 4, 4)
+    offset = np.asarray(config.tool_tcp_offset_ee_m, dtype=np.float64).reshape(-1)
+    if offset.shape != (3,) or not np.all(np.isfinite(offset)):
+        raise ValueError("tool_tcp_offset_ee_m must contain three finite values")
+    return matrix[:3, 3] + matrix[:3, :3] @ offset
 
 
 def dls_joint_delta(jacobian: Any, pose_error: Any, damping: float) -> np.ndarray:
@@ -199,6 +251,9 @@ def validate_streaming_contract(
         raise ValueError(
             "Streaming requires action labels ['dx', 'dy', 'dz', 'gripper']"
         )
+    tool_tcp_offset = np.asarray(config.tool_tcp_offset_ee_m, dtype=np.float64).reshape(-1)
+    if tool_tcp_offset.shape != (3,) or not np.all(np.isfinite(tool_tcp_offset)):
+        raise ValueError("tool_tcp_offset_ee_m must contain three finite values")
 
     stream = config.streaming
     if stream.backend not in {"async_position", "server9_joint_position"}:
@@ -231,12 +286,39 @@ def validate_streaming_contract(
         values = np.asarray(getattr(stream, name), dtype=np.float64).reshape(-1)
         if values.shape != (7,) or not np.all(np.isfinite(values)) or np.any(values <= 0.0):
             raise ValueError(f"streaming.{name} must have seven finite positive values")
+    if stream.impedance_mode not in {"joint", "cartesian"}:
+        raise ValueError("streaming.impedance_mode must be 'joint' or 'cartesian'")
     if stream.joint_impedance is not None:
         joint_impedance = np.asarray(stream.joint_impedance, dtype=np.float64).reshape(-1)
         if joint_impedance.shape != (7,) or not np.all(np.isfinite(joint_impedance)):
             raise ValueError("streaming.joint_impedance must have seven finite values or be null")
         if np.any(joint_impedance <= 0.0) or np.any(joint_impedance > 14250.0):
             raise ValueError("streaming.joint_impedance values must be in (0, 14250]")
+    if stream.cartesian_impedance is not None:
+        cartesian_impedance = np.asarray(stream.cartesian_impedance, dtype=np.float64).reshape(-1)
+        if cartesian_impedance.shape != (6,) or not np.all(np.isfinite(cartesian_impedance)):
+            raise ValueError(
+                "streaming.cartesian_impedance must have six finite values or be null"
+            )
+        if (
+            np.any(cartesian_impedance[:3] < 10.0)
+            or np.any(cartesian_impedance[:3] > 3000.0)
+            or np.any(cartesian_impedance[3:] < 1.0)
+            or np.any(cartesian_impedance[3:] > 300.0)
+        ):
+            raise ValueError(
+                "streaming.cartesian_impedance must be [10, 3000] N/m for XYZ "
+                "and [1, 300] Nm/rad for rotation"
+            )
+    if stream.impedance_mode == "cartesian":
+        if stream.cartesian_impedance is None:
+            raise ValueError(
+                "streaming.cartesian_impedance is required when impedance_mode='cartesian'"
+            )
+        if stream.joint_impedance is not None:
+            raise ValueError(
+                "streaming.joint_impedance must be null when impedance_mode='cartesian'"
+            )
     if (
         not math.isfinite(stream.maximum_joint_target_delta_rad)
         or not (0.0 < stream.maximum_joint_target_delta_rad <= 0.1)
@@ -282,6 +364,40 @@ def validate_streaming_contract(
     ):
         raise ValueError("Streaming normalized action bounds must be exactly [-1, 1]")
 
+    if getattr(bundle, "is_tacex_rma_gelsight_x040_three_frame_student", False):
+        history_scale = np.asarray(config.model.history_scale, dtype=np.float32).reshape(-1)
+        _validate_tacex_rma_gelsight_x040_three_frame_student_contract(
+            bundle, config, history_scale
+        )
+        return {
+            "policy_frequency_hz": stream.policy_frequency_hz,
+            "ik_frequency_hz": stream.ik_frequency_hz,
+            "ticks_per_action": 2,
+            "rma_gelsight_x040_three_frame_student_metadata_version": bundle.metadata.get(
+                "version"
+            ),
+            "rgb_history": "three_frames_oldest_to_newest",
+            "tactile_reference": "first_post_reset_frame_fixed_per_rollout",
+            "max_episode_length_steps": 150,
+        }
+    if getattr(bundle, "is_tacex_rma_gelsight_size_buckets_student", False):
+        history_scale = np.asarray(config.model.history_scale, dtype=np.float32).reshape(-1)
+        _validate_tacex_rma_gelsight_size_buckets_student_contract(
+            bundle, config, history_scale
+        )
+        deployment_contract = bundle.metadata.get("deployment_contract", {})
+        return {
+            "policy_frequency_hz": stream.policy_frequency_hz,
+            "ik_frequency_hz": stream.ik_frequency_hz,
+            "ticks_per_action": 2,
+            "rma_gelsight_size_buckets_student_metadata_version": bundle.metadata.get(
+                "version"
+            ),
+            "tactile_reference": "first_post_reset_frame_fixed_per_rollout",
+            "max_episode_length_steps": deployment_contract.get(
+                "max_episode_length_steps", 150
+            ),
+        }
     if getattr(bundle, "is_tacex_rma_student", False):
         history_scale = np.asarray(config.model.history_scale, dtype=np.float32).reshape(-1)
         _validate_tacex_rma_student_contract(bundle, config, history_scale)
@@ -289,8 +405,53 @@ def validate_streaming_contract(
             "policy_frequency_hz": stream.policy_frequency_hz,
             "ik_frequency_hz": stream.ik_frequency_hz,
             "ticks_per_action": 2,
-            "rma_student_metadata_version": bundle.metadata.get("version"),
+            "rma_student_metadata_version": getattr(bundle, "metadata", {}).get("version"),
             "rma_student_v5": True,
+        }
+    if getattr(bundle, "is_tacex_rma_xy_student", False):
+        history_scale = np.asarray(config.model.history_scale, dtype=np.float32).reshape(-1)
+        _validate_tacex_rma_xy_student_contract(bundle, config, history_scale)
+        return {
+            "policy_frequency_hz": stream.policy_frequency_hz,
+            "ik_frequency_hz": stream.ik_frequency_hz,
+            "ticks_per_action": 2,
+            "rma_xy_student_metadata_version": bundle.metadata.get("version"),
+            "rma_contact_force_source": config.model.rma_contact_force_source,
+        }
+    if getattr(bundle, "is_tacex_rma_direct_action_student", False):
+        history_scale = np.asarray(config.model.history_scale, dtype=np.float32).reshape(-1)
+        _validate_tacex_rma_direct_action_student_contract(bundle, config, history_scale)
+        return {
+            "policy_frequency_hz": stream.policy_frequency_hz,
+            "ik_frequency_hz": stream.ik_frequency_hz,
+            "ticks_per_action": 2,
+            "rma_direct_action_student_metadata_version": bundle.metadata.get("version"),
+        }
+    if getattr(bundle, "is_tacex_rma_x040_wide_direct_action_student", False):
+        history_scale = np.asarray(config.model.history_scale, dtype=np.float32).reshape(-1)
+        _validate_tacex_rma_x040_wide_direct_action_student_contract(
+            bundle, config, history_scale
+        )
+        return {
+            "policy_frequency_hz": stream.policy_frequency_hz,
+            "ik_frequency_hz": stream.ik_frequency_hz,
+            "ticks_per_action": 2,
+            "rma_x040_wide_direct_action_student_metadata_version": bundle.metadata.get(
+                "version"
+            ),
+        }
+    if getattr(bundle, "is_tacex_rma_x040_wide_three_frame_direct_action_student", False):
+        history_scale = np.asarray(config.model.history_scale, dtype=np.float32).reshape(-1)
+        _validate_tacex_rma_x040_wide_three_frame_direct_action_student_contract(
+            bundle, config, history_scale
+        )
+        return {
+            "policy_frequency_hz": stream.policy_frequency_hz,
+            "ik_frequency_hz": stream.ik_frequency_hz,
+            "ticks_per_action": 2,
+            "rma_x040_wide_three_frame_direct_action_student_metadata_version": (
+                bundle.metadata.get("version")
+            ),
         }
 
     contract = bundle.metadata.get("policy_contract")
@@ -323,17 +484,13 @@ def validate_streaming_contract(
         stream.policy_frequency_hz,
         "nominal_camera_frequency_hz",
     )
-    episode_limit = int(contract.get("max_episode_length_steps", 150))
-    if config.runner.steps > min(150, episode_limit):
-        raise ValueError(
-            f"Streaming rollout is capped at {min(150, episode_limit)} policy steps"
-        )
     return {
         "policy_frequency_hz": stream.policy_frequency_hz,
         "ik_frequency_hz": stream.ik_frequency_hz,
         "ticks_per_action": 2,
         "xyz_command_frame": "robot_root",
         "commissioning_action_limit": stream.commissioning_action_limit,
+        "training_episode_length_steps": contract.get("max_episode_length_steps"),
     }
 
 
@@ -409,7 +566,10 @@ def evaluate_streaming_check_state(
         "joint state is non-finite or outside Panda limits",
     )
 
-    position = np.asarray(observation.tcp_translation, dtype=np.float64).reshape(-1)
+    position = np.asarray(
+        observation.metadata.get("physical_tool_tcp_translation_m", observation.tcp_translation),
+        dtype=np.float64,
+    ).reshape(-1)
     minimum = np.asarray(config.workspace["minimum"], dtype=np.float64)
     maximum = np.asarray(config.workspace["maximum"], dtype=np.float64)
     workspace_ok = (
@@ -426,7 +586,7 @@ def evaluate_streaming_check_state(
             "minimum_m": minimum.tolist(),
             "maximum_m": maximum.tolist(),
         },
-        "TCP is non-finite or outside the configured workspace",
+        "physical tool TCP is non-finite or outside the configured workspace",
     )
     return report
 
@@ -526,100 +686,143 @@ class AsyncGripperQueue:
         self.tolerance = tolerance
         self.force = force
         state = gripper.state
-        self.cached_state = state
-        self.desired_width = float(state.width)
+        self._cached_state = state
+        self._desired_width = float(state.width)
         self._future: Any | None = None
         self._future_kind: str | None = None
         self._future_target: float | None = None
         self._future_start_width: float | None = None
-        self._queued_width: float | None = None
+        self._pending_grasp_width: float | None = None
         self._control_session_active = False
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._closing = False
+        self._closed = False
+        self._api_call_in_progress = False
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="franka-gripper-worker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def cached_state(self) -> Any:
+        with self._lock:
+            return self._cached_state
+
+    @property
+    def desired_width(self) -> float:
+        with self._lock:
+            return self._desired_width
+
+    def _raise_error_locked(self) -> None:
+        if self._error is not None:
+            raise RuntimeError(f"Asynchronous gripper worker failed: {self._error}") from self._error
+
+    def check(self) -> None:
+        with self._lock:
+            self._raise_error_locked()
+            if self._closed:
+                raise RuntimeError("Asynchronous gripper worker is closed")
 
     def mark_control_session_active(self) -> None:
         with self._lock:
+            self._raise_error_locked()
+            if self._closed or self._closing:
+                raise RuntimeError("Cannot activate a closed gripper worker")
             self._control_session_active = True
 
     def command(self, width: float) -> None:
-        with self._lock:
-            max_width = float(getattr(self.cached_state, "max_width", 0.08))
+        # This is the only method called from the 30 Hz policy path. It must
+        # never enter franky/libfranka: it only coalesces the newest target.
+        with self._condition:
+            self._raise_error_locked()
+            if self._closed or self._closing:
+                raise RuntimeError("Cannot command a closed gripper worker")
+            max_width = float(getattr(self._cached_state, "max_width", 0.08))
             if not math.isfinite(max_width) or max_width <= 0.0:
                 max_width = 0.08
             target = float(np.clip(width, 0.0, max_width))
-            self.desired_width = target
-            self.poll()
-            current_width = float(self.cached_state.width)
-            if (
-                bool(getattr(self.cached_state, "is_grasped", False))
-                and target <= current_width + self.tolerance
-            ):
-                # Keep the active grasp instead of replacing it with another
-                # close command that cannot reach the policy's nominal width.
-                return
-            if abs(target - current_width) <= self.tolerance:
-                return
-            if self._future is None:
-                self._start_move(target, current_width)
-            else:
-                self._queued_width = target
+            self._desired_width = target
+            self._condition.notify_all()
 
-    def _start_move(self, target: float, current_width: float) -> None:
-        self._future = self.gripper.move_async(target, self.speed)
-        self._future_kind = "move"
-        self._future_target = target
-        self._future_start_width = current_width
-
-    def _start_grasp(self, width: float) -> None:
-        self._future = self.gripper.grasp_async(width, self.speed, self.force)
-        self._future_kind = "grasp"
-        self._future_target = width
-        self._future_start_width = width
-
-    def _clear_future(self) -> None:
+    def _clear_future_locked(self) -> None:
         self._future = None
         self._future_kind = None
         self._future_target = None
         self._future_start_width = None
 
-    def _start_queued_command(self) -> None:
-        if self._queued_width is None:
-            return
-        target = self._queued_width
-        self._queued_width = None
-        current_width = float(self.cached_state.width)
+    def _next_operation_locked(self) -> tuple[str, float, float] | None:
+        if self._pending_grasp_width is not None:
+            width = self._pending_grasp_width
+            self._pending_grasp_width = None
+            return "grasp", width, width
+        current_width = float(self._cached_state.width)
+        target = self._desired_width
         if (
-            bool(getattr(self.cached_state, "is_grasped", False))
+            bool(getattr(self._cached_state, "is_grasped", False))
             and target <= current_width + self.tolerance
         ):
-            return
-        if abs(target - current_width) > self.tolerance:
-            self._start_move(target, current_width)
+            # Keep an active force-controlled grasp instead of issuing a move
+            # that cannot reach the nominal closed width through the object.
+            return None
+        if abs(target - current_width) <= self.tolerance:
+            return None
+        return "move", target, current_width
 
-    def poll(self) -> None:
-        with self._lock:
-            if self._future is None or not self._future.wait(0.0):
+    def _start_operation(self, operation: tuple[str, float, float]) -> None:
+        kind, target, start_width = operation
+        with self._condition:
+            if self._closing:
                 return
+            self._api_call_in_progress = True
+        try:
+            if kind == "grasp":
+                future = self.gripper.grasp_async(target, self.speed, self.force)
+            else:
+                future = self.gripper.move_async(target, self.speed)
+        finally:
+            with self._condition:
+                self._api_call_in_progress = False
+                self._condition.notify_all()
+        with self._condition:
+            self._future = future
+            self._future_kind = kind
+            self._future_target = target
+            self._future_start_width = start_width
+            self._condition.notify_all()
+
+    def _complete_future(self, future: Any) -> None:
+        with self._condition:
             kind = self._future_kind
             target = self._future_target
             start_width = self._future_start_width
-            try:
-                success = bool(self._future.get())
-            except Exception as exc:
-                self._clear_future()
-                raise RuntimeError(
-                    f"Asynchronous gripper {kind or 'command'} raised an exception"
-                ) from exc
-            self._clear_future()
-            self.cached_state = self.gripper.state
-            current_width = float(self.cached_state.width)
+            self._api_call_in_progress = True
+        try:
+            success = bool(future.get())
+            state = self.gripper.state
+        except Exception as exc:
+            raise RuntimeError(
+                f"Asynchronous gripper {kind or 'command'} raised an exception"
+            ) from exc
+        finally:
+            with self._condition:
+                self._api_call_in_progress = False
+                self._condition.notify_all()
 
-            if success or (
-                kind == "grasp"
-                and bool(getattr(self.cached_state, "is_grasped", False))
-            ):
-                self._start_queued_command()
+        with self._condition:
+            if future is not self._future:
                 return
-
+            self._clear_future_locked()
+            self._cached_state = state
+            current_width = float(state.width)
+            if success or (
+                kind == "grasp" and bool(getattr(state, "is_grasped", False))
+            ):
+                self._condition.notify_all()
+                return
             blocked_close = (
                 kind == "move"
                 and target is not None
@@ -628,29 +831,105 @@ class AsyncGripperQueue:
                 and current_width > target + self.tolerance
             )
             if blocked_close:
-                # A Franka `move` reports False when an object prevents it
-                # from reaching the requested width. Convert that measured
-                # contact width into a force-controlled grasp instead of
-                # treating the expected obstruction as a communication fault.
-                self._start_grasp(current_width)
+                # Expected object contact: convert the measured blocked width
+                # into a force-controlled grasp on the same worker thread.
+                self._pending_grasp_width = current_width
+                self._condition.notify_all()
                 return
-
             raise RuntimeError(
                 "Asynchronous gripper command failed: "
                 f"kind={kind}, target_width={target}, "
                 f"actual_width={current_width:.6f}, "
-                f"is_grasped={bool(getattr(self.cached_state, 'is_grasped', False))}"
+                f"is_grasped={bool(getattr(state, 'is_grasped', False))}"
             )
 
+    def _loop(self) -> None:
+        try:
+            while True:
+                with self._condition:
+                    if self._closing:
+                        return
+                    future = self._future
+                    operation = (
+                        None if future is not None else self._next_operation_locked()
+                    )
+                    if future is None and operation is None:
+                        self._condition.wait(timeout=0.01)
+                        continue
+                if operation is not None:
+                    self._start_operation(operation)
+                    continue
+                assert future is not None
+                if future.wait(0.0):
+                    self._complete_future(future)
+                else:
+                    with self._condition:
+                        self._condition.wait(timeout=0.002)
+        except BaseException as exc:
+            with self._condition:
+                if not self._closing:
+                    self._error = exc
+                self._condition.notify_all()
+
+    def poll(self) -> None:
+        # Backward-compatible name used by streaming loops. All Franka Hand
+        # calls are owned by the worker; this check is bounded and non-blocking.
+        self.check()
+
+    def wait_idle(self, timeout_s: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            while True:
+                self._raise_error_locked()
+                operation = self._next_operation_locked()
+                if operation is not None:
+                    # Restore a pending grasp consumed by the idle probe.
+                    if operation[0] == "grasp":
+                        self._pending_grasp_width = operation[1]
+                idle = (
+                    self._future is None
+                    and not self._api_call_in_progress
+                    and operation is None
+                )
+                if idle:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError("Timed out waiting for asynchronous gripper worker")
+                self._condition.wait(timeout=min(0.02, remaining))
+
     def stop(self) -> None:
-        with self._lock:
-            self._queued_width = None
-            try:
-                if self._control_session_active or self._future is not None:
-                    self.gripper.stop()
-            finally:
-                self._clear_future()
-                self._control_session_active = False
+        with self._condition:
+            if self._closed:
+                return
+            should_stop = bool(
+                self._control_session_active
+                or self._future is not None
+                or self._api_call_in_progress
+                or self._next_operation_locked() is not None
+            )
+            self._closing = True
+            self._condition.notify_all()
+        self._thread.join(timeout=2.0)
+        if self._thread.is_alive():
+            raise RuntimeError("Asynchronous gripper worker did not stop")
+        stop_error: BaseException | None = None
+        try:
+            if should_stop:
+                self.gripper.stop()
+        except BaseException as exc:
+            stop_error = exc
+        with self._condition:
+            worker_error = self._error
+            self._clear_future_locked()
+            self._pending_grasp_width = None
+            self._control_session_active = False
+            self._closed = True
+            self._condition.notify_all()
+        if stop_error is not None:
+            raise RuntimeError(f"Failed to stop gripper: {stop_error}") from stop_error
+        if worker_error is not None:
+            raise RuntimeError(f"Asynchronous gripper worker failed: {worker_error}") from worker_error
 
 
 @dataclass
@@ -660,10 +939,17 @@ class _PolicyResult:
     robot_action: RobotAction
     action_history: np.ndarray
     proprio: np.ndarray
+    contact_force_n: np.ndarray | None
     image: np.ndarray
+    model_rgb: np.ndarray
     tactile_images: dict[str, np.ndarray]
+    tactile_references: dict[str, np.ndarray]
     inference_info: dict[str, Any]
     elapsed_ns: int
+    raw_image: np.ndarray | None = None
+    hil_step: HILStepData | None = None
+    camera_metadata: dict[str, Any] = field(default_factory=dict)
+    observation_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _run_policy_tick(
@@ -675,15 +961,35 @@ def _run_policy_tick(
     allow_full_scale: bool,
     desired_gripper_width: float,
     clock_ns: Callable[[], int],
+    rgb_history: WristRGBHistoryBuffer | None = None,
+    tactile_references: dict[str, np.ndarray] | None = None,
     *,
     collect_rma_debug: bool = False,
 ) -> _PolicyResult:
     started = clock_ns()
-    image = camera.read()
+    if tactile_references is None:
+        tactile_references = getattr(bundle, "_deployment_tactile_references", None)
+    if rgb_history is None and getattr(bundle, "uses_wrist_rgb_history", False):
+        rgb_history = getattr(bundle, "_deployment_rgb_history", None)
+        if rgb_history is None:
+            rgb_history = WristRGBHistoryBuffer(
+                bundle.rgb_history_frames,
+                (bundle.rgb_height, bundle.rgb_width, 3),
+            )
+            bundle._deployment_rgb_history = rgb_history
+    camera_metadata: dict[str, Any] = {}
+    raw_image: np.ndarray | None = None
+    if hasattr(camera, "read_policy_packet_with_raw"):
+        image, raw_image, camera_metadata = camera.read_policy_packet_with_raw()
+    elif hasattr(camera, "read_policy_packet"):
+        image, camera_metadata = camera.read_policy_packet()
+    else:
+        image = camera.read()
     if image.shape != (bundle.rgb_height, bundle.rgb_width, 3):
         raise ValueError(
             f"Expected RGB frame {(bundle.rgb_height, bundle.rgb_width, 3)}, got {image.shape}"
         )
+    model_rgb = rgb_history.update(image) if rgb_history is not None else image
     action_history, proprio = build_bundle_inputs(
         observation,
         history.current(),
@@ -699,37 +1005,121 @@ def _run_policy_tick(
             "gsmini_left_rgb": np.asarray(left_tactile, dtype=np.uint8),
             "gsmini_right_rgb": np.asarray(right_tactile, dtype=np.uint8),
         }
+    if getattr(bundle, "has_gelsight_reference_inputs", False) is True and not tactile_references:
+        raise RuntimeError(
+            "Model requires fixed GelSight reference inputs, but the deployment "
+            "session did not capture them"
+        )
     predict_kwargs = {"collect_rma_debug": True} if collect_rma_debug else {}
+    contact_force_n = build_rma_contact_force_input(observation, bundle, config)
     if tactile_images:
         raw_action = bundle.predict(
             action_history,
             proprio,
-            image,
+            model_rgb,
             tactile_images["gsmini_left_rgb"],
             tactile_images["gsmini_right_rgb"],
+            gsmini_left_reference_rgb=(tactile_references or {}).get(
+                "gsmini_left_reference_rgb"
+            ),
+            gsmini_right_reference_rgb=(tactile_references or {}).get(
+                "gsmini_right_reference_rgb"
+            ),
+            contact_force_n=contact_force_n,
             **predict_kwargs,
         )
     else:
-        raw_action = bundle.predict(
-            action_history,
-            proprio,
-            image,
-            **predict_kwargs,
-        )
+        predict_args = (action_history, proprio, model_rgb)
+        if contact_force_n is None:
+            raw_action = bundle.predict(*predict_args, **predict_kwargs)
+        else:
+            raw_action = bundle.predict(
+                *predict_args,
+                contact_force_n=contact_force_n,
+                **predict_kwargs,
+            )
     executed = clip_streaming_action(raw_action, config, allow_full_scale)
     action = streaming_robot_action(executed, config, desired_gripper_width)
+    image_copy = np.asarray(image, dtype=np.uint8).copy()
+    model_rgb_copy = (
+        image_copy
+        if model_rgb is image
+        else np.asarray(model_rgb, dtype=np.uint8).copy()
+    )
     return _PolicyResult(
         raw_action=np.asarray(raw_action, dtype=np.float32),
         executed_action=executed,
         robot_action=action,
         action_history=action_history,
         proprio=proprio,
-        image=np.asarray(image, dtype=np.uint8).copy(),
+        contact_force_n=contact_force_n,
+        image=image_copy,
+        raw_image=(
+            None if raw_image is None else np.asarray(raw_image, dtype=np.uint8).copy()
+        ),
+        model_rgb=model_rgb_copy,
         tactile_images={
             name: value.copy() for name, value in tactile_images.items()
         },
+        # Reference images are immutable for the rollout. Sharing this pair
+        # avoids copying the same arrays on every policy boundary.
+        tactile_references=dict(tactile_references or {}),
         inference_info=dict(getattr(bundle, "last_inference_info", {})),
         elapsed_ns=clock_ns() - started,
+        camera_metadata=camera_metadata,
+        observation_metadata=dict(observation.metadata),
+    )
+
+
+def apply_hil_action(
+    result: _PolicyResult,
+    snapshot: HILInputSnapshot,
+    settings: HILSettings,
+    config: BundleDeployConfig,
+    allow_full_scale: bool,
+    desired_gripper_width: float,
+) -> _PolicyResult:
+    """Select a boundary-time human XYZ action while retaining policy gripper control."""
+
+    settings.validate()
+    if not settings.enabled:
+        raise ValueError("apply_hil_action requires enabled HIL settings")
+    base_action = np.asarray(result.raw_action, dtype=np.float32).reshape(-1)
+    if base_action.shape != (4,) or not np.all(np.isfinite(base_action)):
+        raise ValueError("HIL requires a finite four-dimensional base action")
+
+    human_action: np.ndarray | None = None
+    residual_target = np.zeros(3, dtype=np.float32)
+    selected_action = base_action.copy()
+    if snapshot.intervention:
+        human_xyz = human_normalized_xyz(
+            snapshot,
+            speed_m_s=settings.speed_m_s,
+            policy_frequency_hz=config.streaming.policy_frequency_hz,
+            action_scales=config.action_adapter.scales,
+        )
+        human_action = np.concatenate((human_xyz, base_action[3:4])).astype(np.float32)
+        residual_target = np.asarray(human_xyz - base_action[:3], dtype=np.float32)
+        selected_action = human_action.copy()
+
+    limited_action = clip_streaming_action(selected_action, config, allow_full_scale)
+    robot_action = streaming_robot_action(
+        limited_action,
+        config,
+        desired_gripper_width,
+    )
+    return replace(
+        result,
+        raw_action=selected_action,
+        executed_action=limited_action,
+        robot_action=robot_action,
+        hil_step=HILStepData(
+            intervention=snapshot.intervention,
+            base_action=base_action.copy(),
+            human_action=None if human_action is None else human_action.copy(),
+            residual_target_xyz=residual_target.copy(),
+            input_snapshot=snapshot,
+        ),
     )
 
 
@@ -781,16 +1171,28 @@ def _write_streaming_artifacts(
     config: BundleDeployConfig,
     initial_report: dict[str, Any],
     records: list[dict[str, Any]],
-    images: list[np.ndarray],
+    images: list[np.ndarray | None],
     control_trace: list[dict[str, Any]],
     timing: dict[str, Any],
     save_step_data: bool,
 ) -> dict[str, Any]:
+    artifact_started = time.perf_counter()
+    artifact_profile = {
+        "png_encoder": "opencv_lossless",
+        "model_rgb_png": bool(config.camera.save_rgb or save_step_data),
+        "tactile_rgb_png": bool(config.tactile_camera.save_rgb or save_step_data),
+        "step_data_npz": bool(save_step_data),
+        "raw_boundary_rgb_png": any(
+            record.get("_raw_image") is not None for record in records
+        ),
+    }
     (run_dir / "rgb").mkdir(exist_ok=True)
     if config.tactile_camera.enabled:
         (run_dir / "tactile_rgb").mkdir(exist_ok=True)
     if save_step_data:
         (run_dir / "step_data").mkdir(exist_ok=True)
+    if any(record.get("_raw_image") is not None for record in records):
+        (run_dir / "raw_rgb").mkdir(exist_ok=True)
     (run_dir / "config.json").write_text(
         json.dumps(config.to_dict(), indent=2), encoding="utf-8"
     )
@@ -798,19 +1200,59 @@ def _write_streaming_artifacts(
         json.dumps(initial_report, indent=2), encoding="utf-8"
     )
     for index, (record, image) in enumerate(zip(records, images)):
+        raw_image = record.pop("_raw_image", None)
+        raw_camera_frame = record.pop("_offline_boundary_camera_frame", None)
+        next_raw_image = record.pop("_offline_next_raw_image", None)
+        next_camera_frame = record.pop("_offline_next_camera_frame", None)
         tactile_images = record.pop("_tactile_images", {})
+        tactile_references = record.pop("_tactile_references", {})
+        model_rgb = record.pop("_model_rgb", None)
         rgb_relpath = f"rgb/step_{index:04d}.png"
         record["model_input"]["rgb_path"] = rgb_relpath
         if config.camera.save_rgb or save_step_data:
-            Image.fromarray(image).save(run_dir / rgb_relpath)
+            if image is None:
+                raise RuntimeError("RGB artifact was released before it could be written")
+            _save_rgb_png(run_dir / rgb_relpath, image)
+        if raw_image is not None:
+            raw_relpath = f"raw_rgb/boundary_{index:04d}.png"
+            _save_rgb_png(run_dir / raw_relpath, raw_image)
+            record["model_input"]["raw_rgb_path"] = raw_relpath
+            record["model_input"]["raw_rgb_shape"] = list(raw_image.shape)
+            record["model_input"]["offline_apriltag_boundary"] = {
+                "raw_rgb_path": raw_relpath,
+                "raw_rgb_shape": list(raw_image.shape),
+                "camera_frame": dict(raw_camera_frame or {}),
+            }
+        if next_raw_image is not None:
+            next_index = index + 1
+            next_relpath = f"raw_rgb/boundary_{next_index:04d}.png"
+            _save_rgb_png(run_dir / next_relpath, next_raw_image)
+            record["model_input"]["next_raw_rgb_path"] = next_relpath
+            record["model_input"]["next_raw_rgb_shape"] = list(next_raw_image.shape)
+            record["model_input"]["next_boundary_camera_frame"] = dict(
+                next_camera_frame or {}
+            )
         tactile_paths: dict[str, str] = {}
         for name, tactile_image in tactile_images.items():
             relpath = f"tactile_rgb/{name}_step_{index:04d}.png"
             tactile_paths[name] = relpath
             if config.tactile_camera.save_rgb or save_step_data:
-                Image.fromarray(tactile_image).save(run_dir / relpath)
+                _save_rgb_png(run_dir / relpath, tactile_image)
         record["model_input"]["tactile_rgb_paths"] = tactile_paths
+        reference_paths: dict[str, str] = {}
+        if tactile_references:
+            reference_dir = run_dir / "tactile_reference_rgb"
+            reference_dir.mkdir(exist_ok=True)
+            for name, tactile_reference in tactile_references.items():
+                relpath = f"tactile_reference_rgb/{name}.png"
+                reference_paths[name] = relpath
+                output = run_dir / relpath
+                if not output.exists() and (config.tactile_camera.save_rgb or save_step_data):
+                    _save_rgb_png(output, tactile_reference)
+        record["model_input"]["tactile_reference_rgb_paths"] = reference_paths
         if save_step_data:
+            if model_rgb is None:
+                raise RuntimeError("Step-data RGB was released before it could be written")
             data_relpath = f"step_data/step_{index:04d}.npz"
             step_payload = {
                 "action_history": np.asarray(
@@ -819,13 +1261,87 @@ def _write_streaming_artifacts(
                 "proprio_obs": np.asarray(
                     record["model_input"]["proprio_obs"], dtype=np.float32
                 ),
-                "wrist_rgb": image,
+                **{
+                    record["model_input"].get("rgb_input_name", "wrist_rgb"):
+                    np.asarray(model_rgb, dtype=np.uint8)
+                },
+                **(
+                    {
+                        "contact_force_n": np.asarray(
+                            record["model_input"]["contact_force_n"], dtype=np.float32
+                        )
+                    }
+                    if record["model_input"]["contact_force_n"] is not None
+                    else {}
+                ),
                 "raw_action": np.asarray(record["raw_action"], dtype=np.float32),
                 "executed_action": np.asarray(
                     record["limited_action"], dtype=np.float32
                 ),
                 **tactile_images,
+                **tactile_references,
             }
+            if "intervention" in record:
+                step_payload.update(
+                    {
+                        "episode_id": np.asarray(record["episode_id"]),
+                        "step_id": np.asarray(record["step_id"], dtype=np.int64),
+                        "intervention": np.asarray(
+                            record["intervention"], dtype=np.bool_
+                        ),
+                        "policy_action_accepted": np.asarray(
+                            record["info"]["policy_action_accepted"], dtype=np.bool_
+                        ),
+                        "base_action": np.asarray(
+                            record["base_action"], dtype=np.float32
+                        ),
+                        "residual_target_xyz": np.asarray(
+                            record["residual_target_xyz"], dtype=np.float32
+                        ),
+                    }
+                )
+                if record["human_action"] is not None:
+                    step_payload["human_action"] = np.asarray(
+                        record["human_action"], dtype=np.float32
+                    )
+            if "predicted_residual_xyz" in record:
+                step_payload.update(
+                    {
+                        "base_action": np.asarray(
+                            record["base_action"], dtype=np.float32
+                        ),
+                        "predicted_residual_xyz": np.asarray(
+                            record["predicted_residual_xyz"], dtype=np.float32
+                        ),
+                        "applied_residual_xyz": np.asarray(
+                            record["applied_residual_xyz"], dtype=np.float32
+                        ),
+                        "residual_scale": np.asarray(
+                            record["residual_scale"], dtype=np.float32
+                        ),
+                        "residual_max_abs": np.asarray(
+                            record["residual_max_abs"], dtype=np.float32
+                        ),
+                    }
+                )
+            if "sac_unit_action" in record:
+                real_rl_info = record["model_input"]["rma_actor_input"]["real_rl"]
+                step_payload.update(
+                    {
+                        "real_rl_state": np.asarray(real_rl_info["state"], dtype=np.float32),
+                        "base_action": np.asarray(record["base_action"], dtype=np.float32),
+                        "sac_unit_action": np.asarray(record["sac_unit_action"], dtype=np.float32),
+                        "residual_action_normalized": np.asarray(
+                            record["residual_action_normalized"], dtype=np.float32
+                        ),
+                        "residual_action_m": np.asarray(
+                            record["residual_action_m"], dtype=np.float32
+                        ),
+                        "policy_action_accepted": np.asarray(
+                            record["info"]["policy_action_accepted"], dtype=np.bool_
+                        ),
+                    }
+                )
             np.savez_compressed(run_dir / data_relpath, **step_payload)
             record["model_input"]["step_data_path"] = data_relpath
     with (run_dir / "rollout.jsonl").open("w", encoding="utf-8") as handle:
@@ -834,6 +1350,8 @@ def _write_streaming_artifacts(
     with (run_dir / "control_trace.jsonl").open("w", encoding="utf-8") as handle:
         for tick in control_trace:
             handle.write(json.dumps(tick) + "\n")
+    timing["artifact_profile"] = artifact_profile
+    timing["artifact_write_elapsed_s"] = time.perf_counter() - artifact_started
     (run_dir / "timing_summary.json").write_text(
         json.dumps(timing, indent=2), encoding="utf-8"
     )
@@ -846,6 +1364,7 @@ def _write_streaming_artifacts(
         "steps": records,
         "timing": timing,
         "save_step_data": save_step_data,
+        "artifact_profile": artifact_profile,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
@@ -858,10 +1377,18 @@ def run_streaming_bundle_deploy(
     save_step_data: bool = False,
     allow_full_scale: bool = False,
     streaming_check: bool = False,
+    hil_settings: HILSettings | None = None,
+    residual_settings: ResidualDeploySettings | None = None,
+    real_rl_settings: RealRLDeploySettings | None = None,
     *,
     clock_ns: Callable[[], int] = time.monotonic_ns,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
+    hil_enabled = bool(hil_settings is not None and hil_settings.enabled)
+    if hil_settings is not None:
+        hil_settings.validate()
+    if hil_enabled and streaming_check:
+        raise ValueError("--hil cannot be combined with --streaming-check")
     if streaming_check:
         config.control_mode = "streaming"
     if config.streaming.backend == "server9_joint_position":
@@ -874,12 +1401,27 @@ def run_streaming_bundle_deploy(
             save_step_data=save_step_data,
             allow_full_scale=allow_full_scale,
             streaming_check=streaming_check,
+            hil_settings=hil_settings,
+            residual_settings=residual_settings,
+            real_rl_settings=real_rl_settings,
             clock_ns=clock_ns,
             sleep=sleep,
         )
+    if hil_enabled:
+        raise ValueError(
+            "--hil currently requires streaming.backend='server9_joint_position'"
+        )
+    if residual_settings is not None:
+        raise ValueError(
+            "Residual BC currently requires streaming.backend='server9_joint_position'"
+        )
+    if real_rl_settings is not None:
+        raise ValueError(
+            "Real-RL currently requires streaming.backend='server9_joint_position'"
+        )
     run_dir = _make_run_dir(config)
     records: list[dict[str, Any]] = []
-    images: list[np.ndarray] = []
+    images: list[np.ndarray | None] = []
     control_trace: list[dict[str, Any]] = []
     timing: dict[str, Any] = {
         "policy_deadline_misses": 0,
@@ -906,6 +1448,7 @@ def run_streaming_bundle_deploy(
                 rma_oracle_cube_position_root=config.model.rma_oracle_cube_position_root,
             )
             _validate_bundle_action_dims(bundle, config)
+            reject_evaluation_only_motion(bundle, execute_motion)
             validate_streaming_contract(bundle, config)
 
         import pylibfranka
@@ -947,6 +1490,7 @@ def run_streaming_bundle_deploy(
             )
 
         history: ActionHistoryBuffer | None = None
+        rgb_history: WristRGBHistoryBuffer | None = None
         first_policy: _PolicyResult | None = None
         if not streaming_check:
             assert bundle is not None
@@ -957,12 +1501,21 @@ def run_streaming_bundle_deploy(
                 tactile_config=config.tactile_camera,
                 gelsight_input_shapes=getattr(bundle, "gelsight_input_shapes", {}),
             )
+            capture_gelsight_reference_frames(camera, bundle)
             history = ActionHistoryBuffer(
                 bundle.history_dim,
                 config.model.history_source,
                 config.model.history_scale,
                 config.model.history_delay_steps,
                 processed_action_scale=config.action_adapter.scales,
+            )
+            rgb_history = (
+                WristRGBHistoryBuffer(
+                    bundle.rgb_history_frames,
+                    (bundle.rgb_height, bundle.rgb_width, 3),
+                )
+                if getattr(bundle, "uses_wrist_rgb_history", False) is True
+                else None
             )
             # Camera warm-up is completed by construction. Exercise the exact
             # TorchScript path once before starting the active control connection.
@@ -973,16 +1526,38 @@ def run_streaming_bundle_deploy(
             warmup_args = (
                 np.zeros(bundle.history_dim, dtype=np.float32),
                 np.zeros(bundle.proprio_dim, dtype=np.float32),
-                np.zeros((bundle.rgb_height, bundle.rgb_width, 3), dtype=np.uint8),
+                np.zeros(
+                    getattr(
+                        bundle,
+                        "rgb_input_shape",
+                        (bundle.rgb_height, bundle.rgb_width, 3),
+                    ),
+                    dtype=np.uint8,
+                ),
+            )
+            warmup_contact_force = (
+                np.zeros(getattr(bundle, "contact_force_dim", 0), dtype=np.float32)
+                if getattr(bundle, "contact_force_dim", 0)
+                else None
             )
             if tactile_zeros:
                 bundle.predict(
                     *warmup_args,
                     tactile_zeros["gsmini_left_rgb"],
                     tactile_zeros["gsmini_right_rgb"],
+                    gsmini_left_reference_rgb=tactile_zeros.get(
+                        "gsmini_left_reference_rgb"
+                    ),
+                    gsmini_right_reference_rgb=tactile_zeros.get(
+                        "gsmini_right_reference_rgb"
+                    ),
+                    contact_force_n=warmup_contact_force,
                 )
             else:
-                bundle.predict(*warmup_args)
+                if warmup_contact_force is None:
+                    bundle.predict(*warmup_args)
+                else:
+                    bundle.predict(*warmup_args, contact_force_n=warmup_contact_force)
             first_policy = _run_policy_tick(
                 bundle,
                 camera,
@@ -992,6 +1567,7 @@ def run_streaming_bundle_deploy(
                 allow_full_scale,
                 float(gripper_queue.desired_width if gripper_queue else 0.0),
                 clock_ns,
+                rgb_history,
             )
 
         if not execute_motion:
@@ -1012,6 +1588,7 @@ def run_streaming_bundle_deploy(
                     allow_full_scale,
                     float(gripper_queue.desired_width if gripper_queue else 0.0),
                     clock_ns,
+                    rgb_history,
                 )
                 assert result is not None
                 timing["maximum_policy_elapsed_ms"] = max(
@@ -1026,10 +1603,9 @@ def run_streaming_bundle_deploy(
                     history.update(result.raw_action, result.executed_action)
                 else:
                     timing["policy_deadline_misses"] += 1
-                records.append(
-                    _policy_record(step_index, observation, result, timely, False)
-                )
-                images.append(result.image)
+                record = _policy_record(step_index, observation, result, timely, False)
+                records.append(record)
+                images.append(_retain_artifact_arrays(record, result, config, save_step_data))
             preview_elapsed_s = max(0.0, (clock_ns() - start_ns) / 1e9)
             timing["preview_only"] = True
             timing["policy_elapsed_s"] = preview_elapsed_s
@@ -1153,6 +1729,7 @@ def run_streaming_bundle_deploy(
                         allow_full_scale,
                         float(gripper_queue.desired_width if gripper_queue else 0.0),
                         clock_ns,
+                        rgb_history,
                     )
                 timing["maximum_policy_elapsed_ms"] = max(
                     timing["maximum_policy_elapsed_ms"], result.elapsed_ns / 1e6
@@ -1164,8 +1741,11 @@ def run_streaming_bundle_deploy(
                 ) if not is_preflight_result else True
                 if not timely:
                     timing["policy_deadline_misses"] += 1
-                    records.append(_policy_record(policy_step, observation, result, False, True))
-                    images.append(result.image)
+                    record = _policy_record(policy_step, observation, result, False, True)
+                    records.append(record)
+                    images.append(
+                        _retain_artifact_arrays(record, result, config, save_step_data)
+                    )
                 else:
                     proposed_target = latch_tcp_target(
                         state.O_T_EE,
@@ -1176,8 +1756,11 @@ def run_streaming_bundle_deploy(
                     history.update(result.raw_action, result.executed_action)
                     if gripper_queue is not None and result.robot_action.gripper_width is not None:
                         gripper_queue.command(result.robot_action.gripper_width)
-                    records.append(_policy_record(policy_step, observation, result, True, True))
-                    images.append(result.image)
+                    record = _policy_record(policy_step, observation, result, True, True)
+                    records.append(record)
+                    images.append(
+                        _retain_artifact_arrays(record, result, config, save_step_data)
+                    )
                     policy_accepted = True
 
             if streaming_check:
@@ -1287,7 +1870,7 @@ def run_streaming_bundle_deploy(
 
 
 def _validate_workspace_target(target_pose: np.ndarray, config: BundleDeployConfig) -> None:
-    position = target_pose[:3, 3]
+    position = physical_tool_tcp_translation(target_pose, config)
     minimum = np.asarray(config.workspace["minimum"], dtype=np.float64)
     maximum = np.asarray(config.workspace["maximum"], dtype=np.float64)
     if (
@@ -1296,7 +1879,7 @@ def _validate_workspace_target(target_pose: np.ndarray, config: BundleDeployConf
         or np.any(position > maximum)
     ):
         raise RuntimeError(
-            f"Latched TCP target {position.tolist()} is outside workspace "
+            f"Latched physical tool TCP target {position.tolist()} is outside workspace "
             f"[{minimum.tolist()}, {maximum.tolist()}]"
         )
 
@@ -1330,41 +1913,116 @@ def _policy_record(
     accepted: bool,
     motion_enabled: bool,
     *,
+    episode_id: str | None = None,
+    policy_action_accepted: bool | None = None,
     deadline_lateness_ns: int = 0,
     timing_ms: dict[str, float] | None = None,
 ) -> dict[str, Any]:
+    action_accepted = accepted if policy_action_accepted is None else policy_action_accepted
     record = {
         "step_index": step_index,
         "observation_before": observation.to_dict(),
         "model_input": {
             "action_history": result.action_history.tolist(),
             "proprio_obs": result.proprio.tolist(),
+            "contact_force_n": (
+                None if result.contact_force_n is None else result.contact_force_n.tolist()
+            ),
             "rgb_path": None,
             "rgb_shape": list(result.image.shape),
+            "rgb_input_name": "wrist_rgb_history" if result.model_rgb.ndim == 4 else "wrist_rgb",
+            "rgb_history_shape": list(result.model_rgb.shape) if result.model_rgb.ndim == 4 else None,
             "tactile_rgb_paths": {},
             "tactile_rgb_shapes": {
                 name: list(image.shape)
                 for name, image in result.tactile_images.items()
             },
+            "tactile_reference_rgb_shapes": {
+                name: list(image.shape)
+                for name, image in result.tactile_references.items()
+            },
             "step_data_path": None,
             "rma_actor_input": dict(result.inference_info),
+            "camera_frame": dict(result.camera_metadata),
         },
         "raw_action": result.raw_action.tolist(),
         "clipped_action": result.executed_action.tolist(),
         "limited_action": result.executed_action.tolist(),
-        "executed_action": result.executed_action.tolist() if accepted else None,
+        "executed_action": result.executed_action.tolist() if action_accepted else None,
         "robot_action": result.robot_action.to_dict(),
         "info": {
-            "motion_executed": bool(accepted and motion_enabled),
-            "policy_action_accepted": accepted,
+            "motion_executed": bool(action_accepted and motion_enabled),
+            "policy_action_accepted": action_accepted,
             "policy_deadline_miss": not accepted,
             "policy_elapsed_ms": result.elapsed_ns / 1e6,
             "policy_deadline_lateness_ms": max(0, deadline_lateness_ns) / 1e6,
             "timing_ms": dict(timing_ms or {}),
         },
         "observation": observation.to_dict(),
+        "_model_rgb": result.model_rgb,
         "observation_after": observation.to_dict(),
     }
+    if "real_rl" in result.inference_info and result.raw_image is not None:
+        record["_raw_image"] = result.raw_image
+        record["_offline_boundary_camera_frame"] = dict(result.camera_metadata)
     if result.tactile_images:
         record["_tactile_images"] = result.tactile_images
+    if result.tactile_references:
+        record["_tactile_references"] = result.tactile_references
+    if result.hil_step is not None:
+        if not episode_id:
+            raise ValueError("HIL policy records require a non-empty episode_id")
+        hil_step = result.hil_step
+        record.update(
+            {
+                "episode_id": episode_id,
+                "step_id": step_index,
+                "intervention": hil_step.intervention,
+                "base_action": hil_step.base_action.tolist(),
+                "human_action": (
+                    None
+                    if hil_step.human_action is None
+                    else hil_step.human_action.tolist()
+                ),
+                "residual_target_xyz": hil_step.residual_target_xyz.tolist(),
+                "hil_input": {
+                    "pressed_keys": list(hil_step.input_snapshot.pressed_keys),
+                    "direction_xyz": list(hil_step.input_snapshot.direction_xyz),
+                    "sampled_monotonic_ns": hil_step.input_snapshot.sampled_monotonic_ns,
+                    "focused": hil_step.input_snapshot.focused,
+                },
+            }
+        )
+    residual_info = result.inference_info.get("residual_bc")
+    if residual_info is not None:
+        record.update(
+            {
+                "base_action": list(residual_info["base_action"]),
+                "predicted_residual_xyz": list(
+                    residual_info["predicted_residual_xyz"]
+                ),
+                "applied_residual_xyz": list(
+                    residual_info["applied_residual_xyz"]
+                ),
+                "residual_scale": float(residual_info["scale"]),
+                "residual_max_abs": float(residual_info["max_abs"]),
+                "residual_model_sha256": str(residual_info["model_sha256"]),
+            }
+        )
+    real_rl_info = result.inference_info.get("real_rl")
+    if real_rl_info is not None:
+        record.update(
+            {
+                "base_action": list(real_rl_info["base_action"]),
+                "sac_unit_action": list(real_rl_info["sac_unit_action"]),
+                "residual_action_normalized": list(
+                    real_rl_info["residual_action_normalized"]
+                ),
+                "residual_action_m": list(real_rl_info["residual_action_m"]),
+                "real_rl_mode": str(real_rl_info["mode"]),
+                "real_rl_checkpoint_sha256": real_rl_info["checkpoint_sha256"],
+                "real_rl_fallback": bool(real_rl_info["fallback"]),
+                "real_rl_fallback_reason": real_rl_info["fallback_reason"],
+            }
+        )
     return record

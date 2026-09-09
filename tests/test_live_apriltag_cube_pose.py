@@ -115,6 +115,22 @@ class LiveAprilTagCubePoseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             live_pose._validate_color_control_args(True, 80.0, None)
 
+    def test_x040_wide_position_head_returns_root_xyz_without_contact(self) -> None:
+        predictor = live_pose.RMAPolicyCubePredictor(
+            REPO_ROOT / "checkpoint/0809_extend_xy_10000/rma_x040_wide_student_latest.pt",
+            REPO_ROOT / "checkpoint/0809_extend_xy_10000/rma_x040_wide_student_latest.json",
+            "cpu",
+        )
+
+        position, contact = predictor.predict(np.zeros((224, 224, 3), dtype=np.uint8))
+
+        self.assertEqual(predictor.policy_kind, "tacex_rma_x040_wide_direct_action_torchscript")
+        self.assertFalse(predictor.has_contact_prediction)
+        self.assertEqual(position.shape, (3,))
+        self.assertTrue(np.all(np.isfinite(position)))
+        self.assertEqual(contact.shape, (2,))
+        self.assertTrue(np.all(np.isnan(contact)))
+
 
 if __name__ == "__main__":
     unittest.main()

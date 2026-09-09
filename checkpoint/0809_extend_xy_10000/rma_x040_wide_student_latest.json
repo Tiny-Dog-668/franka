@@ -1,0 +1,98 @@
+{
+  "kind": "tacex_rma_x040_wide_direct_action_torchscript",
+  "version": 1,
+  "student_checkpoint": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment_rma_x040_wide_direct_action_student/2026-08-09_20-37-53_distillation/checkpoints/latest.pt",
+  "student_checkpoint_sha256": "72ba77e02982fc8197261b0123ffb0133f0f2ce61410f4bc649aa05c95294716",
+  "torchscript_sha256": "d7ab387c0b57e642a6bdc52137878ca32b6366884c59f16428bc74fd3d16a76c",
+  "teacher_checkpoint": "/home/tinydog/Projects/TacEx/logs/skrl/sim2real_cube_real_alignment_rma_x040_wide_teacher/2026-08-09_19-35-58_ppo_torch_rma_privileged_xyz_no_contact/checkpoints/best_agent.pt",
+  "teacher_checkpoint_sha256": "1773fbcc40b972001e21c698f16a43695eb0affbc58f08d470f67072d674954a",
+  "input_signature": {
+    "wrist_rgb": [
+      224,
+      224,
+      3
+    ],
+    "proprio_obs": [
+      15
+    ],
+    "action_history": [
+      4
+    ]
+  },
+  "input_order": [
+    "wrist_rgb",
+    "proprio_obs",
+    "action_history"
+  ],
+  "output_signature": {
+    "mean_actions": [
+      4
+    ]
+  },
+  "normalization": {
+    "joint_lower": [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
+    "joint_upper": [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
+    "joint_velocity_scale": [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61],
+    "gripper_width_center_scale": [0.04, 0.04],
+    "history_scale": [0.025, 0.025, 0.025, 0.005],
+    "cube_position_center": [0.4, 0.0, 0.026],
+    "cube_position_scale": [0.08, 0.1, 0.1],
+    "gripper_position_center": [0.5, 0.0, 0.175],
+    "gripper_position_scale": [0.1, 0.1, 0.15],
+    "target_position_center": [-0.1, 0.0, -0.149],
+    "target_position_scale": [0.18, 0.1, 0.15],
+    "position_frame": "robot_root"
+  },
+  "model_contract": {
+    "model_version": 1,
+    "input_order": ["wrist_rgb", "proprio_obs", "action_history"],
+    "input_signature": {
+      "wrist_rgb": [224, 224, 3],
+      "proprio_obs": [15],
+      "action_history": [4]
+    },
+    "output_signature": {"mean_actions": [4]},
+    "feature_dim": 531,
+    "feature_order": [
+      "resnet18_global_average_pool_visual[512]",
+      "normalized_proprio_obs[15]",
+      "normalized_action_history[4]"
+    ],
+    "runtime_privileged_inputs": [],
+    "training_only_label": "normalized_cube_position_root[3]",
+    "vision_encoder": "resnet18_layer4_global_average_pool",
+    "action_head": [531, 512, 256, 128, 64, 4],
+    "position_head": [512, 256, 128, 3],
+    "activation": "ELU_then_action_tanh",
+    "batch_norm": "all_resnet18_batch_norm_eval"
+  },
+  "environment_contract": {
+    "profile": "rma_x040_wide_xyz_no_contact_v1",
+    "action_dim": 4,
+    "action_scales": [0.05, 0.05, 0.05, 0.01],
+    "gripper_control_mode": "total_width_delta_cached_target",
+    "cube_nominal_position_root_m": [0.4, 0.0, 0.026],
+    "cube_reset_half_range_xy_m": [0.08, 0.1],
+    "cube_position_curriculum_enabled": false,
+    "cube_position_curriculum_force_full_range": true,
+    "tcp_table_clearance_min_z_m": 0.011,
+    "position_frame": "robot_root",
+    "teacher_actor_feature_dim": 28,
+    "teacher_contact_input": "none"
+  },
+  "runtime_privileged_inputs": [],
+  "training_privileged_inputs": {
+    "rma_cube_pos": [
+      3
+    ],
+    "purpose": "Teacher action and visual-position MSE labels only; never runtime input"
+  },
+  "position_head": "training-only auxiliary output; not in TorchScript signature",
+  "trace_max_abs_error": 0.0,
+  "reload_max_abs_error": 0.0,
+  "cuda_validation": {
+    "available": true,
+    "max_abs_error": 0.0007221698760986328
+  },
+  "cuda_validation_atol": 0.001
+}

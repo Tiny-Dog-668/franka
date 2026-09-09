@@ -14,7 +14,7 @@ from typing import Any
 
 
 MAGIC = 0x46524B4139535452
-ABI_VERSION = 8
+ABI_VERSION = 11
 # Keep enough 60 Hz diagnostics for the full 150-step RMA episode, including
 # temporary extra hold ticks while the Python policy loop catches up.
 TRACE_CAPACITY = 1024
@@ -26,6 +26,14 @@ CONTROL_LAW_SIM_ACTUATOR_VELOCITY = 1
 CONTROL_LAW_IDS = {
     "joint_position_pursuit": CONTROL_LAW_JOINT_POSITION_PURSUIT,
     "sim_actuator_velocity": CONTROL_LAW_SIM_ACTUATOR_VELOCITY,
+}
+
+IMPEDANCE_MODE_JOINT = 0
+IMPEDANCE_MODE_CARTESIAN = 1
+
+IMPEDANCE_MODE_IDS = {
+    "joint": IMPEDANCE_MODE_JOINT,
+    "cartesian": IMPEDANCE_MODE_CARTESIAN,
 }
 
 COMMAND_WAIT = 0
@@ -84,6 +92,8 @@ class SharedData(ctypes.Structure):
         ("target_pose", ctypes.c_double * 16),
         ("maximum_joint_velocities", ctypes.c_double * 7),
         ("joint_impedance", ctypes.c_double * 7),
+        ("cartesian_impedance", ctypes.c_double * 6),
+        ("impedance_mode", ctypes.c_uint64),
         ("maximum_joint_accelerations", ctypes.c_double * 7),
         ("maximum_joint_jerks", ctypes.c_double * 7),
         ("dls_lambda", ctypes.c_double),
@@ -93,6 +103,7 @@ class SharedData(ctypes.Structure):
         ("control_watchdog_s", ctypes.c_double),
         ("workspace_minimum", ctypes.c_double * 3),
         ("workspace_maximum", ctypes.c_double * 3),
+        ("tool_tcp_offset_ee", ctypes.c_double * 3),
         ("control_law", ctypes.c_uint64),
         ("reference_velocity_gain", ctypes.c_double),
         ("maximum_ik_reference_delta_rad", ctypes.c_double),
@@ -111,6 +122,10 @@ class SharedData(ctypes.Structure):
         ("q", ctypes.c_double * 7),
         ("dq", ctypes.c_double * 7),
         ("O_T_EE", ctypes.c_double * 16),
+        # The active flange-to-end-effector transform configured in the robot.
+        # O_T_EE already includes this transform, but exposing it lets a
+        # deployment verify that its physical tool TCP matches training.
+        ("F_T_EE", ctypes.c_double * 16),
         ("external_wrench", ctypes.c_double * 6),
         ("q_target", ctypes.c_double * 7),
         ("error_message", ctypes.c_char * 256),
@@ -127,14 +142,14 @@ class SharedData(ctypes.Structure):
 
 
 EXPECTED_LAYOUT = {
-    "shared_size": 443816,
+    "shared_size": 444024,
     "trace_size": 144,
     "fci_log_size": 288,
     "command_seq": 16,
-    "state_seq": 544,
-    "trace": 1224,
-    "fci_log": 148688,
-    "collision_behavior_enabled": 443600,
+    "state_seq": 624,
+    "trace": 1432,
+    "fci_log": 148896,
+    "collision_behavior_enabled": 443808,
 }
 
 
@@ -170,6 +185,7 @@ class WorkerSnapshot:
     q: tuple[float, ...]
     dq: tuple[float, ...]
     O_T_EE: tuple[float, ...]
+    F_T_EE: tuple[float, ...]
     external_wrench: tuple[float, ...]
     q_target: tuple[float, ...]
 
@@ -207,6 +223,16 @@ class Server9SharedMemory:
             self.shared.joint_impedance,
             ([math.nan] * 7 if joint_impedance is None else joint_impedance),
         )
+        cartesian_impedance = config.streaming.cartesian_impedance
+        self._copy_array(
+            self.shared.cartesian_impedance,
+            ([math.nan] * 6 if cartesian_impedance is None else cartesian_impedance),
+        )
+        impedance_mode = str(config.streaming.impedance_mode)
+        if impedance_mode not in IMPEDANCE_MODE_IDS:
+            valid = ", ".join(sorted(IMPEDANCE_MODE_IDS))
+            raise ValueError(f"streaming.impedance_mode must be one of: {valid}")
+        self.shared.impedance_mode = IMPEDANCE_MODE_IDS[impedance_mode]
         collision_behavior = config.streaming.collision_behavior
         if collision_behavior is not None:
             lower_torque = self._validated_thresholds(
@@ -253,6 +279,7 @@ class Server9SharedMemory:
         self.shared.control_watchdog_s = config.streaming.control_watchdog_s
         self._copy_array(self.shared.workspace_minimum, config.workspace["minimum"])
         self._copy_array(self.shared.workspace_maximum, config.workspace["maximum"])
+        self._copy_array(self.shared.tool_tcp_offset_ee, config.tool_tcp_offset_ee_m)
         control_law = str(config.streaming.control_law)
         if control_law not in CONTROL_LAW_IDS:
             valid = ", ".join(sorted(CONTROL_LAW_IDS))
@@ -358,6 +385,7 @@ class Server9SharedMemory:
                     q=tuple(copied.q),
                     dq=tuple(copied.dq),
                     O_T_EE=tuple(copied.O_T_EE),
+                    F_T_EE=tuple(copied.F_T_EE),
                     external_wrench=tuple(copied.external_wrench),
                     q_target=tuple(copied.q_target),
                 )
@@ -527,7 +555,14 @@ class Server9Worker:
             time.sleep(0.0005)
         raise RuntimeError(
             "server9 worker did not latch policy action "
-            f"{generation} (last latched {snapshot.latched_action_generation})"
+            f"{generation} within {timeout_s * 1e3:.1f} ms "
+            f"(last latched {snapshot.latched_action_generation}; "
+            f"worker_status={snapshot.status_name}; "
+            f"worker_error_code={snapshot.error_code}; "
+            f"worker_error_message={snapshot.error_message or '<none>'}; "
+            f"control_cycles={snapshot.control_cycle_count}; "
+            f"ik_ticks={snapshot.ik_tick_count}; "
+            f"latched_action_ticks={snapshot.latched_action_tick_count})"
         )
 
     def _read_stderr(self) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,11 +11,17 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 import franka_sim2real.e2e_bundle as e2e_bundle
+import franka_sim2real.streaming as streaming
 from franka_sim2real.e2e_bundle import (
     ActionHistoryBuffer,
+    BundleCameraConfig,
     BundleInitialStateConfig,
+    BundleTorchScriptPolicy,
+    build_rma_contact_force_input,
+    capture_gelsight_reference_frames,
     evaluate_initial_state,
     load_bundle_config,
+    validate_bundle_artifacts,
 )
 from franka_sim2real.types import RobotObservation
 
@@ -181,6 +188,21 @@ class InitialStateTests(unittest.TestCase):
         report = evaluate_initial_state(observation, config)
         self.assertFalse(report["checks"]["robot_errors"]["passed"])
 
+    def test_flange_to_tcp_offset_must_match_the_simulation_contract(self) -> None:
+        config = BundleInitialStateConfig(
+            enforce=True,
+            flange_to_tcp_translation_m=[0.0, 0.0, 0.1034],
+            flange_to_tcp_translation_tolerance_m=0.001,
+        )
+        observation = make_observation()
+        observation.metadata["flange_to_tcp_translation_m"] = [0.0, 0.0, 0.1034]
+        self.assertTrue(evaluate_initial_state(observation, config)["passed"])
+
+        observation.metadata["flange_to_tcp_translation_m"] = [0.0, 0.0, 0.0]
+        report = evaluate_initial_state(observation, config)
+        self.assertFalse(report["passed"])
+        self.assertIn("flange-to-TCP translation error", report["failures"][-1])
+
 
 class Exported0712ConfigTests(unittest.TestCase):
     def test_0712_config_uses_safe_scales_and_compatible_history(self) -> None:
@@ -238,6 +260,352 @@ class Exported0808GelSightConfigTests(unittest.TestCase):
         self.assertEqual(config.model.history_source, "processed_action")
         self.assertEqual(config.action_adapter.scales, [0.05, 0.05, 0.05, 0.01])
         self.assertIn("/checkpoint/0808/", config.model.model_path)
+
+
+class Exported0813GelSightReferenceConfigTests(unittest.TestCase):
+    def test_0813_config_and_artifact_expose_fixed_reference_inputs(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0813_gelsight.json"
+        )
+        config.model.device = "cpu"
+        report = validate_bundle_artifacts(config)
+
+        self.assertTrue(config.tactile_camera.enabled)
+        self.assertEqual(
+            report["input_signature"]["gsmini_left_reference_rgb"], [96, 128, 3]
+        )
+        self.assertEqual(
+            report["input_signature"]["gsmini_right_reference_rgb"], [96, 128, 3]
+        )
+        self.assertEqual(
+            report["streaming_contract"]["tactile_reference"],
+            "first_post_reset_frame_fixed_per_rollout",
+        )
+
+    def test_reference_capture_copies_one_fixed_tactile_pair(self) -> None:
+        bundle = type("Bundle", (), {
+            "has_gelsight_reference_inputs": True,
+            "gelsight_input_shapes": {
+                "gsmini_left_reference_rgb": (96, 128, 3),
+                "gsmini_right_reference_rgb": (96, 128, 3),
+            },
+        })()
+        left = np.full((96, 128, 3), 11, dtype=np.uint8)
+        right = np.full((96, 128, 3), 22, dtype=np.uint8)
+        camera = MagicMock()
+        camera.read_tactile.return_value = left, right
+
+        references = capture_gelsight_reference_frames(camera, bundle)
+        left[...] = 0
+        right[...] = 0
+
+        camera.read_tactile.assert_called_once_with()
+        self.assertEqual(int(references["gsmini_left_reference_rgb"][0, 0, 0]), 11)
+        self.assertEqual(int(references["gsmini_right_reference_rgb"][0, 0, 0]), 22)
+        self.assertIs(bundle._deployment_tactile_references, references)
+
+    def test_streaming_tick_reuses_the_captured_reference_pair(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0813_gelsight.json"
+        )
+        config.model.device = "cpu"
+        bundle = BundleTorchScriptPolicy(
+            config.model.model_path, config.model.metadata_path, device="cpu"
+        )
+        history = ActionHistoryBuffer(
+            4, "processed_action", [1.0] * 4, 1, config.action_adapter.scales
+        )
+
+        class StaticCamera:
+            def __init__(self) -> None:
+                self.left = np.full((96, 128, 3), 17, dtype=np.uint8)
+                self.right = np.full((96, 128, 3), 23, dtype=np.uint8)
+
+            def read(self) -> np.ndarray:
+                return np.zeros((224, 224, 3), dtype=np.uint8)
+
+            def read_tactile(self) -> tuple[np.ndarray, np.ndarray]:
+                return self.left.copy(), self.right.copy()
+
+        camera = StaticCamera()
+        capture_gelsight_reference_frames(camera, bundle)
+        camera.left[...] = 51
+        camera.right[...] = 63
+        result = streaming._run_policy_tick(
+            bundle, camera, history, make_observation(), config, False, 0.04,
+            time.monotonic_ns,
+        )
+
+        self.assertEqual(int(result.tactile_images["gsmini_left_rgb"][0, 0, 0]), 51)
+        self.assertEqual(
+            int(result.tactile_references["gsmini_left_reference_rgb"][0, 0, 0]), 17
+        )
+        self.assertEqual(
+            int(result.tactile_references["gsmini_right_reference_rgb"][0, 0, 0]), 23
+        )
+
+
+class Exported0814GelSightReferenceConfigTests(unittest.TestCase):
+    def test_0814_v2_config_records_but_does_not_cap_the_training_horizon(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0814_gelsight.json"
+        )
+        config.model.device = "cpu"
+
+        self.assertEqual(config.runner.steps, 150)
+        self.assertEqual(config.tool_tcp_offset_ee_m, [0.0, 0.0, 0.027408])
+        self.assertEqual(config.workspace["minimum"][2], 0.01)
+        self.assertEqual(
+            config.initial_state.flange_to_tcp_translation_m, [0.0, 0.0, 0.1034]
+        )
+        # The 150-step training horizon remains provenance, not a deployment
+        # stop condition for a continuing real-robot policy stream.
+        config.runner.steps = 1000
+        report = validate_bundle_artifacts(config)
+        self.assertEqual(
+            report["streaming_contract"]["max_episode_length_steps"], 150
+        )
+
+
+class Exported0823GelSightThreeFrameConfigTests(unittest.TestCase):
+    def test_0823_config_matches_corrected_geometry_and_runtime_contract(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0823_gelsight.json"
+        )
+        self.assertEqual(config.tool_tcp_offset_ee_m, [0.0, 0.0, 0.0579])
+        self.assertEqual(config.workspace["minimum"][2], 0.01)
+        self.assertEqual(config.runner.steps, 150)
+        self.assertEqual(config.runner.log_dir, "real_policy_logs")
+        self.assertFalse(config.camera.save_rgb)
+        self.assertFalse(config.tactile_camera.save_rgb)
+        self.assertEqual(config.model.history_source, "processed_action")
+        self.assertEqual(config.model.history_scale, [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(config.model.history_delay_steps, 1)
+        self.assertEqual(config.action_adapter.scales, [0.05, 0.05, 0.05, 0.01])
+        self.assertIn("/checkpoint/0823/", config.model.model_path)
+
+    def test_0823_artifact_validates_with_three_frame_and_reference_inputs(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0823_gelsight.json"
+        )
+        config.model.device = "cpu"
+        report = validate_bundle_artifacts(config)
+
+        self.assertEqual(report["rgb_history"], {
+            "frames": 3,
+            "order": "oldest_to_newest",
+        })
+        self.assertEqual(
+            report["input_signature"]["gsmini_left_reference_rgb"],
+            [96, 128, 3],
+        )
+        self.assertEqual(
+            report["streaming_contract"][
+                "rma_gelsight_x040_three_frame_student_metadata_version"
+            ],
+            1,
+        )
+
+    def test_three_frame_policy_rejects_the_old_short_workspace_offset(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0823_gelsight.json"
+        )
+        config.model.device = "cpu"
+        config.tool_tcp_offset_ee_m = [0.0, 0.0, 0.027408]
+        with self.assertRaisesRegex(ValueError, "corrected 161.3 mm"):
+            validate_bundle_artifacts(config)
+
+
+class Exported0809XYConfigTests(unittest.TestCase):
+    def test_0809_config_declares_gripper_contact_approximation(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0809_xy_only.json"
+        )
+        self.assertEqual(config.model.rma_contact_force_source, "gripper_is_grasped")
+        self.assertEqual(config.model.history_source, "processed_action")
+        self.assertEqual(config.action_adapter.scales, [0.05, 0.05, 0.05, 0.01])
+        self.assertIn("/checkpoint/0809_xy_only/", config.model.model_path)
+
+    def test_gripper_contact_approximation_maps_only_the_binary_actor_feature(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0809_xy_only.json"
+        )
+        bundle = BundleTorchScriptPolicy(
+            config.model.model_path,
+            config.model.metadata_path,
+            device="cpu",
+        )
+        open_observation = make_observation()
+        closed_observation = make_observation()
+        closed_observation.gripper_is_grasped = True
+        np.testing.assert_array_equal(
+            build_rma_contact_force_input(open_observation, bundle, config),
+            np.asarray([0.0, 0.0], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            build_rma_contact_force_input(closed_observation, bundle, config),
+            np.asarray([1.0, 1.0], dtype=np.float32),
+        )
+
+    def test_0809_model_contract_validates_on_cpu(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0809_xy_only.json"
+        )
+        config.model.device = "cpu"
+        report = validate_bundle_artifacts(config)
+        self.assertEqual(report["input_signature"]["contact_force_n"], [2])
+        self.assertEqual(report["rma_contact_force_source"], "gripper_is_grasped")
+
+    def test_0809_streaming_policy_tick_passes_contact_by_keyword(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0809_xy_only.json"
+        )
+        config.model.device = "cpu"
+        bundle = BundleTorchScriptPolicy(
+            config.model.model_path,
+            config.model.metadata_path,
+            device="cpu",
+        )
+        history = ActionHistoryBuffer(
+            history_dim=4,
+            source="processed_action",
+            scale=[1.0] * 4,
+            delay_steps=1,
+            processed_action_scale=config.action_adapter.scales,
+        )
+
+        class StaticCamera:
+            def read(self) -> np.ndarray:
+                return np.zeros((224, 224, 3), dtype=np.uint8)
+
+        result = streaming._run_policy_tick(
+            bundle,
+            StaticCamera(),
+            history,
+            make_observation(),
+            config,
+            allow_full_scale=False,
+            desired_gripper_width=0.04,
+            clock_ns=time.monotonic_ns,
+        )
+        np.testing.assert_array_equal(
+            result.contact_force_n,
+            np.asarray([0.0, 0.0], dtype=np.float32),
+        )
+
+
+class Exported0809DirectActionConfigTests(unittest.TestCase):
+    def test_0809_direct_action_config_has_no_contact_force_approximation(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0809_direct_action.json"
+        )
+        self.assertEqual(config.model.device, "cuda:0")
+        self.assertEqual(config.model.history_source, "processed_action")
+        self.assertEqual(config.action_adapter.scales, [0.05, 0.05, 0.05, 0.01])
+        self.assertIn("/checkpoint/0809_direct_action/", config.model.model_path)
+
+    def test_0809_direct_action_model_contract_validates_on_cpu(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0809_direct_action.json"
+        )
+        config.model.device = "cpu"
+        report = validate_bundle_artifacts(config)
+        self.assertNotIn("contact_force_n", report["input_signature"])
+        self.assertIsNone(report["rma_contact_force_source"])
+        self.assertEqual(
+            report["streaming_contract"]["rma_direct_action_student_metadata_version"], 1
+        )
+
+    def test_0809_direct_action_streaming_policy_tick_omits_contact_input(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0809_direct_action.json"
+        )
+        bundle = BundleTorchScriptPolicy(
+            config.model.model_path,
+            config.model.metadata_path,
+            device="cpu",
+        )
+        history = ActionHistoryBuffer(
+            history_dim=4,
+            source="processed_action",
+            scale=[1.0] * 4,
+            delay_steps=1,
+            processed_action_scale=config.action_adapter.scales,
+        )
+
+        class StaticCamera:
+            def read(self) -> np.ndarray:
+                return np.zeros((224, 224, 3), dtype=np.uint8)
+
+        result = streaming._run_policy_tick(
+            bundle,
+            StaticCamera(),
+            history,
+            make_observation(),
+            config,
+            allow_full_scale=False,
+            desired_gripper_width=0.04,
+            clock_ns=time.monotonic_ns,
+        )
+        self.assertIsNone(result.contact_force_n)
+        self.assertEqual(result.raw_action.shape, (4,))
+        self.assertTrue(np.isfinite(result.raw_action).all())
+
+
+class Exported0809X040WideDirectActionConfigTests(unittest.TestCase):
+    def test_0809_x040_wide_direct_action_model_contract_validates_on_cpu(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0809_x040_wide_direct_action.json"
+        )
+        config.model.device = "cpu"
+        report = validate_bundle_artifacts(config)
+        self.assertNotIn("contact_force_n", report["input_signature"])
+        self.assertIsNone(report["rma_contact_force_source"])
+        self.assertEqual(
+            report["streaming_contract"][
+                "rma_x040_wide_direct_action_student_metadata_version"
+            ],
+            1,
+        )
+
+
+class RealSenseColorControlTests(unittest.TestCase):
+    def test_make_camera_forwards_configured_color_controls(self) -> None:
+        config = BundleCameraConfig(
+            auto_exposure=False,
+            exposure=100.0,
+            gain=64.0,
+        )
+        fake_color_camera = MagicMock()
+        fake_color_camera.get_color_controls.return_value = {
+            "auto_exposure": False,
+            "exposure": 100.0,
+            "gain": 64.0,
+        }
+
+        with (
+            patch.object(
+                e2e_bundle,
+                "RealSenseRGBCamera",
+                return_value=fake_color_camera,
+            ) as camera_class,
+            patch.object(
+                e2e_bundle,
+                "LatestFrameCamera",
+                side_effect=lambda camera: camera,
+            ),
+        ):
+            camera = e2e_bundle._make_camera(config, 224, 224)
+
+        self.assertIs(camera, fake_color_camera)
+        camera_class.assert_called_once_with(
+            config,
+            output_width=224,
+            output_height=224,
+            auto_exposure=False,
+            exposure=100.0,
+            gain=64.0,
+        )
 
 
 class InitialStateRolloutGateTests(unittest.TestCase):

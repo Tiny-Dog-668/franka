@@ -1,0 +1,59 @@
+{
+  "schema_version": 2,
+  "base_policy_config": "configs/e2e_bundle_real_exported_0814_gelsight.json",
+  "checkpoint_dir": "checkpoints/real_residual_sac",
+  "log_dir": "real_rl_logs",
+  "seed": 17,
+  "replay": {
+    "path": "real_rl_logs/replay.sqlite3",
+    "writer_queue_size": 256
+  },
+  "apriltag": {
+    "calibration_report": "runs_old/20260802_204111_eye_to_hand/reports/20260802_205349/calibration_report.json",
+    "family": "tag36h11",
+    "marker_id": 2,
+    "marker_length_m": 0.04,
+    "tag_to_object_m": [0.0, 0.0, 0.0],
+    "height_offset_m": 0.0,
+    "detection_scale": 3.0,
+    "max_reprojection_px": 0.8,
+    "max_pose_age_s": 0.5,
+    "smoothing_window": 1,
+    "preflight_valid_detections": 15,
+    "preflight_timeout_s": 30.0,
+    "offline_roi_expansion": 3.0
+  },
+  "reward": {
+    "k_reach": 10.0,
+    "k_lift": 20.0,
+    "k_success": 10.0,
+    "k_action": 0.01,
+    "success_height_m": 0.015,
+    "success_consecutive_detections": 3
+  },
+  "residual": {
+    "max_residual_m": 0.002,
+    "action_scale_m": 0.05,
+    "warmup_std_m": 0.0005,
+    "warmup_cap_m": 0.001,
+    "warmup_correlation": 0.9
+  },
+  "sac": {
+    "hidden_dims": [256, 256],
+    "gamma": 0.99,
+    "tau": 0.005,
+    "actor_lr": 0.0003,
+    "critic_lr": 0.0003,
+    "alpha_lr": 0.0003,
+    "batch_size": 256,
+    "success_samples_per_batch": 1,
+    "target_entropy": -3.0,
+    "initial_log_std": -3.0,
+    "minimum_trainable_replay": 1000,
+    "normalizer_samples": 1000,
+    "normalizer_clip": 10.0,
+    "utd_ratio": 2.0,
+    "bootstrap_updates": 1000,
+    "snapshot_interval_updates": 5000
+  }
+}
