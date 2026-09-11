@@ -27,6 +27,7 @@ from .residual_runtime import ResidualDeploySettings, ResidualPolicyRuntime
 from .real_rl.runtime import RealRLDeploySettings, RealRLPolicyRuntime
 from .safety import apply_safety_limits
 from .types import RobotAction, RobotObservation, print_error_wrench_report
+from real_rlpd.runtime import RLPDDeploySettings, RLPDPolicyRuntime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUNDLE_DIR = REPO_ROOT / "deploy_bundle_e2e"
@@ -1281,6 +1282,7 @@ class BundleTorchScriptPolicy:
         rma_oracle_cube_position_root: list[float] | None = None,
         residual_settings: ResidualDeploySettings | None = None,
         real_rl_settings: RealRLDeploySettings | None = None,
+        rlpd_settings: RLPDDeploySettings | None = None,
     ) -> None:
         if torch_num_threads is not None:
             if isinstance(torch_num_threads, bool) or not isinstance(torch_num_threads, int):
@@ -1393,6 +1395,10 @@ class BundleTorchScriptPolicy:
         self.is_tacex_rma_gelsight_size_buckets_student = (
             self.kind == "tacex_rma_gelsight_size_buckets_student_torchscript"
         )
+        self.is_tacex_rma_gelsight_size_buckets_progress_student = (
+            self.kind
+            == "tacex_rma_gelsight_size_buckets_progress_student_torchscript"
+        )
         self.is_tacex_rma_gelsight_x040_three_frame_student = (
             self.kind == "tacex_rma_gelsight_x040_dr_three_frame_student_torchscript"
         )
@@ -1467,6 +1473,7 @@ class BundleTorchScriptPolicy:
             )
         if (
             self.is_tacex_rma_gelsight_size_buckets_student
+            or self.is_tacex_rma_gelsight_size_buckets_progress_student
             or self.is_tacex_rma_gelsight_x040_three_frame_student
         ):
             expected_reference_order = [
@@ -1496,8 +1503,13 @@ class BundleTorchScriptPolicy:
                 )
         self.residual_runtime: ResidualPolicyRuntime | None = None
         self.real_rl_runtime: RealRLPolicyRuntime | None = None
+        self.rlpd_runtime: RLPDPolicyRuntime | None = None
         if residual_settings is not None and real_rl_settings is not None:
             raise ValueError("Residual BC and Real-RL are mutually exclusive")
+        if rlpd_settings is not None and (
+            residual_settings is not None or real_rl_settings is not None
+        ):
+            raise ValueError("RLPD, Residual BC, and legacy Real-RL are mutually exclusive")
         if residual_settings is not None:
             if override_enabled:
                 raise ValueError("Residual BC cannot be combined with RMA input overrides")
@@ -1522,6 +1534,16 @@ class BundleTorchScriptPolicy:
                 real_rl_settings,
                 base_model_path=self.model_path,
                 base_kind=self.kind,
+                device=self.device,
+            )
+        if rlpd_settings is not None:
+            if override_enabled:
+                raise ValueError("RLPD cannot be combined with RMA input overrides")
+            self.rlpd_runtime = RLPDPolicyRuntime(
+                rlpd_settings,
+                model=self.model,
+                metadata=self.metadata,
+                model_path=self.model_path,
                 device=self.device,
             )
 
@@ -1792,7 +1814,10 @@ class BundleTorchScriptPolicy:
                     )
                 elif (
                     collect_rma_debug
-                    and self.is_tacex_rma_gelsight_size_buckets_student
+                    and (
+                        self.is_tacex_rma_gelsight_size_buckets_student
+                        or self.is_tacex_rma_gelsight_size_buckets_progress_student
+                    )
                     and hasattr(self.model, "forward_with_auxiliary")
                 ):
                     assert rgb_tensor is not None
@@ -1903,6 +1928,15 @@ class BundleTorchScriptPolicy:
                     .tolist(),
                 }
             output = action
+        if self.rlpd_runtime is not None:
+            assert rgb_tensor is not None
+            self.rlpd_runtime.prepare(
+                rgb_tensor,
+                proprio_tensor,
+                action_tensor,
+                tactile_tensors,
+                output,
+            )
         if self.residual_runtime is not None:
             assert rgb_tensor is not None
             output = self._apply_residual_bc(
@@ -1923,6 +1957,13 @@ class BundleTorchScriptPolicy:
             )
         output = output.detach().cpu().numpy().reshape(-1)
         return output
+
+    def apply_rlpd_post_limit(self, base_limited: np.ndarray) -> np.ndarray:
+        if self.rlpd_runtime is None:
+            return np.asarray(base_limited, dtype=np.float32)
+        candidate, info = self.rlpd_runtime.apply_post_limit(base_limited)
+        self.last_inference_info["rlpd"] = info
+        return candidate
 
 
 def build_bundle_inputs(
@@ -2037,6 +2078,10 @@ def _validate_bundle_action_dims(bundle: BundleTorchScriptPolicy, config: Bundle
             _validate_tacex_rma_gelsight_x040_three_frame_student_contract(
                 bundle, config, history_buffer.scale
             )
+        elif bundle.is_tacex_rma_gelsight_size_buckets_progress_student:
+            _validate_tacex_rma_gelsight_size_buckets_progress_student_contract(
+                bundle, config, history_buffer.scale
+            )
         elif bundle.is_tacex_rma_gelsight_size_buckets_student:
             _validate_tacex_rma_gelsight_size_buckets_student_contract(
                 bundle, config, history_buffer.scale
@@ -2062,9 +2107,11 @@ def _validate_bundle_action_dims(bundle: BundleTorchScriptPolicy, config: Bundle
 
 
 def reject_evaluation_only_motion(
-    bundle: BundleTorchScriptPolicy, execute_motion: bool
+    bundle: BundleTorchScriptPolicy,
+    execute_motion: bool,
+    rlpd_settings: RLPDDeploySettings | None = None,
 ) -> None:
-    """Do not treat a TacEx evaluation-only export as a real-robot policy."""
+    """Reject exports whose recorded behavior is not approved for direct motion."""
 
     if (
         execute_motion
@@ -2075,6 +2122,21 @@ def reject_evaluation_only_motion(
             "This TorchScript export is marked legacy_appearance_evaluation_only by TacEx; "
             "it may be used with --validate-only or --preview-only, but cannot command "
             "the real robot. Re-export a deployment-approved checkpoint first."
+        )
+    if (
+        execute_motion
+        and getattr(
+            bundle,
+            "is_tacex_rma_gelsight_size_buckets_progress_student",
+            False,
+        ) is True
+        and rlpd_settings is None
+    ):
+        raise ValueError(
+            "The 0911 Progress Student is marked motion_authorization='rlpd_only' "
+            "because its offline behavior audit rejected direct motion. It may be used "
+            "with --validate-only/--preview-only, RLPD expert takeover, or a validated "
+            "RLPD checkpoint; direct base-policy motion is disabled."
         )
 
 
@@ -2398,6 +2460,121 @@ def _validate_tacex_rma_gelsight_size_buckets_student_contract(
     _validate_tacex_rma_x040_wide_real_runtime(
         config, history_scale_vector, policy_name
     )
+
+
+def _validate_tacex_rma_gelsight_size_buckets_progress_student_contract(
+    bundle: BundleTorchScriptPolicy,
+    config: BundleDeployConfig,
+    history_scale_vector: np.ndarray,
+) -> None:
+    """Validate the isolated 0911 terminal-success Progress Student profile."""
+
+    policy_name = "TacEx GelSight Size-Buckets Progress Student"
+    _validate_tacex_rma_gelsight_size_buckets_student_contract(
+        bundle, config, history_scale_vector
+    )
+    metadata = bundle.metadata
+    expected_task = (
+        "TacEx-Sim2Real-Cube-Real-Alignment-RMA-GelSight-Size-Buckets-"
+        "Progress-Student-DR-v0"
+    )
+    if metadata.get("task") != expected_task:
+        raise ValueError(f"{policy_name} task provenance is inconsistent")
+    if metadata.get("behavior_profile") != "gelsight_size_buckets_progress_rlpd_base_v1":
+        raise ValueError(f"{policy_name} behavior profile is inconsistent")
+    if metadata.get("motion_authorization") != "rlpd_only":
+        raise ValueError(f"{policy_name} must remain restricted to RLPD motion")
+
+    source = metadata.get("source_export")
+    if not isinstance(source, dict) or source != {
+        "kind": "tacex_rma_gelsight_size_buckets_student_torchscript",
+        "version": 2,
+        "metadata_filename": "gelsight_reference_student_student_100000.json",
+        "metadata_sha256": "71ea77b146f6ec9b5e4ed05c8298ad49eccf6cf11413820d62dfe5afb744e564",
+    }:
+        raise ValueError(f"{policy_name} source export provenance is inconsistent")
+    source_metadata_path = bundle.metadata_path.with_name(source["metadata_filename"])
+    if (
+        not source_metadata_path.is_file()
+        or _sha256_file(source_metadata_path) != source["metadata_sha256"]
+    ):
+        raise ValueError(f"{policy_name} source metadata file/hash is inconsistent")
+
+    progress = metadata.get("progress_training_contract")
+    expected_progress = {
+        "reward": "signed_reach_lift_contact_progress",
+        "success": "once_on_confirmed_terminal_success",
+        "success_lift_delta_m": 0.035,
+        "success_hold_steps": 5,
+        "action_magnitude_penalty_weight": 0.05,
+        "excess_contact_force_threshold_n": 15.0,
+        "excess_contact_force_quadratic_weight": 5.0,
+    }
+    if progress != expected_progress:
+        raise ValueError(f"{policy_name} progress reward/success contract is inconsistent")
+    deployment = metadata.get("deployment_contract")
+    if (
+        not isinstance(deployment, dict)
+        or deployment.get("success_stop")
+        != "external_apriltag_or_operator_required"
+        or config.runner.steps > int(deployment.get("max_episode_length_steps", 0))
+    ):
+        raise ValueError(
+            f"{policy_name} requires an external/operator success stop and at most "
+            "150 policy steps"
+        )
+
+    geometry = metadata.get("gelsight_geometry")
+    if not isinstance(geometry, dict) or geometry != {
+        "version": 3,
+        "center_offset_hand_m": [0.0, 0.0, 0.1392],
+        "lowest_point_offset_hand_m": [0.0, 0.0, 0.1563],
+        "flange_to_ee_translation_m": [0.0, 0.0, 0.1034],
+        "tool_tcp_offset_ee_m": [0.0, 0.0, 0.0529],
+    }:
+        raise ValueError(f"{policy_name} GelSight geometry contract is inconsistent")
+    if not np.allclose(
+        np.asarray(config.tool_tcp_offset_ee_m, dtype=np.float64),
+        [0.0, 0.0, 0.0529],
+        rtol=0.0,
+        atol=1.0e-9,
+    ):
+        raise ValueError(
+            f"{policy_name} requires tool_tcp_offset_ee_m=[0, 0, 0.0529] "
+            "for the GelSight v7 lowest-point workspace check"
+        )
+    audit = metadata.get("behavioral_validation")
+    if (
+        not isinstance(audit, dict)
+        or audit.get("status") != "direct_motion_rejected"
+        or audit.get("approved_runtime") != "rlpd_residual_only"
+    ):
+        raise ValueError(f"{policy_name} behavior audit restriction is missing")
+    cuda_details = metadata.get("cuda_validation_details")
+    cuda_error = (
+        cuda_details.get("cpu_cuda_max_abs_error")
+        if isinstance(cuda_details, dict)
+        else None
+    )
+    cuda_tolerance = (
+        cuda_details.get("tolerance") if isinstance(cuda_details, dict) else None
+    )
+    if (
+        not isinstance(cuda_details, dict)
+        or cuda_details.get("device") != "cuda:0"
+        or not isinstance(cuda_details.get("synthetic_cases"), int)
+        or cuda_details["synthetic_cases"] < 1
+        or isinstance(cuda_error, bool)
+        or not isinstance(cuda_error, (int, float))
+        or not math.isfinite(float(cuda_error))
+        or float(cuda_error) < 0.0
+        or isinstance(cuda_tolerance, bool)
+        or not isinstance(cuda_tolerance, (int, float))
+        or not math.isfinite(float(cuda_tolerance))
+        or float(cuda_tolerance) <= 0.0
+        or float(cuda_error) > float(cuda_tolerance)
+    ):
+        raise ValueError(f"{policy_name} CUDA validation details are inconsistent")
 
 
 def _validate_tacex_rma_gelsight_x040_three_frame_student_contract(
@@ -3054,6 +3231,7 @@ def validate_bundle_artifacts(
     config: BundleDeployConfig,
     residual_settings: ResidualDeploySettings | None = None,
     real_rl_settings: RealRLDeploySettings | None = None,
+    rlpd_settings: RLPDDeploySettings | None = None,
 ) -> dict[str, Any]:
     """Validate and exercise a bundle without connecting to robot or camera hardware."""
     bundle = BundleTorchScriptPolicy(
@@ -3067,6 +3245,7 @@ def validate_bundle_artifacts(
         rma_oracle_cube_position_root=config.model.rma_oracle_cube_position_root,
         residual_settings=residual_settings,
         real_rl_settings=real_rl_settings,
+        rlpd_settings=rlpd_settings,
     )
     _validate_bundle_action_dims(bundle, config)
     streaming_report: dict[str, Any] | None = None
@@ -3143,6 +3322,7 @@ def validate_bundle_artifacts(
             if bundle.real_rl_runtime is None
             else bundle.real_rl_runtime.report()
         ),
+        "rlpd": None if bundle.rlpd_runtime is None else bundle.rlpd_runtime.report(),
     }
 
 
@@ -3365,6 +3545,8 @@ def run_bundle_deploy(
     hil_settings: HILSettings | None = None,
     residual_settings: ResidualDeploySettings | None = None,
     real_rl_settings: RealRLDeploySettings | None = None,
+    rlpd_settings: RLPDDeploySettings | None = None,
+    rlpd_expert: bool = False,
 ) -> dict[str, Any]:
     hil_enabled = bool(hil_settings is not None and hil_settings.enabled)
     if hil_settings is not None:
@@ -3382,6 +3564,8 @@ def run_bundle_deploy(
             hil_settings=hil_settings,
             residual_settings=residual_settings,
             real_rl_settings=real_rl_settings,
+            rlpd_settings=rlpd_settings,
+            rlpd_expert=rlpd_expert,
         )
 
     if config.control_mode != "blocking":
@@ -3394,6 +3578,8 @@ def run_bundle_deploy(
         raise ValueError("Residual BC is only valid with server9 streaming control")
     if real_rl_settings is not None:
         raise ValueError("Real-RL is only valid with server9 streaming control")
+    if rlpd_settings is not None or rlpd_expert:
+        raise ValueError("RLPD is only valid with server9 streaming control")
     run_dir = _make_run_dir(config)
     (run_dir / "rgb").mkdir(exist_ok=True)
     if config.tactile_camera.enabled:

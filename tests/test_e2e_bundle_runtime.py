@@ -21,6 +21,7 @@ from franka_sim2real.e2e_bundle import (
     capture_gelsight_reference_frames,
     evaluate_initial_state,
     load_bundle_config,
+    reject_evaluation_only_motion,
     validate_bundle_artifacts,
 )
 from franka_sim2real.types import RobotObservation
@@ -414,6 +415,56 @@ class Exported0823GelSightThreeFrameConfigTests(unittest.TestCase):
         config.tool_tcp_offset_ee_m = [0.0, 0.0, 0.027408]
         with self.assertRaisesRegex(ValueError, "corrected 161.3 mm"):
             validate_bundle_artifacts(config)
+
+
+class Exported0911GelSightProgressConfigTests(unittest.TestCase):
+    def test_0911_uses_an_isolated_progress_profile_and_v7_geometry(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0911_gelsight_progress.json"
+        )
+        config.model.device = "cpu"
+        report = validate_bundle_artifacts(config)
+
+        self.assertEqual(config.tool_tcp_offset_ee_m, [0.0, 0.0, 0.0529])
+        self.assertEqual(config.workspace["minimum"][2], 0.01)
+        self.assertEqual(config.runner.steps, 150)
+        self.assertIn("/checkpoint/0911/", config.model.model_path)
+        self.assertEqual(
+            report["streaming_contract"]["behavior_profile"],
+            "gelsight_size_buckets_progress_rlpd_base_v1",
+        )
+        self.assertEqual(
+            report["streaming_contract"]["motion_authorization"], "rlpd_only"
+        )
+
+    def test_0911_rejects_a_geometry_offset_from_an_older_policy(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0911_gelsight_progress.json"
+        )
+        config.model.device = "cpu"
+        config.tool_tcp_offset_ee_m = [0.0, 0.0, 0.027408]
+        with self.assertRaisesRegex(ValueError, "0.0529"):
+            validate_bundle_artifacts(config)
+
+    def test_0911_cannot_run_past_its_terminal_training_horizon(self) -> None:
+        config = load_bundle_config(
+            REPO_ROOT / "configs/e2e_bundle_real_exported_0911_gelsight_progress.json"
+        )
+        config.model.device = "cpu"
+        config.runner.steps = 151
+        with self.assertRaisesRegex(ValueError, "at most 150 policy steps"):
+            validate_bundle_artifacts(config)
+
+    def test_0911_direct_motion_is_blocked_but_rlpd_is_allowed(self) -> None:
+        bundle = MagicMock()
+        bundle.is_tacex_rma_x040_wide_three_frame_direct_action_student = False
+        bundle.is_tacex_rma_gelsight_size_buckets_progress_student = True
+        bundle.metadata = {"motion_authorization": "rlpd_only"}
+
+        with self.assertRaisesRegex(ValueError, "RLPD checkpoint"):
+            reject_evaluation_only_motion(bundle, True)
+        reject_evaluation_only_motion(bundle, False)
+        reject_evaluation_only_motion(bundle, True, rlpd_settings=object())
 
 
 class Exported0809XYConfigTests(unittest.TestCase):

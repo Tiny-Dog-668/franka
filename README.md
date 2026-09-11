@@ -967,6 +967,87 @@ server9 Real-RL 的 Franka Hand 由独立 `spawn` 进程独占：`move_async/gra
 缺少 capture/action timestamp 的 Replay v1 不会被自动升级或伪造成可训练数据；若已有 v1 数据库，
 请在配置中使用新的 Replay 路径重新采集，旧库会以 schema mismatch 明确拒绝。
 
+## RLPD 残差强化学习
+
+`real_rlpd/` 是独立于旧 Real-RL 的 PyTorch RLPD 实现。当前适配 0814 单帧、0823 三帧，以及独立的
+0911 Progress 单帧 GelSight 策略，默认仍使用 0823。专家源数据保存同步视觉/触觉、机器人观测和专家绝对动作，不绑定某个
+base policy；每个 base policy 的派生 expert Replay、online Replay 和 checkpoint 仍由模型与 metadata
+SHA 隔离。
+Actor 输入是 frozen base-policy feature 1043D 加限幅后的 base action 4D，输出 XYZ＋gripper 4D residual。
+Critic 额外读取 AprilTag object-relative XYZ＋height。默认使用 10 个 Q、随机取 2 个最小 Q、Critic
+LayerNorm、offline/online 50:50、UTD=20；每组做 20 次 Critic 更新和 1 次 Actor/temperature 更新。
+完整模块、操作和扩展说明见 [`real_rlpd/README.md`](real_rlpd/README.md)。
+
+先做完全离线的 0823 模型与契约校验：
+
+```bash
+.venv/bin/python scripts/real_rlpd/run_rlpd.py validate \
+  --config configs/real_rlpd_0823.json --device cuda:0
+```
+
+0911 Progress 使用新的 artifact kind、adapter ID 和独立数据目录，不修改或复用 0814/0823 的
+Replay/checkpoint。该 checkpoint 的真实历史帧离线审计发现动作饱和和触觉辅助接触输出塌缩，因此
+`motion_authorization=rlpd_only`：部署入口只允许 `--validate-only`/`--preview-only`；真机控制只能走
+RLPD 专家全接管或通过契约校验的 RLPD checkpoint。
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0911_gelsight_progress.py --validate-only
+.venv/bin/python scripts/real_rlpd/run_rlpd.py validate \
+  --config configs/real_rlpd_0911_progress.json --device cuda:0
+```
+
+把下文命令中的 `configs/real_rlpd_0823.json` 替换为
+`configs/real_rlpd_0911_progress.json` 即可执行 0911 的专家采集、训练和 online 采集；对应 checkpoint
+目录为 `checkpoints/real_rlpd/0911_progress/`。0911 reward 的成功条件按训练 Progress 契约设置为
+抬升 `0.035 m` 且连续检测 5 帧；单个 episode 被强制限制在最多 150 个 policy step。当前在线检测仍是
+离线标注，成功后需要操作者或外部监控停止，不得把步数提高到训练 horizon 之外。
+
+专家数据是全人工接管：base policy 只做 shadow，窗口聚焦后按 Enter arm，`W/S`、`A/D`、`J/K`
+控制基座系 XYZ，`U/I` 连续开合夹爪；窗口失焦、ESC 或关闭窗口都会安全停止。先 preview，再
+streaming check，再单步：
+
+```bash
+.venv/bin/python scripts/real_rlpd/run_rlpd.py collect-expert \
+  --config configs/real_rlpd_0823.json --device cuda:0 --steps 150 \
+  --auto-gelsight --preview-only
+
+.venv/bin/python scripts/real_rlpd/run_rlpd.py streaming-check \
+  --config configs/real_rlpd_0823.json --device cuda:0 --enable-streaming-check
+
+.venv/bin/python scripts/real_rlpd/run_rlpd.py collect-expert \
+  --config configs/real_rlpd_0823.json --device cuda:0 --steps 1 \
+  --auto-gelsight --enable-expert-control
+```
+
+采够至少 1000 条完成离线标注的 expert transition 后，首次训练默认执行 1000 个 update group：
+
+```bash
+.venv/bin/python scripts/real_rlpd/run_rlpd.py train \
+  --config configs/real_rlpd_0823.json --device cuda:0
+```
+
+随后用同一策略的 checkpoint 采 online episode。确定性 residual 是默认值；随机策略必须同时显式给出
+`--stochastic --enable-stochastic-control`。每个 episode 停止并完成离线标注后再运行一次 `train`，它只按
+checkpoint high-watermark 之后新增的 trainable online transition 安排 update group，训练不会与真机控制并发：
+
+```bash
+.venv/bin/python scripts/real_rlpd/run_rlpd.py collect-online \
+  --config configs/real_rlpd_0823.json --device cuda:0 --steps 1 \
+  --checkpoint checkpoints/real_rlpd/0823/latest.pt --auto-gelsight \
+  --enable-rlpd-control
+
+.venv/bin/python scripts/real_rlpd/run_rlpd.py train \
+  --config configs/real_rlpd_0823.json --device cuda:0
+```
+
+online 动作在原 base policy 的 commissioning limiter 之后组成 residual，再经过原有最终裁剪；专家控制
+保存的是人工绝对动作，同时生成当前 policy-specific residual Replay。
+不允许 `--allow-full-scale`。动作尺度、workspace、initial-state gate、DLS/FCI 与 server9 ABI 都没有放宽。
+采集时 30 Hz 控制线程只缓存 transition，worker 停止后才单事务写 SQLite；AprilTag reward 也只在停止后
+离线标注。专家 episode 写入 `real_rlpd_data/expert/`，rollout 写入 `real_rlpd_data/rollout/0823/`，不会
+混放。0823 的附加物理 TCP 偏移已确认为 `0.0579 m`，workspace z 下界为 `0.01 m`；该偏移仅用于工具
+最低点的 workspace 检查和日志，不改变策略动作坐标系或 IK 命令点。
+
 ## 目录结构
 
 - `scripts/robot/`：状态读取、回零和直接控制。
@@ -975,6 +1056,8 @@ server9 Real-RL 的 Franka Hand 由独立 `spawn` 进程独占：`move_async/gra
 - `scripts/calibration/`：真机视觉与状态对齐。
 - `scripts/diagnostics/`：力传感器、运动和方向诊断。
 - `scripts/real_rl/`：Residual SAC 的校验、真机采集和离线训练入口。
+- `scripts/real_rlpd/`：RLPD 专家/online 采集、标注和 episode 间训练入口。
+- `real_rlpd/`：多 base-policy adapter、4D residual、ensemble SAC 与分离 Replay。
 - `franka_sim2real/`：运行时、真实机器人 backend、安全限制和日志。
 - `configs/`：部署配置。
 - `tools/system/`：网络、realtime 和主机检查。

@@ -10,7 +10,7 @@
   "auto_recover": false,
   "auto_gripper_homing": false,
   "async_gripper_commands": true,
-  "tool_tcp_offset_ee_m": [0.0, 0.0, 0.0579],
+  "tool_tcp_offset_ee_m": [0.0, 0.0, 0.0529],
   "fallback_gripper_max_width": 0.08,
   "streaming": {
     "backend": "server9_joint_position",
@@ -31,7 +31,7 @@
       "lower_torque_thresholds": [20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0],
       "upper_torque_thresholds": [40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0],
       "lower_force_thresholds": [10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
-      "upper_force_thresholds": [20.0, 20.0, 20.0, 20.0, 20.0, 20.0]
+      "upper_force_thresholds": [20.0, 20.0, 25.0, 20.0, 20.0, 20.0]
     },
     "maximum_joint_target_delta_rad": 0.02,
     "joint_limit_margin_rad": 0.05,
@@ -100,11 +100,11 @@
   "runner": {
     "steps": 150,
     "log_dir": "real_policy_logs",
-    "run_name": "e2e_bundle_real_exported_0823_gelsight"
+    "run_name": "e2e_bundle_real_exported_0911_gelsight_progress"
   },
   "model": {
-    "model_path": "/home/td/franka/checkpoint/0823/gelsight_x040_three_frame_latest.pt",
-    "metadata_path": "/home/td/franka/checkpoint/0823/gelsight_x040_three_frame_latest.json",
+    "model_path": "/home/td/franka/checkpoint/0911/gelsight_reference_student_student_100000.pt",
+    "metadata_path": "/home/td/franka/checkpoint/0911/gelsight_reference_progress_student_100000.json",
     "device": "cuda:0",
     "history_source": "processed_action",
     "history_scale": [1.0, 1.0, 1.0, 1.0],

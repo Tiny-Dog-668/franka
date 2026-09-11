@@ -25,6 +25,7 @@ from franka_sim2real.server9_ipc import (
 )
 from franka_sim2real.streaming_server9 import (
     _audit_fci_log,
+    _gripper_deadline_miss_requires_hold,
     _offline_boundary_snapshot,
     _print_streaming_progress,
     _wait_generation_ticks,
@@ -33,6 +34,34 @@ from franka_sim2real.streaming_server9 import (
 
 
 class Server9IpcTests(unittest.TestCase):
+    def test_gripper_ignores_single_deadline_miss_until_watchdog(self) -> None:
+        last_command_ns = 1_000_000_000
+        watchdog_ns = 250_000_000
+        self.assertFalse(
+            _gripper_deadline_miss_requires_hold(
+                last_command_ns,
+                last_command_ns + 45_000_000,
+                watchdog_ns,
+                False,
+            )
+        )
+        self.assertTrue(
+            _gripper_deadline_miss_requires_hold(
+                last_command_ns,
+                last_command_ns + watchdog_ns,
+                watchdog_ns,
+                False,
+            )
+        )
+        self.assertFalse(
+            _gripper_deadline_miss_requires_hold(
+                last_command_ns,
+                last_command_ns + 2 * watchdog_ns,
+                watchdog_ns,
+                True,
+            )
+        )
+
     def test_offline_boundary_snapshot_uses_latest_raw_packet_not_policy_result(self) -> None:
         raw = np.full((4, 5, 3), 7, dtype=np.uint8)
 

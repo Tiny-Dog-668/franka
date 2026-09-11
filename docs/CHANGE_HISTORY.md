@@ -34,6 +34,160 @@
 
 # 变更时间线
 
+## 2026-09-11 0911 Progress policy 隔离与 RLPD 接入
+
+**变更**：为 0911 checkpoint 新增独立 Progress metadata kind、部署配置/入口和 RLPD 配置；新增
+`gelsight_reference_progress_single_frame_v1` adapter，并按 model/metadata/reward contract 隔离
+`0911_progress` 的派生 Replay、rollout 与 checkpoint。旧 0814/0823 kind、配置和 adapter 保持不变。
+
+**动机**：0911 来自 terminal-success Progress 环境，但原导出 metadata 与普通 Size-Buckets 共用 kind；
+同时真实历史帧审计显示动作饱和与辅助接触预测塌缩，不能把它当作已批准的裸 base policy。
+
+**影响**：0911 直接真机运动在 worker 启动前拒绝，只允许离线校验/preview、RLPD 专家全接管或已校验
+RLPD checkpoint。动作仍为 4D、尺度仍为 `[0.05,0.05,0.05,0.01]`，commissioning limit、workspace
+下界、初始状态门禁、坐标系、停止时序和 ABI-8 均未放宽；v7 工具最低点附加偏移新增为 `0.0529 m`。
+
+**验证**：RLPD、bundle 与部署 CLI 相关单测 71 项通过；0911 GPU `--validate-only` 与 RLPD GPU
+`validate` 通过，1043D feature 能复现 base action；0814/0823 原入口 GPU `--validate-only` 均通过。
+0814/0823 原 RLPD GPU `validate` 也均通过且保持原 adapter ID。compileall 与 `git diff --check` 通过。
+未连接相机或 Franka，未执行真机运动。
+
+**文件**：`checkpoint/0911/gelsight_reference_progress_student_100000.json`、
+`configs/e2e_bundle_real_exported_0911_gelsight_progress.json`、`configs/real_rlpd_0911_progress.json`、
+`scripts/policy/run_exported_0911_gelsight_progress.py`、`franka_sim2real/e2e_bundle.py`、
+`franka_sim2real/streaming.py`、`franka_sim2real/streaming_server9.py`、`real_rlpd/adapters.py`、
+`tests/test_e2e_bundle_runtime.py`、`tests/test_real_rlpd.py`、`README.md`、`real_rlpd/README.md`、
+`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-09-09 0823 RLPD 策略支持与专家/rollout 数据分层
+
+**变更**：确认 0823 三帧 GelSight 策略的 workspace 工具点附加偏移为 `0.0579 m`，并将该配置的
+workspace z 下界从 `0.00 m` 收紧到 `0.01 m`。RLPD 默认入口切换到 0823，配置 schema 升至 v2；专家
+episode 写入共享的 `real_rlpd_data/expert/`，rollout 写入 policy-specific
+`real_rlpd_data/rollout/0823/`。新增策略无关专家源格式，保存同步腕部 RGB、左右 GelSight 当前帧和固定
+参考帧、机器人观测、proprio/action history 及专家绝对物理动作；base feature/action/residual 只进入
+`real_rlpd_data/derived/0823/offline_expert.sqlite3` 派生缓存。专家与 rollout 目录相同或互相嵌套时配置
+校验会拒绝启动。专家进度日志也改为显示绝对 requested/limited action，不再读取不存在的 residual 字段。
+
+**动机**：同一个真机任务的遥操示范不应永久绑定采集时使用的 base policy；同时专家数据和策略 rollout
+需要物理隔离，避免后续采样时混淆。0823 夹爪最低点距 `panda_hand` 为 `0.1613 m`，而 `O_T_EE` 已包含
+`0.1034 m`，所以附加 workspace 偏移是两者之差 `0.0579 m`。旧 `0.027408 m` 会把工具最低点向上少算
+`0.030492 m`。
+
+**影响**：0823 的动作维度、动作尺度、commissioning limit、基座系方向、IK 命令点、初始状态门禁、
+碰撞阈值、watchdog、停止时序和 ABI-8 不变；workspace 下界只收紧、不放宽。0814/0815 配置使用
+`0.027408 m` 的历史 episode 不会被删除，且仍可用于离线分析，但其旧观测并不包含本次新格式要求的
+完整同步触觉源，不能无损转换为新的策略无关专家源。当前会在采集时同步生成所选 policy 的派生 Replay；
+从历史专家源批量重建其他 policy Replay 的独立 CLI 仍待实现。
+
+**验证**：0823 实际 TorchScript 已在 CPU 和 `cuda:0` 完成离线 artifact、三帧视觉/双 GelSight 输入、1043D feature、
+4D action 和 RLPD contract 校验；RLPD 12 项及 RLPD/bundle/streaming/server9 相关 88 项测试通过，
+compileall 与 `git diff --check` 通过。全仓 236 项中 235 项通过；唯一失败是既有
+`test_live_apriltag_cube_pose` 仍指向已不存在的 `runs/.../calibration_report.json`，实际配置使用
+`runs_old/...`，与本次改动无关。历史日志审计中，48 份 0823 run config 全部记录 `0.0579 m` 偏移和
+`0.01 m` workspace z 下界；36 份旧 0814 RLPD run config 记录 `0.027408 m`。未连接相机或 Franka，
+未执行真机运动。
+
+**文件**：`configs/e2e_bundle_real_exported_0823_gelsight.json`、`configs/real_rlpd_0814.json`、
+`configs/real_rlpd_0823.json`、`real_rlpd/config.py`、`real_rlpd/expert_dataset.py`、
+`real_rlpd/collector.py`、`real_rlpd/teleop.py`、`scripts/real_rlpd/run_rlpd.py`、
+`franka_sim2real/streaming_server9.py`、`tests/test_real_rlpd.py`、`.gitignore`、`README.md`、
+`real_rlpd/README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-09-09 0814 RLPD 成功抬升阈值调整为 5 cm
+
+**变更**：将 0814 RLPD 的 `reward.success_height_m` 从 `0.015 m` 调整为 `0.05 m`；连续 3 帧确认、
+成功奖励大小及 reach/lift/action-penalty 公式保持不变，并增加配置契约断言。collector 现在先校验
+Replay contract，再执行 15 次有效 AprilTag 检测的 preflight，不兼容时立即拒绝。
+
+**动机**：让抓取成功代表物体已经稳定抬升到 5 cm，而不是仅离开初始高度 1.5 cm。
+
+**影响**：只改变 0814 离线 AprilTag 成功边界、reward contract 和 preflight/契约检查顺序；不改变 0823、
+动作尺度、速度、限幅、workspace、initial-state gate、碰撞阈值、停止时序、FCI worker 或共享内存 ABI。
+旧 `0.015 m` Replay 和 checkpoint 与新配置不兼容，必须隔离或重新标注/迁移，不能静默混用。
+
+**验证**：RLPD 单元测试、配置加载和 `git diff --check` 通过。轨迹 `20260909_182558` 重新标注后，成功
+边界由 431 推迟到 484，最大抬升 `0.092151 m`，在新阈值下仍判定成功；trainable transition 从 425
+变为 476。现有 offline Replay 已迁移到 5 cm contract，迁移前 SQLite 备份保留在同目录。未连接相机或
+Franka，未执行真机运动。
+
+**文件**：`configs/real_rlpd_0814.json`、`real_rlpd/collector.py`、`tests/test_real_rlpd.py`、`real_rlpd/README.md`、
+`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-09-09 RLPD 夹爪抢占停止与 deadline 容错
+
+**变更**：RLPD 连续夹爪执行器不再使用 `franky.Gripper.stop_async()` 中断 endpoint move，改为在隔离的
+Hand owner 进程中直接调用同步 `stop()`；反向动作在 stop 返回后立即启动，只有静止 hold 才读取实测宽度
+并重置逻辑累计起点。单帧被丢弃的 policy 结果不再直接生成夹爪 hold；机械臂仍立即 hold，夹爪保持最后
+一个已接受的速度意图，持续超过既有 `policy_watchdog_s` 后才停止。timing artifact 将停止调用字段收敛为
+`maximum_stop_call_ms`，并新增 `gripper_policy_watchdog_holds`。
+
+**动机**：真机运行 `20260909_164427` 测得指令发布到 Hand owner 仅 `1.58–3.53 ms`、`move_async()`
+仅 `0.05–0.07 ms`，但 `stop_async()` 调用本身阻塞 `1319.59 ms`。`franky 1.1.x` 的
+`setCurrentFuture()` 会先等待已有异步动作，因此 `stop_async()` 不能抢占正在运行的 `move_async()`；一次
+45 ms 的孤立 policy miss 又被旧逻辑误判为松键，最终造成后续反向命令约 802 ms 的可见延迟。
+
+**影响**：RLPD Replay 中的 30 Hz、每步 1 mm gripper delta、动作限幅、速度上限、力、workspace、机械臂
+deadline hold、history 接受规则、FCI worker 和共享内存 ABI 均不变。连续丢帧仍受现有 0.25 s policy
+watchdog 保护。普通非 RLPD/非 servo 夹爪目标队列不变。
+
+**验证**：`git diff --check` 与 Python compileall 通过；gripper、server9、RLPD、streaming 共 55 项测试
+通过。mock 明确令 `stop_async()` 抛错，确认抢占路径只调用 `stop()`；新增 45 ms 单帧 miss 不触发 stop、
+250 ms watchdog 到期只触发一次 hold 的测试。未执行新的真机运动，实际 stop RPC 延迟需下一次采集确认。
+
+**文件**：`franka_sim2real/gripper_process.py`、`franka_sim2real/streaming_server9.py`、
+`tests/test_gripper_process.py`、`tests/test_server9_streaming.py`、`real_rlpd/README.md`、
+`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-09-09 RLPD 专家遥操键位调整
+
+**变更**：将 RLPD 专家遥操的 Z 轴按键从 `R/F` 改为 `J/K`，夹爪连续打开/关闭从 `O/C` 改为
+`U/I`；同步更新 Pygame 监听、窗口提示、测试和操作文档。旧 HIL Residual BC 的按键不变。
+
+**影响**：只改变显式 RLPD expert 模式的人工输入映射；动作尺度、坐标系、安全限幅、workspace、
+initial-state gate、DLS/FCI、停止时序和 ABI 均不变。
+
+**验证**：RLPD 单元测试与 `git diff --check` 通过；未连接相机或 Franka，未执行真机运动。
+
+**文件**：`real_rlpd/teleop.py`、`tests/test_real_rlpd.py`、`real_rlpd/README.md`、`README.md`、
+`docs/CHANGE_HISTORY.md`
+
+## 2026-09-09 多策略真机 RLPD 4D residual
+
+**变更**：新增独立 `real_rlpd/` PyTorch 实现和统一 CLI，按 RLPD 采用 10-Q ensemble、随机 min-2、
+Critic LayerNorm、offline/online 50:50 和 UTD=20。Actor 使用 frozen policy feature 1043D＋已限幅
+base action 4D，并输出 XYZ＋gripper 4D residual；Critic 额外读取 AprilTag object-relative XYZ＋height。
+新增 0814 单帧 GelSight 与 0823 三帧 GelSight adapter、各自独立的 expert/online Replay 和 checkpoint
+配置。专家采集使用 30 Hz Pygame 全接管遥操，base policy 只做 shadow；online 采集只允许有效 checkpoint，
+随机 residual 需要额外显式开关。训练严格在 episode 之间运行，首次默认 1000 update group，后续按新增
+trainable online transition 更新。控制期间 transition 只保存在内存，worker 停止后才以单事务写 SQLite，
+AprilTag reward 继续使用原始边界帧离线标注。旧 Real-RL Replay 不迁移。新增目录内 README，集中记录
+模块边界、算法/动作契约、专家按键、完整验收命令、Replay 时序和扩展新 policy/reward 的要求。
+
+**动机**：把用户引入的 `rlpd/` 参考实现思路适配到现有 server9 真机链路，同时支持不同 base policy、
+高质量人工 expert 数据和不改变最终真机安全包络的 residual 学习。
+
+**影响**：RLPD 是显式、互斥的新路径；不开启时旧部署、HIL、Residual BC 和旧 Real-RL 保持原行为。
+residual 在 base commissioning limiter 之后叠加，再经过原有最终裁剪；RLPD 禁止 full-scale。动作物理尺度、
+基座系 XYZ、workspace、initial-state gate、碰撞阈值、DLS/FCI、停止时序、native worker 与共享内存 ABI
+均未修改。运行数据新增到 Git 忽略的 `real_rlpd_runs/`。
+
+**验证**：0814 与 0823 实际 TorchScript 均在 CPU 完成离线 artifact/feature contract 及完整 RLPD
+post-limit tick 校验；临时 Replay 的 1-group 训练、原子 checkpoint 和重新加载 smoke test 通过。新增 RLPD
+8 项单元测试通过。RLPD/streaming/server9/bundle 相关 83 项中 82 项通过，唯一失败是既有 0823 配置
+`workspace.minimum.z=0.00` 与既有测试期望 `0.01` 不一致。全量 230 项中 228 项通过；另一个既有错误是
+live AprilTag 测试仍指向已迁移的 `runs/` 标定路径。compileall 与 `git diff --check` 通过。未连接相机或
+Franka，未运行 preview、streaming-check 或任何真机运动。
+
+**待确认**：0823 base config 的 `workspace.minimum.z` 实际为 `0.00 m`，但其既有测试和变更记录要求
+`0.01 m`。本次未擅自修改安全参数；RLPD CLI 在该矛盾解决前拒绝 0823 真机运动，离线 validate 和
+preview 不受影响。
+
+**文件**：`real_rlpd/`、`scripts/real_rlpd/run_rlpd.py`、`configs/real_rlpd_0814.json`、
+`configs/real_rlpd_0823.json`、`franka_sim2real/e2e_bundle.py`、`franka_sim2real/streaming.py`、
+`franka_sim2real/streaming_server9.py`、`tests/test_real_rlpd.py`、`.gitignore`、`README.md`、
+`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
 ## 2026-08-23 修正几何的 0823 三帧 GelSight 真机部署
 
 **变更**：新增 0823 三帧 RGB＋双 GelSight TorchScript 的独立配置和入口；沿用 4D 动作、30 Hz、

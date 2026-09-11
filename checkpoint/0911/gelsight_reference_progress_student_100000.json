@@ -1,0 +1,118 @@
+{
+  "kind": "tacex_rma_gelsight_size_buckets_progress_student_torchscript",
+  "version": 2,
+  "task": "TacEx-Sim2Real-Cube-Real-Alignment-RMA-GelSight-Size-Buckets-Progress-Student-DR-v0",
+  "behavior_profile": "gelsight_size_buckets_progress_rlpd_base_v1",
+  "motion_authorization": "rlpd_only",
+  "source_export": {
+    "kind": "tacex_rma_gelsight_size_buckets_student_torchscript",
+    "version": 2,
+    "metadata_filename": "gelsight_reference_student_student_100000.json",
+    "metadata_sha256": "71ea77b146f6ec9b5e4ed05c8298ad49eccf6cf11413820d62dfe5afb744e564"
+  },
+  "student_checkpoint": "/data2/skrl/sim2real_cube_real_alignment_rma_gelsight_size_buckets_progress_student/2026-09-10_13-34-39_distillation/checkpoints/student_100000.pt",
+  "student_checkpoint_sha256": "718ae61563d9dfee48d67a080ad72376d6665eb980d244a04b7cfe39d8100c03",
+  "torchscript_sha256": "b9f8deedf5cf202ec982998963c2695f7aeb13a869242e211a9ae0dfe7e58c96",
+  "input_order": [
+    "wrist_rgb",
+    "proprio_obs",
+    "action_history",
+    "gsmini_left_rgb",
+    "gsmini_right_rgb",
+    "gsmini_left_reference_rgb",
+    "gsmini_right_reference_rgb"
+  ],
+  "input_signature": {
+    "wrist_rgb": [224, 224, 3],
+    "proprio_obs": [15],
+    "action_history": [4],
+    "gsmini_left_rgb": [96, 128, 3],
+    "gsmini_right_rgb": [96, 128, 3],
+    "gsmini_left_reference_rgb": [96, 128, 3],
+    "gsmini_right_reference_rgb": [96, 128, 3]
+  },
+  "output_signature": {
+    "mean_actions": [4]
+  },
+  "tactile_delta": "signed_float32_current_minus_reference_div_255",
+  "student_model_contract": {
+    "runtime_input_order": [
+      "wrist_rgb",
+      "proprio_obs",
+      "action_history",
+      "gsmini_left_rgb",
+      "gsmini_right_rgb",
+      "gsmini_left_reference_rgb",
+      "gsmini_right_reference_rgb"
+    ],
+    "visual_feature": "resnet18_layer4_global_average_pool[512]",
+    "tactile_feature": "shared_cnn_signed_current_minus_reference[256]_per_side",
+    "actor_feature_order": [
+      "visual[512]",
+      "left_tactile[256]",
+      "right_tactile[256]",
+      "normalized_proprio[15]",
+      "normalized_action_history[4]"
+    ],
+    "actor_feature_dim": 1043,
+    "action_head": [1043, 512, 256, 128, 64, 4],
+    "output": "tanh_mean_action[4]",
+    "auxiliary_outputs": {
+      "normalized_cube_position_root": [3],
+      "cube_center_heatmap": [1, 14, 14],
+      "left_right_contact_logits": [2]
+    },
+    "runtime_privileged_inputs": []
+  },
+  "actor_fusion": "visual_512+left_tactile_256+right_tactile_256+proprio_15+history_4",
+  "contact_to_actor": "continuous_tactile_features; logits_are_auxiliary_only",
+  "training_only_auxiliary_labels": [
+    "cube_position_xyz",
+    "projected_cube_center_heatmap_14x14",
+    "left_right_physics_contact"
+  ],
+  "progress_training_contract": {
+    "reward": "signed_reach_lift_contact_progress",
+    "success": "once_on_confirmed_terminal_success",
+    "success_lift_delta_m": 0.035,
+    "success_hold_steps": 5,
+    "action_magnitude_penalty_weight": 0.05,
+    "excess_contact_force_threshold_n": 15.0,
+    "excess_contact_force_quadratic_weight": 5.0
+  },
+  "gelsight_geometry": {
+    "version": 3,
+    "center_offset_hand_m": [0.0, 0.0, 0.1392],
+    "lowest_point_offset_hand_m": [0.0, 0.0, 0.1563],
+    "flange_to_ee_translation_m": [0.0, 0.0, 0.1034],
+    "tool_tcp_offset_ee_m": [0.0, 0.0, 0.0529]
+  },
+  "deployment_contract": {
+    "policy_frequency_hz": 30.0,
+    "episode_length_s": 5.0,
+    "max_episode_length_steps": 150,
+    "success_stop": "external_apriltag_or_operator_required"
+  },
+  "validation": {
+    "cpu_batch_1_max_abs_error": 0.0,
+    "cpu_batch_8_max_abs_error": 0.0
+  },
+  "cuda_validation": true,
+  "cuda_validation_details": {
+    "device": "cuda:0",
+    "synthetic_cases": 24,
+    "cpu_cuda_max_abs_error": 0.0014194846153259277,
+    "cpu_cuda_mean_case_max_abs_error": 0.000254,
+    "tolerance": 0.002
+  },
+  "behavioral_validation": {
+    "status": "direct_motion_rejected",
+    "approved_runtime": "rlpd_residual_only",
+    "real_replay_source": "real_rl_logs/20260823_151507_e2e_bundle_real_exported_0814_gelsight/step_data",
+    "real_replay_samples": 500,
+    "action_abs_ge_0_95_fraction": [0.198, 0.0, 0.678, 0.188],
+    "zero_tactile_delta_samples": 45,
+    "zero_tactile_delta_contact_probability_mean": [0.99998, 0.99998],
+    "reason": "saturated actions and collapsed auxiliary contact predictions on recorded real observations"
+  }
+}

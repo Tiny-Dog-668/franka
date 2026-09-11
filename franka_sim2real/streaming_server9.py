@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import warnings
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -24,6 +25,8 @@ from .gripper_process import ProcessGripperQueue
 from .hil import HILSettings, PygameHILKeyboard
 from .residual_runtime import ResidualDeploySettings
 from .real_rl.runtime import RealRLDeploySettings
+from real_rlpd.runtime import RLPDDeploySettings
+from real_rlpd.teleop import PygameExpertKeyboard, expert_raw_action, expert_step_info
 from .streaming import (
     _PolicyResult,
     _policy_record,
@@ -33,10 +36,12 @@ from .streaming import (
     _sleep_until,
     _write_streaming_artifacts,
     apply_hil_action,
+    clip_streaming_action,
     evaluate_streaming_check_state,
     physical_tool_tcp_translation,
     policy_result_is_timely,
     reshape_column_major,
+    streaming_robot_action,
     validate_streaming_contract,
 )
 from .types import (
@@ -48,6 +53,7 @@ from .types import (
 
 if TYPE_CHECKING:
     from .real_rl.collector import RealRLCollector
+    from real_rlpd.collector import RLPDCollector
 
 
 ROBOT_MODE_NAMES = {
@@ -55,6 +61,20 @@ ROBOT_MODE_NAMES = {
     5: "UserStopped", 6: "AutomaticErrorRecovery",
 }
 PROGRESS_INTERVAL_STEPS = 30
+
+
+def _gripper_deadline_miss_requires_hold(
+    last_command_ns: int,
+    now_ns: int,
+    watchdog_ns: int,
+    already_holding: bool,
+) -> bool:
+    """Treat only a sustained command outage, not one rejected frame, as hold."""
+
+    return (
+        not already_holding
+        and now_ns - last_command_ns >= watchdog_ns
+    )
 
 
 def _offline_boundary_snapshot(camera: Any) -> tuple[np.ndarray, dict[str, Any]]:
@@ -240,6 +260,32 @@ def _print_streaming_progress(
                 f"residual_mm=[{residual_mm[0]:+.3f}, {residual_mm[1]:+.3f}, "
                 f"{residual_mm[2]:+.3f}] fallback={bool(real_rl['fallback'])}"
             )
+        rlpd = result.inference_info.get("rlpd")
+        if isinstance(rlpd, dict):
+            if bool(rlpd.get("expert_takeover")):
+                requested = [
+                    float(value) for value in rlpd["expert_requested_action"]
+                ]
+                limited = [float(value) for value in rlpd["expert_limited_action"]]
+                lines.append(
+                    "  rlpd: "
+                    f"mode={rlpd['mode']} expert_takeover=True "
+                    f"requested_norm=[{', '.join(f'{value:+.3f}' for value in requested)}] "
+                    f"limited_norm=[{', '.join(f'{value:+.3f}' for value in limited)}] "
+                    f"keys={rlpd.get('pressed_keys', [])}"
+                )
+            else:
+                unit = [float(value) for value in rlpd["unit_residual_action"]]
+                residual = [
+                    float(value) for value in rlpd["residual_normalized_action"]
+                ]
+                lines.append(
+                    "  rlpd: "
+                    f"mode={rlpd['mode']} "
+                    f"unit=[{', '.join(f'{value:+.3f}' for value in unit)}] "
+                    f"residual_norm=[{', '.join(f'{value:+.3f}' for value in residual)}] "
+                    f"stochastic={bool(rlpd['stochastic'])}"
+                )
         if result.hil_step is not None:
             base = ", ".join(
                 f"{float(value):+.3f}" for value in result.hil_step.base_action
@@ -457,6 +503,7 @@ def _stop_resources(
     gripper_queue: ProcessGripperQueue | None,
     run_dir: Path,
     config: BundleDeployConfig,
+    timing: dict[str, Any] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     errors: list[str] = []
     trace: list[dict[str, Any]] = []
@@ -475,7 +522,56 @@ def _stop_resources(
             gripper_queue.stop()
         except Exception as exc:
             errors.append(f"gripper stop: {exc}")
+        finally:
+            if timing is not None:
+                timing["gripper_owner_timing"] = gripper_queue.timing_report()
     return errors, trace
+
+
+def _apply_rlpd_expert_action(
+    result: _PolicyResult,
+    keyboard: PygameExpertKeyboard,
+    settings: RLPDDeploySettings,
+    config: BundleDeployConfig,
+    desired_gripper_width: float,
+) -> _PolicyResult:
+    """Replace the shadow policy command with the current 4D expert command."""
+
+    snapshot = keyboard.sample()
+    raw = expert_raw_action(
+        snapshot,
+        xyz_speed_m_s=settings.config.teleop.xyz_speed_m_s,
+        gripper_speed_m_s=settings.config.teleop.gripper_speed_m_s,
+        policy_frequency_hz=config.streaming.policy_frequency_hz,
+        action_scales=config.action_adapter.scales,
+    )
+    executed = clip_streaming_action(raw, config, allow_full_scale=False)
+    inference_info = dict(result.inference_info)
+    rlpd = dict(inference_info.get("rlpd", {}))
+    # Expert source commands are absolute actions. The shadow runtime's zero
+    # residual is not an expert label; the policy-specific Replay derives its
+    # residual target later inside RLPDCollector.
+    rlpd.pop("unit_residual_action", None)
+    rlpd.pop("residual_normalized_action", None)
+    rlpd.update(expert_step_info(
+        raw,
+        executed,
+        snapshot,
+    ))
+    rlpd.update({
+        "candidate_action": raw.tolist(),
+        "mode": "expert_shadow",
+        "stochastic": False,
+        "expert_takeover": True,
+    })
+    inference_info["rlpd"] = rlpd
+    return replace(
+        result,
+        raw_action=raw,
+        executed_action=executed,
+        robot_action=streaming_robot_action(executed, config, desired_gripper_width),
+        inference_info=inference_info,
+    )
 
 
 def _preview(
@@ -496,6 +592,9 @@ def _preview(
     hil_keyboard: PygameHILKeyboard | None = None,
     episode_id: str | None = None,
     real_rl_collector: "RealRLCollector | None" = None,
+    rlpd_settings: RLPDDeploySettings | None = None,
+    rlpd_keyboard: PygameExpertKeyboard | None = None,
+    rlpd_collector: "RLPDCollector | None" = None,
     save_step_data: bool = False,
 ) -> None:
     period_ns = round(1e9 / config.streaming.policy_frequency_hz)
@@ -504,12 +603,16 @@ def _preview(
         _sleep_until(start_ns + step_index * period_ns, clock_ns, sleep)
         offline_raw_image: np.ndarray | None = None
         offline_camera_frame: dict[str, Any] | None = None
-        if real_rl_collector is not None:
+        if real_rl_collector is not None or rlpd_collector is not None:
             offline_raw_image, offline_camera_frame = _offline_boundary_snapshot(camera)
         result = first_policy if step_index == 0 else _run_policy_tick(
             bundle, camera, history, observation, config, allow_full_scale,
             float(gripper_queue.desired_width if gripper_queue else 0.0), clock_ns,
         )
+        if rlpd_collector is not None:
+            # Pair the previous action before sampling the next expert input;
+            # an ESC stop still preserves the completed previous transition.
+            rlpd_collector.observe_boundary(step_index, observation, result)
         if hil_settings is not None and hil_settings.enabled:
             if hil_keyboard is None:
                 raise RuntimeError("HIL preview is missing its keyboard listener")
@@ -521,6 +624,14 @@ def _preview(
                 allow_full_scale,
                 float(gripper_queue.desired_width if gripper_queue else 0.0),
             )
+        if rlpd_settings is not None and rlpd_keyboard is not None:
+            result = _apply_rlpd_expert_action(
+                result,
+                rlpd_keyboard,
+                rlpd_settings,
+                config,
+                float(gripper_queue.desired_width if gripper_queue else 0.0),
+            )
         if real_rl_collector is not None:
             real_rl_collector.observe_boundary(step_index, observation, result)
         timing["maximum_policy_elapsed_ms"] = max(
@@ -530,12 +641,14 @@ def _preview(
             result.elapsed_ns, period_ns, round(config.streaming.policy_watchdog_s * 1e9)
         )
         if timely:
-            if real_rl_collector is None:
+            if real_rl_collector is None and rlpd_collector is None:
                 history.update(result.raw_action, result.executed_action)
         else:
             timing["policy_deadline_misses"] += 1
         if real_rl_collector is not None:
             real_rl_collector.record_action(result, False)
+        if rlpd_collector is not None:
+            rlpd_collector.record_action(result, False)
         record = _policy_record(
             step_index,
             observation,
@@ -547,6 +660,7 @@ def _preview(
                 False
                 if (hil_settings is not None and hil_settings.enabled)
                 or real_rl_collector is not None
+                or rlpd_collector is not None
                 else None
             ),
         )
@@ -557,15 +671,20 @@ def _preview(
             )
         records.append(record)
         images.append(_retain_artifact_arrays(record, result, config, save_step_data))
-    if real_rl_collector is not None:
+    if real_rl_collector is not None or rlpd_collector is not None:
         final_raw_image, final_camera_frame = _offline_boundary_snapshot(camera)
         final_result = _run_policy_tick(
             bundle, camera, history, observation, config, allow_full_scale,
             float(gripper_queue.desired_width if gripper_queue else 0.0), clock_ns,
         )
-        real_rl_collector.observe_boundary(
-            config.runner.steps, observation, final_result, truncate=True
-        )
+        if real_rl_collector is not None:
+            real_rl_collector.observe_boundary(
+                config.runner.steps, observation, final_result, truncate=True
+            )
+        if rlpd_collector is not None:
+            rlpd_collector.observe_boundary(
+                config.runner.steps, observation, final_result, truncate=True
+            )
         if records:
             records[-1]["_offline_next_raw_image"] = final_raw_image
             records[-1]["_offline_next_camera_frame"] = final_camera_frame
@@ -590,6 +709,8 @@ def run_server9_streaming_bundle_deploy(
     hil_settings: HILSettings | None = None,
     residual_settings: ResidualDeploySettings | None = None,
     real_rl_settings: RealRLDeploySettings | None = None,
+    rlpd_settings: RLPDDeploySettings | None = None,
+    rlpd_expert: bool = False,
     *,
     clock_ns: Callable[[], int] = time.monotonic_ns,
     sleep: Callable[[float], None] = time.sleep,
@@ -609,6 +730,35 @@ def run_server9_streaming_bundle_deploy(
         raise ValueError("Real-RL cannot be combined with HIL")
     if real_rl_settings is not None and residual_settings is not None:
         raise ValueError("Real-RL cannot be combined with Residual BC")
+    if rlpd_settings is not None:
+        rlpd_settings.validate()
+    if rlpd_expert and rlpd_settings is None:
+        raise ValueError("RLPD expert takeover requires RLPD settings")
+    if rlpd_settings is not None and streaming_check:
+        raise ValueError("RLPD cannot be combined with --streaming-check")
+    if rlpd_settings is not None and hil_enabled:
+        raise ValueError("RLPD cannot be combined with HIL")
+    if rlpd_settings is not None and residual_settings is not None:
+        raise ValueError("RLPD cannot be combined with Residual BC")
+    if rlpd_settings is not None and real_rl_settings is not None:
+        raise ValueError("RLPD cannot be combined with Real-RL")
+    if rlpd_expert and rlpd_settings is not None and rlpd_settings.mode != "expert_shadow":
+        raise ValueError("RLPD expert takeover requires expert_shadow mode")
+    if rlpd_settings is not None and not rlpd_expert and rlpd_settings.mode != "checkpoint":
+        raise ValueError("RLPD policy control requires checkpoint mode")
+    if rlpd_settings is not None and allow_full_scale:
+        raise ValueError("RLPD keeps the commissioning envelope; full scale is forbidden")
+    if rlpd_settings is not None and not np.isclose(
+        rlpd_settings.commissioning_limit,
+        config.streaming.commissioning_action_limit,
+    ):
+        raise ValueError("RLPD commissioning limit must match the base deployment config")
+    if (
+        rlpd_settings is not None
+        and execute_motion
+        and float(config.workspace["minimum"][2]) < 0.01
+    ):
+        raise ValueError("RLPD real motion requires workspace.minimum.z >= 0.01 m")
     if hil_enabled:
         save_step_data = True
     run_dir = _make_run_dir(config)
@@ -624,6 +774,7 @@ def run_server9_streaming_bundle_deploy(
         "maximum_policy_decision_lateness_ms": 0.0,
         "maximum_gripper_command_ms": 0.0,
         "maximum_gripper_poll_ms": 0.0,
+        "gripper_policy_watchdog_holds": 0,
         "maximum_latch_wait_ms": 0.0,
         "maximum_loop_body_ms": 0.0,
     }
@@ -641,12 +792,19 @@ def run_server9_streaming_bundle_deploy(
         })
     if real_rl_settings is not None:
         timing["real_rl_enabled"] = True
+    if rlpd_settings is not None:
+        timing.update({
+            "rlpd_enabled": True,
+            "rlpd_expert_takeover": bool(rlpd_expert),
+        })
     bundle: BundleTorchScriptPolicy | None = None
     camera: Any | None = None
     gripper_queue: ProcessGripperQueue | None = None
     worker: Server9Worker | None = None
     hil_keyboard: PygameHILKeyboard | None = None
     real_rl_collector: "RealRLCollector | None" = None
+    rlpd_keyboard: PygameExpertKeyboard | None = None
+    rlpd_collector: "RLPDCollector | None" = None
     initial_report: dict[str, Any] = {"passed": False, "checks": {}, "failures": []}
     stopped = False
     printed_error_report = False
@@ -663,9 +821,10 @@ def run_server9_streaming_bundle_deploy(
                 rma_oracle_cube_position_root=config.model.rma_oracle_cube_position_root,
                 residual_settings=residual_settings,
                 real_rl_settings=real_rl_settings,
+                rlpd_settings=rlpd_settings,
             )
             _validate_bundle_action_dims(bundle, config)
-            reject_evaluation_only_motion(bundle, execute_motion)
+            reject_evaluation_only_motion(bundle, execute_motion, rlpd_settings)
             validate_streaming_contract(bundle, config)
             if bundle.residual_runtime is not None:
                 timing["residual_bc"] = bundle.residual_runtime.report()
@@ -678,6 +837,13 @@ def run_server9_streaming_bundle_deploy(
                         "--allow-checkpoint-fallback-collect opt-in. Reason: "
                         + str(bundle.real_rl_runtime.fallback_reason)
                     )
+            if bundle.rlpd_runtime is not None:
+                timing["rlpd"] = bundle.rlpd_runtime.report()
+                if bundle.rlpd_runtime.requires_episode_refusal:
+                    raise RuntimeError(
+                        "RLPD checkpoint validation failed; refusing episode start. "
+                        + str(bundle.rlpd_runtime.fallback_reason)
+                    )
 
         worker = Server9Worker(config, worker_path=_worker_binary(config))
         initial_snapshot = worker.wait_ready()
@@ -685,6 +851,11 @@ def run_server9_streaming_bundle_deploy(
             gripper_queue = ProcessGripperQueue(
                 config.robot_ip, config.gripper_speed,
                 config.gripper_command_tolerance_m, config.gripper_force,
+                servo_frequency_hz=(
+                    config.streaming.policy_frequency_hz
+                    if rlpd_settings is not None
+                    else None
+                ),
             )
             worker.set_abort_callback(gripper_queue.stop)
         initial_observation = snapshot_to_observation(
@@ -726,6 +897,25 @@ def run_server9_streaming_bundle_deploy(
                 timing["real_rl_initial_object_z_in_base"] = (
                     real_rl_collector.initial_object_z_in_base
                 )
+            if rlpd_settings is not None and execute_motion:
+                from real_rlpd.collector import RLPDCollector
+
+                assert bundle.rlpd_runtime is not None
+                role = "offline" if rlpd_expert else "online"
+                print(
+                    "RLPD AprilTag preflight: waiting for "
+                    f"{rlpd_settings.config.apriltag.preflight_valid_detections} "
+                    "valid detections...",
+                    flush=True,
+                )
+                rlpd_collector = RLPDCollector(
+                    rlpd_settings,
+                    camera,
+                    run_dir,
+                    role,
+                    bundle.rlpd_runtime.contract(),
+                )
+                timing["rlpd_initial_object_z_in_base"] = rlpd_collector.initial_object_z
             history = ActionHistoryBuffer(
                 bundle.history_dim, config.model.history_source,
                 config.model.history_scale, config.model.history_delay_steps,
@@ -794,21 +984,37 @@ def run_server9_streaming_bundle_deploy(
                 hil_keyboard.start()
                 print("HIL window opened; focus it and press Enter to arm preview.")
                 hil_keyboard.wait_until_ready()
+            if rlpd_expert:
+                assert rlpd_settings is not None
+                rlpd_keyboard = PygameExpertKeyboard(
+                    rlpd_settings.config.teleop.xyz_speed_m_s,
+                    rlpd_settings.config.teleop.gripper_speed_m_s,
+                )
+                rlpd_keyboard.start()
+                print("RLPD expert window opened; focus it and press Enter to arm preview.")
+                rlpd_keyboard.wait_until_ready()
             _preview(
                 bundle, camera, history, initial_observation, first_policy, gripper_queue,
                 config, allow_full_scale, timing, records, images, clock_ns, sleep,
                 hil_settings=hil_settings,
                 hil_keyboard=hil_keyboard,
-                episode_id=run_dir.name if hil_enabled else None,
+                episode_id=run_dir.name if hil_enabled or rlpd_settings is not None else None,
                 real_rl_collector=real_rl_collector,
+                rlpd_settings=rlpd_settings if rlpd_expert else None,
+                rlpd_keyboard=rlpd_keyboard,
+                rlpd_collector=rlpd_collector,
                 save_step_data=save_step_data,
             )
             if real_rl_collector is not None:
                 real_rl_collector.close()
                 timing["real_rl_collection"] = real_rl_collector.report()
                 real_rl_collector = None
+            if rlpd_collector is not None:
+                rlpd_collector.close()
+                timing["rlpd_collection"] = rlpd_collector.report()
+                rlpd_collector = None
             cleanup_errors, control_trace = _stop_resources(
-                worker, gripper_queue, run_dir, config
+                worker, gripper_queue, run_dir, config, timing
             )
             stopped = True
             if cleanup_errors:
@@ -825,7 +1031,7 @@ def run_server9_streaming_bundle_deploy(
             if not bool(confirm_session_callback(0, proposed_action, initial_observation)):
                 timing["cancelled_by_user"] = True
                 cleanup_errors, control_trace = _stop_resources(
-                    worker, gripper_queue, run_dir, config
+                    worker, gripper_queue, run_dir, config, timing
                 )
                 stopped = True
                 if cleanup_errors:
@@ -841,6 +1047,35 @@ def run_server9_streaming_bundle_deploy(
             hil_keyboard.start()
             print("HIL window opened; focus it and press Enter before control starts.")
             hil_keyboard.wait_until_ready()
+        if rlpd_expert:
+            assert rlpd_settings is not None
+            rlpd_keyboard = PygameExpertKeyboard(
+                rlpd_settings.config.teleop.xyz_speed_m_s,
+                rlpd_settings.config.teleop.gripper_speed_m_s,
+            )
+            rlpd_keyboard.start()
+            print("RLPD expert window opened; focus it and press Enter before control starts.")
+            rlpd_keyboard.wait_until_ready()
+
+        if rlpd_settings is not None:
+            # The operator confirmation and keyboard arming may take an
+            # arbitrary amount of time. Refresh the policy state immediately
+            # before starting FCI so transition zero is not paired with a
+            # stale camera observation.
+            assert bundle is not None and camera is not None and history is not None
+            first_policy = _run_policy_tick(
+                bundle,
+                camera,
+                history,
+                initial_observation,
+                config,
+                allow_full_scale,
+                float(gripper_queue.desired_width if gripper_queue else 0.0),
+                clock_ns,
+                collect_rma_debug=_should_print_streaming_progress(
+                    1, config.runner.steps
+                ),
+            )
 
         worker.start(streaming_check=streaming_check)
         _wait_running(worker, 2.0)
@@ -862,6 +1097,8 @@ def run_server9_streaming_bundle_deploy(
             assert bundle is not None and camera is not None and history is not None
             pending_result = first_policy
             last_accepted_generation: int | None = None
+            last_gripper_command_ns = start_ns
+            gripper_watchdog_holding = False
             stopped_for_success = False
             for step_index in range(config.runner.steps):
                 loop_started_ns = clock_ns()
@@ -869,7 +1106,7 @@ def run_server9_streaming_bundle_deploy(
                 lateness_ns = _sleep_until(deadline_ns, clock_ns, sleep)
                 offline_raw_image: np.ndarray | None = None
                 offline_camera_frame: dict[str, Any] | None = None
-                if real_rl_collector is not None:
+                if real_rl_collector is not None or rlpd_collector is not None:
                     offline_raw_image, offline_camera_frame = _offline_boundary_snapshot(
                         camera
                     )
@@ -909,6 +1146,10 @@ def run_server9_streaming_bundle_deploy(
                             config.runner.steps,
                         ),
                     )
+                if rlpd_collector is not None:
+                    # Complete the previous transition before a new expert
+                    # sample can request an operator stop.
+                    rlpd_collector.observe_boundary(step_index, observation, result)
                 if hil_enabled:
                     assert hil_settings is not None and hil_keyboard is not None
                     result = apply_hil_action(
@@ -917,6 +1158,15 @@ def run_server9_streaming_bundle_deploy(
                         hil_settings,
                         config,
                         allow_full_scale,
+                        float(gripper_queue.desired_width if gripper_queue else 0.0),
+                    )
+                if rlpd_expert:
+                    assert rlpd_settings is not None and rlpd_keyboard is not None
+                    result = _apply_rlpd_expert_action(
+                        result,
+                        rlpd_keyboard,
+                        rlpd_settings,
+                        config,
                         float(gripper_queue.desired_width if gripper_queue else 0.0),
                     )
                 if real_rl_collector is not None:
@@ -965,10 +1215,15 @@ def run_server9_streaming_bundle_deploy(
                     if gripper_queue is not None and result.robot_action.gripper_width is not None:
                         gripper_started_ns = clock_ns()
                         gripper_queue.command(result.robot_action.gripper_width)
+                        last_gripper_command_ns = clock_ns()
+                        gripper_watchdog_holding = False
                         step_timing_ms["gripper_command"] = (
-                            clock_ns() - gripper_started_ns
+                            last_gripper_command_ns - gripper_started_ns
                         ) / 1e6
-                    if step_index + 1 < config.runner.steps:
+                    if (
+                        step_index + 1 < config.runner.steps
+                        and rlpd_settings is None
+                    ):
                         # The policy result for the next 30 Hz boundary must be
                         # ready before that boundary.  The native worker runs
                         # independently at 1 kHz, so this inference overlaps
@@ -1016,8 +1271,34 @@ def run_server9_streaming_bundle_deploy(
                     if absolute_deadline_expired:
                         timing["absolute_policy_deadline_misses"] += 1
                     worker.hold_policy_target()
+                    # A rejected policy result is not a gripper release. Keep
+                    # the last accepted velocity through brief inference or
+                    # scheduling jitter. Only the existing policy watchdog may
+                    # turn a prolonged absence of accepted commands into hold.
+                    # This avoids invoking the Hand stop path for one dropped
+                    # 30 Hz frame while retaining a bounded fail-safe.
+                    if (
+                        gripper_queue is not None
+                        and _gripper_deadline_miss_requires_hold(
+                            last_gripper_command_ns,
+                            clock_ns(),
+                            watchdog_ns,
+                            gripper_watchdog_holding,
+                        )
+                    ):
+                        gripper_started_ns = clock_ns()
+                        gripper_queue.hold_servo_target()
+                        step_timing_ms["gripper_command"] = (
+                            clock_ns() - gripper_started_ns
+                        ) / 1e6
+                        gripper_watchdog_holding = True
+                        timing["gripper_policy_watchdog_holds"] += 1
                 if real_rl_collector is not None:
                     real_rl_collector.record_action(
+                        result, timely, action_timestamp=action_timestamp
+                    )
+                if rlpd_collector is not None:
+                    rlpd_collector.record_action(
                         result, timely, action_timestamp=action_timestamp
                     )
                 if gripper_queue is not None:
@@ -1047,7 +1328,11 @@ def run_server9_streaming_bundle_deploy(
                     result,
                     timely,
                     True,
-                    episode_id=run_dir.name if hil_enabled else None,
+                    episode_id=(
+                        run_dir.name
+                        if hil_enabled or rlpd_settings is not None
+                        else None
+                    ),
                     deadline_lateness_ns=decision_lateness_ns,
                     timing_ms=step_timing_ms,
                 )
@@ -1094,7 +1379,7 @@ def run_server9_streaming_bundle_deploy(
                     )
                     raise
 
-            if real_rl_collector is not None and not stopped_for_success:
+            if (real_rl_collector is not None or rlpd_collector is not None) and not stopped_for_success:
                 final_raw_image, final_camera_frame = _offline_boundary_snapshot(camera)
                 final_snapshot = worker.snapshot()
                 final_observation = snapshot_to_observation(
@@ -1113,9 +1398,14 @@ def run_server9_streaming_bundle_deploy(
                     float(gripper_queue.desired_width if gripper_queue else 0.0),
                     clock_ns,
                 )
-                real_rl_collector.observe_boundary(
-                    len(records), final_observation, final_result, truncate=True
-                )
+                if real_rl_collector is not None:
+                    real_rl_collector.observe_boundary(
+                        len(records), final_observation, final_result, truncate=True
+                    )
+                if rlpd_collector is not None:
+                    rlpd_collector.observe_boundary(
+                        len(records), final_observation, final_result, truncate=True
+                    )
                 if records:
                     records[-1]["_offline_next_raw_image"] = final_raw_image
                     records[-1]["_offline_next_camera_frame"] = final_camera_frame
@@ -1123,14 +1413,17 @@ def run_server9_streaming_bundle_deploy(
                 real_rl_collector.close()
                 timing["real_rl_collection"] = real_rl_collector.report()
                 real_rl_collector = None
-
         cleanup_errors, control_trace = _stop_resources(
-            worker, gripper_queue, run_dir, config
+            worker, gripper_queue, run_dir, config, timing
         )
         stopped_ns = clock_ns()
         stopped = True
         if cleanup_errors:
             raise RuntimeError("; ".join(cleanup_errors))
+        if rlpd_collector is not None:
+            rlpd_collector.close()
+            timing["rlpd_collection"] = rlpd_collector.report()
+            rlpd_collector = None
         elapsed_s = max(0.0, (stopped_ns - start_ns) / 1e9)
         timing.update({
             "expected_control_ticks": expected_ticks,
@@ -1162,7 +1455,7 @@ def run_server9_streaming_bundle_deploy(
             )
         if not stopped:
             cleanup_errors, control_trace = _stop_resources(
-                worker, gripper_queue, run_dir, config
+                worker, gripper_queue, run_dir, config, timing
             )
             stopped = True
             timing["cleanup_errors"] = cleanup_errors
@@ -1176,6 +1469,13 @@ def run_server9_streaming_bundle_deploy(
             except Exception as collector_exc:
                 timing["real_rl_collector_close_error"] = str(collector_exc)
             real_rl_collector = None
+        if rlpd_collector is not None:
+            try:
+                rlpd_collector.close()
+                timing["rlpd_collection"] = rlpd_collector.report()
+            except Exception as collector_exc:
+                timing["rlpd_collector_close_error"] = str(collector_exc)
+            rlpd_collector = None
         try:
             _write_streaming_artifacts(
                 run_dir, config, initial_report, records, images, control_trace, timing,
@@ -1189,7 +1489,9 @@ def run_server9_streaming_bundle_deploy(
         raise
     finally:
         if not stopped:
-            cleanup_errors, _ = _stop_resources(worker, gripper_queue, run_dir, config)
+            cleanup_errors, _ = _stop_resources(
+                worker, gripper_queue, run_dir, config, timing
+            )
             if cleanup_errors:
                 warnings.warn("; ".join(cleanup_errors), RuntimeWarning, stacklevel=2)
         if worker is not None:
@@ -1200,6 +1502,12 @@ def run_server9_streaming_bundle_deploy(
                 timing["real_rl_collection"] = real_rl_collector.report()
             except Exception as exc:
                 warnings.warn(f"Real-RL collector close: {exc}", RuntimeWarning, stacklevel=2)
+        if rlpd_collector is not None:
+            try:
+                rlpd_collector.close()
+                timing["rlpd_collection"] = rlpd_collector.report()
+            except Exception as exc:
+                warnings.warn(f"RLPD collector close: {exc}", RuntimeWarning, stacklevel=2)
         if camera is not None:
             try:
                 camera.close()
@@ -1210,3 +1518,8 @@ def run_server9_streaming_bundle_deploy(
                 hil_keyboard.close()
             except Exception as exc:
                 warnings.warn(f"HIL keyboard close: {exc}", RuntimeWarning, stacklevel=2)
+        if rlpd_keyboard is not None:
+            try:
+                rlpd_keyboard.close()
+            except Exception as exc:
+                warnings.warn(f"RLPD keyboard close: {exc}", RuntimeWarning, stacklevel=2)

@@ -54,6 +54,7 @@
 | `franka_sim2real/envs/` | 机器人后端抽象：`base.py`、`franka_real.py`（franky blocking）、`mock_sim.py` |
 | `franka_sim2real/calibration/` | eye-to-hand 标定数学 |
 | `scripts/policy/` | 策略部署 CLI 入口与视觉头验证工具 |
+| `scripts/real_rlpd/` | RLPD 的契约校验、专家/online 采集、离线标注与训练入口 |
 | `scripts/robot/` | 状态读取、回零、手动小幅运动 |
 | `scripts/camera/` | RealSense 预览、crop 采样、GelSight 启动 |
 | `scripts/calibration/` | 标定采集/求解、AprilTag 位姿验证 |
@@ -66,6 +67,7 @@
 | `tools/system/` | 实时内核、网络、主机验证脚本 |
 | `third_party/upstream_libfranka/` | vendored libfranka + pylibfranka（Git submodule） |
 | `third_party/pylibfranka_streaming_patch/` | pylibfranka 0.21.1 的 streaming 补丁包 |
+| `real_rlpd/` | 独立 PyTorch RLPD：策略 adapter、4D residual、Replay、ensemble SAC、teleop |
 | `docs/` | 本文件及各专题文档 |
 | `assets/` | AprilTag 打印资源 |
 | `TacEx/` | Isaac Lab 训练子项目（独立 Git 仓库，主仓库中 untracked） |
@@ -322,7 +324,9 @@ server9 的夹爪走 `ProcessGripperQueue`：独立 `spawn` 进程独占 Hand AP
 HIL 选择动作复用完全相同的 `clip_streaming_action`、commissioning limit、action scales、workspace、
 DLS 和 FCI 路径。仅当 worker 按期接受动作时才执行
 `ActionHistoryBuffer.update(selected_raw, selected_limited)`；因此下一次模型输入中的 processed
-history 是最终限幅后的实际接受组合动作。deadline miss 继续 hold/brake，且不更新 history。
+history 是最终限幅后的实际接受组合动作。deadline miss 令机械臂继续 hold/brake，且不更新 history；
+夹爪则保持最后一个已接受的速度意图，避免把单帧推理抖动误判成松键。只有超过
+`policy_watchdog_s` 仍没有接受新动作时，夹爪才进入 hold。
 
 ### 8.3 控制律
 
@@ -478,7 +482,9 @@ L2 幅度。checkpoint 校验失败时 residual=0 且默认在 worker 启动前�
 开关才允许继续采 base-only 数据。
 
 server9 夹爪使用单 owner 子进程：子进程内才构造 `franky.Gripper`，`move_async/grasp_async`、future
-`wait/get`、完成后的 `gripper.state` 和 `stop` 都在该进程串行执行。policy `command()` 只把带 generation
+`wait/get`、hold 后的 `gripper.state` 和同步 `stop` 都在该进程串行执行。`franky 1.1.x` 的
+`stop_async` 会先等待当前异步动作，不能用于抢占；因此 owner 按官方中断模式直接调用 `stop()`。反向命令
+在 stop 返回后立即启动，不等待只用于 hold 重定位的状态读取。policy `command()` 只把带 generation
 的最新目标宽度写入共享内存，`poll()` 只检查本地缓存错误；因此 native Hand 调用即使持有 GIL，也只会
 阻塞 owner 子进程。物体阻挡 close 后自动转换为 force grasp 的状态机不变，停止时先停机械臂 worker，
 再通知 Hand owner 在同一子进程执行 stop，避免并发调用。
@@ -486,6 +492,90 @@ server9 夹爪使用单 owner 子进程：子进程内才构造 `franky.Gripper`
 单个 RealSense pipeline 同时保留原始 640×480 packet 给离线 AprilTag，并将既有 crop/resize 224×224
 交给策略。Replay 通过 `run_dir/rollout_step` 关联现有 RGB、原始边界帧、GelSight、JSONL 和 step NPZ。
 Real-RL 数据根目录是 `real_rl_logs/`，不与通用部署的 `runs/` 混放。
+
+### 12.2 多策略 RLPD 4D residual
+
+RLPD 与 12.1 的旧 XYZ Residual SAC 完全分开，当前通过 adapter 支持三种 frozen base policy：0814
+单帧 GelSight、0911 Progress 单帧 GelSight 的 `encode_visual()`，以及 0823 三帧 GelSight 的
+`encode_visual_features()`。三条路径都在
+原模型的 `action_head` 之前得到完全相同的 feature contract：
+
+```text
+wrist visual[512] + left tactile[256] + right tactile[256]
+  + normalized proprio[15] + normalized history[4] = frozen feature[1043]
+                                    │
+base policy raw[4] -> commissioning limiter -> base_limited[4]
+                                    │
+                                    ├─ Actor state[1047] -> unit residual[4]
+                                    │                         × (2 × commissioning_limit)
+                                    └───────────────────────── +
+                                                              │
+                            最终既有 clip/workspace/DLS/FCI <-┘
+```
+
+`2 × commissioning_limit` 使任意两个已限幅 4D 动作之差都能表示，因此 expert 模式可以让人工 XYZ＋
+gripper 完全接管，同时保留 base action 作为 shadow 输入。组合发生在 base commissioning limiter 之后，
+候选动作随后再次经过相同的最终 limiter；RLPD 路径禁止 full-scale。XYZ 仍是机器人基座系，物理尺度仍为
+`[0.05,0.05,0.05] m`，gripper delta-width 尺度仍为 `0.01 m`。初始状态门禁、碰撞阈值、watchdog、
+停止时序、native worker 和 ABI-8 均未改变。
+
+RLPD config schema v2 将数据拆成策略无关的专家源、policy-specific 派生 expert Replay，以及 online
+rollout 三层：
+
+```text
+real_rlpd_data/expert/<episode>/                 # 专家源 episode
+real_rlpd_data/derived/<policy>/offline_expert.sqlite3
+real_rlpd_data/rollout/<policy>/<episode>/       # rollout episode
+real_rlpd_data/rollout/<policy>/online_policy.sqlite3
+```
+
+专家源由 `expert_dataset.py` 写入，保存同步的当前腕部 RGB、左右 GelSight 当前帧与每回合固定参考帧、
+proprio、action history、机器人观测，以及基座系 XYZ＋gripper delta-width 的专家绝对物理动作。源契约
+明确排除 base feature、base action 和 residual target；shadow model 的 kind/SHA 只作为采集 provenance。
+因此同一任务的专家源可以由另一 adapter 重新编码。采集时仍同步写入当前 base-policy 的 offline SQLite，
+它是为现有 trainer 准备的派生缓存；当前尚无从历史源 episode 批量重建该缓存的独立 CLI。
+
+Replay schema v1 继续按 base-policy contract 隔离派生 expert 与 online policy 两个 SQLite 文件。契约包括
+adapter ID、policy kind、模型 SHA、metadata SHA、1047D state、4D residual、动作尺度和 commissioning
+limit；不同策略、不同模型或不同限幅不能直接共用派生 Replay/checkpoint。每条 transition 保存当前/下一
+state、base/executed/residual action、TCP 位置、action timestamp 及离线 reward 字段。控制期间 collector
+只缓存 transition 和专家源数组；worker 和 Hand owner 停止后才写源 episode，并以单个事务写库，避免 I/O
+进入 30 Hz 路径。原始 D435 边界帧沿用 Real-RL 的离线 AprilTag 流程，只有 accepted 且满足
+`tag_t <= action_time < tag_t1` 的样本标为 trainable。
+标注器通过 `RewardFunction` 接口调用由 `reward_kind` 选择的实现；当前注册的
+`apriltag_reach_lift_success` 保持原 reach/lift/success/action-penalty 公式，后续任务 reward 不需要改
+Replay、collector 或 learner。当前 0823 的成功条件是物体相对 episode 初始高度严格超过 `0.05 m` 并连续
+检测到 3 帧；reward 参数属于 Replay/checkpoint contract，阈值不同的数据和 checkpoint 不得混用。
+collector 在 AprilTag preflight 前校验 Replay contract，不兼容时不会等待检测或启动控制。
+
+PyTorch learner 是 asymmetric SAC：Actor 只看 1047D state；10 个 Q 都额外看 object-relative XYZ＋height
+4D privileged state，Critic 隐层带 LayerNorm。每次 target 随机选择 2 个 Q 取 minimum，online 数据存在
+时 batch 严格按 offline/online 50:50 采样。一个 update group 包含 UTD=20 个 Critic update，随后只做
+一次 Actor 和 temperature update。首次训练默认 1000 group；后续只在 episode 已结束且离线标签完成后，
+按 checkpoint high-watermark 之后新增的 trainable online transition 更新。Normalizer 首次由 expert
+offline 数据拟合并随 checkpoint 冻结。部署 checkpoint 的模型/metadata/action contract 不匹配时，在
+worker 启动前 fail closed；随机 residual 还要求单独的显式开关。
+
+`configs/real_rlpd_0814.json`、`configs/real_rlpd_0823.json` 与
+`configs/real_rlpd_0911_progress.json` 共享专家源根目录，但使用各自独立的
+`derived/<policy>/`、`rollout/<policy>/` 和 `checkpoints/real_rlpd/<policy>/`；不会迁移或读取旧
+`real_rl_logs/replay.sqlite3` 或 `real_rlpd_runs/`。`rlpd/` 只是用户引入的参考实现，生产路径不 import 它。
+
+0911 另建 `tacex_rma_gelsight_size_buckets_progress_student_torchscript` kind 和
+`gelsight_reference_progress_single_frame_v1` adapter ID，避免与 0814 的 Replay/checkpoint 合并。其 metadata
+记录 Progress reward/terminal-success、GelSight v7 几何和真实历史帧行为审计；由于审计发现动作饱和与
+辅助接触输出塌缩，运行时将其标记为 `rlpd_only`，直接 base-policy 真机运动在 worker 启动前拒绝。
+RLPD 专家模式是四维人工全接管；online 模式必须先通过 residual checkpoint 的 model/metadata/reward
+完整契约校验。其离线成功边界为抬升 `0.035 m` 且连续检测 5 帧，派生 Replay 与 0814/0823 均不兼容。
+运行时把单 episode 限制在 150 policy step；RLPD 的 AprilTag 检测仍是停止后离线标注，所以提前成功
+需要操作者或外部监控停止，不使用已发生塌缩的辅助 contact logits 作为终止信号。
+
+0911 的 GelSight v7 最低点距 `panda_hand` 为 `0.1563 m`，减去 `O_T_EE` 已包含的 `0.1034 m` 后，
+workspace/日志附加偏移为 `tool_tcp_offset_ee_m.z=0.0529 m`。该值不改变 IK 命令点或动作坐标系。
+
+0823 的工具最低点距 `panda_hand` 为 `0.1613 m`；`O_T_EE` 已包含 `0.1034 m` 的 flange-to-EE 平移，
+因此 workspace/日志使用的附加 `tool_tcp_offset_ee_m.z` 是 `0.0579 m`。该偏移不改变 IK 命令点或策略
+动作坐标系。0823 workspace z 下界现为 `0.01 m`，与测试和 RLPD 真机门禁一致。
 
 `scripts/diagnostics/compare_sim_real_images.py` 是纯离线的外观对齐分析，不碰硬件：
 

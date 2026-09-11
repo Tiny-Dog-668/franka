@@ -23,6 +23,7 @@ from .e2e_bundle import (
     capture_gelsight_reference_frames,
     reject_evaluation_only_motion,
     _validate_tacex_rma_direct_action_student_contract,
+    _validate_tacex_rma_gelsight_size_buckets_progress_student_contract,
     _validate_tacex_rma_gelsight_size_buckets_student_contract,
     _validate_tacex_rma_gelsight_x040_three_frame_student_contract,
     _validate_tacex_rma_x040_wide_direct_action_student_contract,
@@ -37,6 +38,7 @@ from .hil import HILInputSnapshot, HILSettings, HILStepData, human_normalized_xy
 from .residual_runtime import ResidualDeploySettings
 from .real_rl.runtime import RealRLDeploySettings
 from .types import RobotAction, RobotObservation, print_error_wrench_report
+from real_rlpd.runtime import RLPDDeploySettings
 
 
 PANDA_JOINT_LOWER = np.asarray(
@@ -393,6 +395,28 @@ def validate_streaming_contract(
             "rma_gelsight_size_buckets_student_metadata_version": bundle.metadata.get(
                 "version"
             ),
+            "tactile_reference": "first_post_reset_frame_fixed_per_rollout",
+            "max_episode_length_steps": deployment_contract.get(
+                "max_episode_length_steps", 150
+            ),
+        }
+    if getattr(
+        bundle, "is_tacex_rma_gelsight_size_buckets_progress_student", False
+    ):
+        history_scale = np.asarray(config.model.history_scale, dtype=np.float32).reshape(-1)
+        _validate_tacex_rma_gelsight_size_buckets_progress_student_contract(
+            bundle, config, history_scale
+        )
+        deployment_contract = bundle.metadata.get("deployment_contract", {})
+        return {
+            "policy_frequency_hz": stream.policy_frequency_hz,
+            "ik_frequency_hz": stream.ik_frequency_hz,
+            "ticks_per_action": 2,
+            "rma_gelsight_size_buckets_progress_student_metadata_version": (
+                bundle.metadata.get("version")
+            ),
+            "behavior_profile": bundle.metadata.get("behavior_profile"),
+            "motion_authorization": bundle.metadata.get("motion_authorization"),
             "tactile_reference": "first_post_reset_frame_fixed_per_rollout",
             "max_episode_length_steps": deployment_contract.get(
                 "max_episode_length_steps", 150
@@ -1038,6 +1062,13 @@ def _run_policy_tick(
                 contact_force_n=contact_force_n,
                 **predict_kwargs,
             )
+    base_raw_action = np.asarray(raw_action, dtype=np.float32)
+    base_limited_action = clip_streaming_action(
+        base_raw_action, config, allow_full_scale
+    )
+    if getattr(bundle, "rlpd_runtime", None) is not None:
+        raw_action = bundle.apply_rlpd_post_limit(base_limited_action)
+        bundle.last_inference_info["rlpd"]["base_raw_action"] = base_raw_action.tolist()
     executed = clip_streaming_action(raw_action, config, allow_full_scale)
     action = streaming_robot_action(executed, config, desired_gripper_width)
     image_copy = np.asarray(image, dtype=np.uint8).copy()
@@ -1380,6 +1411,8 @@ def run_streaming_bundle_deploy(
     hil_settings: HILSettings | None = None,
     residual_settings: ResidualDeploySettings | None = None,
     real_rl_settings: RealRLDeploySettings | None = None,
+    rlpd_settings: RLPDDeploySettings | None = None,
+    rlpd_expert: bool = False,
     *,
     clock_ns: Callable[[], int] = time.monotonic_ns,
     sleep: Callable[[float], None] = time.sleep,
@@ -1404,6 +1437,8 @@ def run_streaming_bundle_deploy(
             hil_settings=hil_settings,
             residual_settings=residual_settings,
             real_rl_settings=real_rl_settings,
+            rlpd_settings=rlpd_settings,
+            rlpd_expert=rlpd_expert,
             clock_ns=clock_ns,
             sleep=sleep,
         )
@@ -1419,6 +1454,8 @@ def run_streaming_bundle_deploy(
         raise ValueError(
             "Real-RL currently requires streaming.backend='server9_joint_position'"
         )
+    if rlpd_settings is not None or rlpd_expert:
+        raise ValueError("RLPD requires streaming.backend='server9_joint_position'")
     run_dir = _make_run_dir(config)
     records: list[dict[str, Any]] = []
     images: list[np.ndarray | None] = []
@@ -1962,7 +1999,9 @@ def _policy_record(
         "_model_rgb": result.model_rgb,
         "observation_after": observation.to_dict(),
     }
-    if "real_rl" in result.inference_info and result.raw_image is not None:
+    if (
+        "real_rl" in result.inference_info or "rlpd" in result.inference_info
+    ) and result.raw_image is not None:
         record["_raw_image"] = result.raw_image
         record["_offline_boundary_camera_frame"] = dict(result.camera_metadata)
     if result.tactile_images:
@@ -2025,4 +2064,26 @@ def _policy_record(
                 "real_rl_fallback_reason": real_rl_info["fallback_reason"],
             }
         )
+    rlpd_info = result.inference_info.get("rlpd")
+    if rlpd_info is not None:
+        if not episode_id:
+            raise ValueError("RLPD policy records require a non-empty episode_id")
+        record.update({
+            "episode_id": episode_id,
+            "step_id": step_index,
+            "base_limited_action": list(rlpd_info["base_limited_action"]),
+            "unit_residual_action": list(rlpd_info["unit_residual_action"]),
+            "residual_normalized_action": list(
+                rlpd_info["residual_normalized_action"]
+            ),
+            "rlpd_mode": str(rlpd_info["mode"]),
+            "rlpd_checkpoint_sha256": rlpd_info["checkpoint_sha256"],
+            "rlpd_expert_takeover": bool(rlpd_info.get("expert_takeover", False)),
+        })
+        if rlpd_info.get("expert_takeover"):
+            record["rlpd_expert_input"] = {
+                "pressed_keys": list(rlpd_info.get("pressed_keys", ())),
+                "sampled_monotonic_ns": rlpd_info.get("sampled_monotonic_ns"),
+                "focused": bool(rlpd_info.get("focused", False)),
+            }
     return record
