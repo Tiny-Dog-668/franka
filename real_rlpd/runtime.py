@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -91,6 +92,7 @@ class RLPDPolicyRuntime:
 
     def contract(self) -> dict[str, Any]:
         base = self.adapter.contract.to_dict()
+        reward_contract = json.loads(json.dumps(asdict(self.settings.config.reward)))
         base.update({
             "state_contract": "policy_feature_1043_plus_base_limited_action_4",
             "action_contract": "unit_residual_4_times_2x_commissioning_limit",
@@ -98,7 +100,7 @@ class RLPDPolicyRuntime:
             "commissioning_limit": float(self.settings.commissioning_limit),
             "action_scales": [0.05, 0.05, 0.05, 0.01],
             "reward_kind": self.settings.config.reward_kind,
-            "reward": asdict(self.settings.config.reward),
+            "reward": reward_contract,
         })
         return base
 

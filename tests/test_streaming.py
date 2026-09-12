@@ -467,6 +467,54 @@ class ContractAndSchedulingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Policy watchdog exceeded"):
             streaming.policy_result_is_timely(100_000_001, period, 100_000_000)
 
+    def test_direct_bc_warmup_covers_zero_and_nonzero_cuda_paths(self) -> None:
+        class FakeBundle:
+            metadata = {"deployment_variant": "frozen_encoder_direct_bc"}
+            history_dim = 4
+            proprio_dim = 15
+            contact_force_dim = 0
+            rgb_input_shape = (3, 8, 8, 3)
+            gelsight_input_shapes = {
+                "gsmini_left_rgb": (4, 6, 3),
+                "gsmini_right_rgb": (4, 6, 3),
+                "gsmini_left_reference_rgb": (4, 6, 3),
+                "gsmini_right_reference_rgb": (4, 6, 3),
+            }
+
+            def __init__(self) -> None:
+                self.pixel_values: list[int] = []
+
+            def predict(self, _history, _proprio, wrist_rgb, *_args, **_kwargs):
+                self.pixel_values.append(int(wrist_rgb[0, 0, 0, 0]))
+                return np.zeros(4, dtype=np.float32)
+
+        bundle = FakeBundle()
+        report = streaming.warm_up_bundle_policy(bundle)
+        self.assertEqual(bundle.pixel_values, [0, 127])
+        self.assertEqual(report["iterations"], 2)
+        self.assertEqual(report["pixel_values"], [0, 127])
+
+    def test_existing_policy_keeps_single_zero_warmup(self) -> None:
+        class FakeBundle:
+            metadata = {}
+            history_dim = 4
+            proprio_dim = 15
+            contact_force_dim = 0
+            rgb_input_shape = (8, 8, 3)
+            gelsight_input_shapes: dict[str, tuple[int, int, int]] = {}
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def predict(self, *_args, **_kwargs):
+                self.calls += 1
+                return np.zeros(4, dtype=np.float32)
+
+        bundle = FakeBundle()
+        report = streaming.warm_up_bundle_policy(bundle)
+        self.assertEqual(bundle.calls, 1)
+        self.assertEqual(report["pixel_values"], [0])
+
     def test_runtime_rejects_unpatched_pylibfranka(self) -> None:
         module = types.SimpleNamespace(
             __version__="0.21.1",

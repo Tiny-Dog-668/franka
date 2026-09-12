@@ -1,16 +1,16 @@
 {
   "schema_version": 2,
-  "base_policy_config": "configs/e2e_bundle_real_exported_0823_gelsight.json",
-  "checkpoint_dir": "checkpoints/real_rlpd/0823",
+  "base_policy_config": "configs/e2e_bundle_real_exported_0912_gelsight_progress.json",
+  "checkpoint_dir": "checkpoints/real_rlpd/0912_progress_observable_absolute_v1",
   "data": {
-    "expert_dir": "real_rlpd_data/0823/expert",
-    "rollout_dir": "real_rlpd_data/0823/rollout"
+    "expert_dir": "real_rlpd_data/0912/expert",
+    "rollout_dir": "real_rlpd_data/0912/rollout"
   },
-  "seed": 23,
-  "reward_kind": "apriltag_reach_lift_success",
+  "seed": 12,
+  "reward_kind": "apriltag_x040_observable_absolute_v1",
   "replay": {
-    "offline_path": "real_rlpd_data/0823/derived/offline_expert.sqlite3",
-    "online_path": "real_rlpd_data/0823/rollout/online_policy.sqlite3"
+    "offline_path": "real_rlpd_data/0912/derived/offline_expert_observable_absolute_v1.sqlite3",
+    "online_path": "real_rlpd_data/0912/rollout/online_policy_observable_absolute_v1.sqlite3"
   },
   "apriltag": {
     "calibration_report": "runs_old/20260802_204111_eye_to_hand/reports/20260802_205349/calibration_report.json",
@@ -28,12 +28,21 @@
     "offline_roi_expansion": 3.0
   },
   "reward": {
-    "k_reach": 10.0,
-    "k_lift": 20.0,
-    "k_success": 10.0,
-    "k_action": 0.01,
-    "success_height_m": 0.05,
-    "success_consecutive_detections": 3
+    "reach_sigma_m": 0.1,
+    "reach_weight": 2.5,
+    "lift_weight": 2.5,
+    "success_weight": 1000.0,
+    "action_magnitude_weight": 0.05,
+    "action_rate_weight": 0.05,
+    "success_height_m": 0.035,
+    "success_consecutive_detections": 5,
+    "drop_arm_height_m": 0.02,
+    "drop_trigger_height_m": 0.005,
+    "drop_penalty": -10.0,
+    "table_height_base_m": 0.0,
+    "table_clearance_min_m": 0.01,
+    "table_clearance_penalty": -10.0,
+    "grasp_center_offset_from_tool_tcp_m": [0.0, 0.0, 0.0171]
   },
   "residual": {
     "action_dim": 4,
@@ -41,8 +50,8 @@
     "span_multiplier": 2.0
   },
   "teleop": {
-    "xyz_speed_m_s": 0.05,
-    "gripper_speed_m_s": 0.03
+    "xyz_speed_m_s": 0.2,
+    "gripper_speed_m_s": 0.3
   },
   "algorithm": {
     "hidden_dims": [256, 256],

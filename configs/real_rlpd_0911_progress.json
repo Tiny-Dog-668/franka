@@ -3,14 +3,14 @@
   "base_policy_config": "configs/e2e_bundle_real_exported_0911_gelsight_progress.json",
   "checkpoint_dir": "checkpoints/real_rlpd/0911_progress",
   "data": {
-    "expert_dir": "real_rlpd_data/expert",
-    "rollout_dir": "real_rlpd_data/rollout/0911_progress"
+    "expert_dir": "real_rlpd_data/0911/expert",
+    "rollout_dir": "real_rlpd_data/0911/rollout"
   },
   "seed": 11,
   "reward_kind": "apriltag_reach_lift_success",
   "replay": {
-    "offline_path": "real_rlpd_data/derived/0911_progress/offline_expert.sqlite3",
-    "online_path": "real_rlpd_data/rollout/0911_progress/online_policy.sqlite3"
+    "offline_path": "real_rlpd_data/0911/derived/offline_expert.sqlite3",
+    "online_path": "real_rlpd_data/0911/rollout/online_policy.sqlite3"
   },
   "apriltag": {
     "calibration_report": "runs_old/20260802_204111_eye_to_hand/reports/20260802_205349/calibration_report.json",

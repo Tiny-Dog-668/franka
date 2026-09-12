@@ -16,6 +16,7 @@ from .e2e_bundle import (
     ActionHistoryBuffer,
     BundleDeployConfig,
     BundleTorchScriptPolicy,
+    GELSIGHT_X040_PROGRESS_THREE_FRAME_STUDENT_TASK,
     WristRGBHistoryBuffer,
     _make_camera,
     _make_run_dir,
@@ -371,7 +372,7 @@ def validate_streaming_contract(
         _validate_tacex_rma_gelsight_x040_three_frame_student_contract(
             bundle, config, history_scale
         )
-        return {
+        report = {
             "policy_frequency_hz": stream.policy_frequency_hz,
             "ik_frequency_hz": stream.ik_frequency_hz,
             "ticks_per_action": 2,
@@ -380,8 +381,15 @@ def validate_streaming_contract(
             ),
             "rgb_history": "three_frames_oldest_to_newest",
             "tactile_reference": "first_post_reset_frame_fixed_per_rollout",
-            "max_episode_length_steps": 150,
         }
+        if (
+            bundle.metadata.get("task")
+            == GELSIGHT_X040_PROGRESS_THREE_FRAME_STUDENT_TASK
+        ):
+            report["training_episode_length_steps"] = 150
+        else:
+            report["max_episode_length_steps"] = 150
+        return report
     if getattr(bundle, "is_tacex_rma_gelsight_size_buckets_student", False):
         history_scale = np.asarray(config.model.history_scale, dtype=np.float32).reshape(-1)
         _validate_tacex_rma_gelsight_size_buckets_student_contract(
@@ -418,8 +426,8 @@ def validate_streaming_contract(
             "behavior_profile": bundle.metadata.get("behavior_profile"),
             "motion_authorization": bundle.metadata.get("motion_authorization"),
             "tactile_reference": "first_post_reset_frame_fixed_per_rollout",
-            "max_episode_length_steps": deployment_contract.get(
-                "max_episode_length_steps", 150
+            "training_episode_length_steps": deployment_contract.get(
+                "training_episode_length_steps"
             ),
         }
     if getattr(bundle, "is_tacex_rma_student", False):
@@ -1102,6 +1110,81 @@ def _run_policy_tick(
     )
 
 
+def warm_up_bundle_policy(bundle: BundleTorchScriptPolicy) -> dict[str, Any]:
+    """Initialize the exact inference path before any policy deadline applies.
+
+    The 0912 Direct BC TorchScript/CUDA graph has two observable lazy-start
+    costs on this deployment host: the first all-zero invocation and the first
+    non-zero image invocation. Both must happen before the first timed camera
+    boundary; otherwise a safe preview aborts at step zero despite subsequent
+    inference taking only a few milliseconds.
+    """
+
+    pixel_values = [0]
+    if (
+        getattr(bundle, "metadata", {}).get("deployment_variant")
+        == "frozen_encoder_direct_bc"
+    ):
+        pixel_values.append(127)
+
+    action_history = np.zeros(bundle.history_dim, dtype=np.float32)
+    proprio = np.zeros(bundle.proprio_dim, dtype=np.float32)
+    contact_force = (
+        np.zeros(getattr(bundle, "contact_force_dim", 0), dtype=np.float32)
+        if getattr(bundle, "contact_force_dim", 0)
+        else None
+    )
+    elapsed_ms: list[float] = []
+    for pixel_value in pixel_values:
+        rgb_input_shape = getattr(bundle, "rgb_input_shape", None)
+        if rgb_input_shape is None:
+            rgb_input_shape = (bundle.rgb_height, bundle.rgb_width, 3)
+        wrist_rgb = np.full(rgb_input_shape, pixel_value, dtype=np.uint8)
+        tactile = {
+            name: np.full(shape, pixel_value, dtype=np.uint8)
+            for name, shape in getattr(bundle, "gelsight_input_shapes", {}).items()
+        }
+        started_ns = time.perf_counter_ns()
+        if tactile:
+            bundle.predict(
+                action_history,
+                proprio,
+                wrist_rgb,
+                tactile["gsmini_left_rgb"],
+                tactile["gsmini_right_rgb"],
+                gsmini_left_reference_rgb=tactile.get(
+                    "gsmini_left_reference_rgb"
+                ),
+                gsmini_right_reference_rgb=tactile.get(
+                    "gsmini_right_reference_rgb"
+                ),
+                contact_force_n=contact_force,
+            )
+        elif contact_force is None:
+            bundle.predict(action_history, proprio, wrist_rgb)
+        else:
+            bundle.predict(
+                action_history,
+                proprio,
+                wrist_rgb,
+                contact_force_n=contact_force,
+            )
+        elapsed_ms.append((time.perf_counter_ns() - started_ns) / 1e6)
+
+    report = {
+        "iterations": len(pixel_values),
+        "pixel_values": pixel_values,
+        "elapsed_ms": elapsed_ms,
+    }
+    if len(pixel_values) > 1:
+        print(
+            "Policy CUDA warmup completed before control: "
+            + ", ".join(f"{value:.1f} ms" for value in elapsed_ms),
+            flush=True,
+        )
+    return report
+
+
 def apply_hil_action(
     result: _PolicyResult,
     snapshot: HILInputSnapshot,
@@ -1554,47 +1637,9 @@ def run_streaming_bundle_deploy(
                 if getattr(bundle, "uses_wrist_rgb_history", False) is True
                 else None
             )
-            # Camera warm-up is completed by construction. Exercise the exact
-            # TorchScript path once before starting the active control connection.
-            tactile_zeros = {
-                name: np.zeros(shape, dtype=np.uint8)
-                for name, shape in getattr(bundle, "gelsight_input_shapes", {}).items()
-            }
-            warmup_args = (
-                np.zeros(bundle.history_dim, dtype=np.float32),
-                np.zeros(bundle.proprio_dim, dtype=np.float32),
-                np.zeros(
-                    getattr(
-                        bundle,
-                        "rgb_input_shape",
-                        (bundle.rgb_height, bundle.rgb_width, 3),
-                    ),
-                    dtype=np.uint8,
-                ),
-            )
-            warmup_contact_force = (
-                np.zeros(getattr(bundle, "contact_force_dim", 0), dtype=np.float32)
-                if getattr(bundle, "contact_force_dim", 0)
-                else None
-            )
-            if tactile_zeros:
-                bundle.predict(
-                    *warmup_args,
-                    tactile_zeros["gsmini_left_rgb"],
-                    tactile_zeros["gsmini_right_rgb"],
-                    gsmini_left_reference_rgb=tactile_zeros.get(
-                        "gsmini_left_reference_rgb"
-                    ),
-                    gsmini_right_reference_rgb=tactile_zeros.get(
-                        "gsmini_right_reference_rgb"
-                    ),
-                    contact_force_n=warmup_contact_force,
-                )
-            else:
-                if warmup_contact_force is None:
-                    bundle.predict(*warmup_args)
-                else:
-                    bundle.predict(*warmup_args, contact_force_n=warmup_contact_force)
+            # Camera warm-up is completed by construction. Exercise every
+            # required TorchScript/CUDA startup path before policy deadlines.
+            timing["policy_warmup"] = warm_up_bundle_policy(bundle)
             first_policy = _run_policy_tick(
                 bundle,
                 camera,
@@ -2068,22 +2113,37 @@ def _policy_record(
     if rlpd_info is not None:
         if not episode_id:
             raise ValueError("RLPD policy records require a non-empty episode_id")
+        expert_takeover = bool(rlpd_info.get("expert_takeover", False))
         record.update({
             "episode_id": episode_id,
             "step_id": step_index,
             "base_limited_action": list(rlpd_info["base_limited_action"]),
-            "unit_residual_action": list(rlpd_info["unit_residual_action"]),
-            "residual_normalized_action": list(
-                rlpd_info["residual_normalized_action"]
-            ),
             "rlpd_mode": str(rlpd_info["mode"]),
             "rlpd_checkpoint_sha256": rlpd_info["checkpoint_sha256"],
-            "rlpd_expert_takeover": bool(rlpd_info.get("expert_takeover", False)),
+            "rlpd_expert_takeover": expert_takeover,
         })
-        if rlpd_info.get("expert_takeover"):
+        if expert_takeover:
+            # Expert takeover is an absolute 4D command. The shadow runtime's
+            # zero residual is deliberately removed by _apply_rlpd_expert_action
+            # and must not be serialized as an expert label.
+            record.update({
+                "expert_requested_action": list(
+                    rlpd_info["expert_requested_action"]
+                ),
+                "expert_limited_action": list(
+                    rlpd_info["expert_limited_action"]
+                ),
+            })
             record["rlpd_expert_input"] = {
                 "pressed_keys": list(rlpd_info.get("pressed_keys", ())),
                 "sampled_monotonic_ns": rlpd_info.get("sampled_monotonic_ns"),
                 "focused": bool(rlpd_info.get("focused", False)),
             }
+        else:
+            record.update({
+                "unit_residual_action": list(rlpd_info["unit_residual_action"]),
+                "residual_normalized_action": list(
+                    rlpd_info["residual_normalized_action"]
+                ),
+            })
     return record

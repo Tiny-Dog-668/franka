@@ -1,0 +1,353 @@
+{
+  "kind": "tacex_rma_gelsight_x040_dr_three_frame_student_torchscript",
+  "version": 1,
+  "task": "TacEx-Sim2Real-Cube-Real-Alignment-RMA-GelSight-X040-Progress-Three-Frame-Direct-Action-Student-DR-v0",
+  "student_checkpoint": "/data2/skrl/sim2real_cube_real_alignment_rma_gelsight_x040_progress_three_frame_student/2026-09-11_22-20-11_distillation/checkpoints/student_0100000.pt",
+  "student_checkpoint_sha256": "5114d7d78490d8813b516721fb2c89b113a26e4e316053c4351e99f08709183f",
+  "torchscript_sha256": "c6456c7474d60735a9abab21436911c896fb222413708bf3e404db6576abcd67",
+  "input_order": [
+    "wrist_rgb_history",
+    "proprio_obs",
+    "action_history",
+    "gsmini_left_rgb",
+    "gsmini_right_rgb",
+    "gsmini_left_reference_rgb",
+    "gsmini_right_reference_rgb"
+  ],
+  "input_signature": {
+    "input_order": [
+      "wrist_rgb_history",
+      "proprio_obs",
+      "action_history",
+      "gsmini_left_rgb",
+      "gsmini_right_rgb",
+      "gsmini_left_reference_rgb",
+      "gsmini_right_reference_rgb"
+    ],
+    "wrist_rgb_history": [
+      3,
+      224,
+      224,
+      3
+    ],
+    "proprio_obs": [
+      15
+    ],
+    "action_history": [
+      4
+    ],
+    "tactile_delta": "signed_float32_current_minus_reference_div_255",
+    "runtime_output": {
+      "action": [
+        4
+      ],
+      "left_right_contact_probability": [
+        2
+      ],
+      "cube_position_root_m": [
+        3
+      ]
+    },
+    "training_only_labels": [
+      "rma_cube_pos",
+      "rma_contact_state"
+    ],
+    "gsmini_left_rgb": [
+      96,
+      128,
+      3
+    ],
+    "gsmini_right_rgb": [
+      96,
+      128,
+      3
+    ],
+    "gsmini_left_reference_rgb": [
+      96,
+      128,
+      3
+    ],
+    "gsmini_right_reference_rgb": [
+      96,
+      128,
+      3
+    ]
+  },
+  "output_signature": {
+    "action": [
+      4
+    ],
+    "left_right_contact_probability": [
+      2
+    ],
+    "cube_position_root_m": [
+      3
+    ]
+  },
+  "student_model_contract": {
+    "model_version": 3,
+    "runtime_input_order": [
+      "wrist_rgb_history",
+      "proprio_obs",
+      "action_history",
+      "gsmini_left_rgb",
+      "gsmini_right_rgb",
+      "gsmini_left_reference_rgb",
+      "gsmini_right_reference_rgb"
+    ],
+    "runtime_output": {
+      "action": [
+        4
+      ],
+      "left_right_contact_probability": [
+        2
+      ],
+      "cube_position_root_m": [
+        3
+      ]
+    },
+    "visual_encoder": "shared_resnet18_layer4_global_average_pool_per_frame",
+    "frame_order": "oldest_to_newest",
+    "temporal_fusion": [
+      1536,
+      512
+    ],
+    "tactile_feature": "shared_cnn_signed_current_minus_reference_256_per_side",
+    "actor_feature_order": [
+      "temporal_visual[512]",
+      "left_tactile[256]",
+      "right_tactile[256]",
+      "normalized_proprio[15]",
+      "normalized_action_history[4]"
+    ],
+    "actor_feature_dim": 1043,
+    "action_head": [
+      1043,
+      256,
+      256,
+      4
+    ],
+    "position_head": [
+      512,
+      256,
+      128,
+      3
+    ],
+    "position_head_output": "unbounded_normalized_robot_root_xyz",
+    "contact_head": "shared_tactile_feature_256_to_logit_per_side",
+    "heatmap": "absent",
+    "runtime_privileged_inputs": [],
+    "position_normalization": "x040_wide_robot_root_xyz"
+  },
+  "validation": {
+    "cpu_batch_1_max_abs_error": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "cpu_batch_8_max_abs_error": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "cuda_validation": true,
+  "deployment_variant": "frozen_encoder_direct_bc",
+  "base_policy_model_path": "/home/td/franka/checkpoint/0912/gelsight_x040_three_frame_student_0100000.pt",
+  "base_policy_model_sha256": "be2c9ad7d97daf508d89a75b696314a2ef38112f18f988fbbd1629fc08a96735",
+  "direct_bc": {
+    "format_version": 1,
+    "input": "frozen_actor_feature_1043",
+    "output": "commissioning_limited_direct_action_4",
+    "action_limit": 0.1,
+    "loss": "smooth_l1_on_expert_executed_action_div_0.1",
+    "hidden_dims": [
+      256,
+      256
+    ],
+    "balanced_action_group_sampling": false,
+    "replay_path": "/home/td/franka/real_rlpd_data/0912/derived/offline_expert_observable_absolute_v1.sqlite3",
+    "replay_contract": {
+      "action_contract": "unit_residual_4_times_2x_commissioning_limit",
+      "action_dim": 4,
+      "action_scales": [
+        0.05,
+        0.05,
+        0.05,
+        0.01
+      ],
+      "adapter_id": "gelsight_reference_progress_three_frame_v1",
+      "commissioning_limit": 0.1,
+      "composition": "post_commissioning_then_final_existing_safety_clip",
+      "feature_dim": 1043,
+      "metadata_sha256": "76238dfef3f9318157945016191c834298a3e483a521122f33b0ad8c5f14e763",
+      "model_sha256": "be2c9ad7d97daf508d89a75b696314a2ef38112f18f988fbbd1629fc08a96735",
+      "policy_kind": "tacex_rma_gelsight_x040_dr_three_frame_student_torchscript",
+      "reward": {
+        "action_magnitude_weight": 0.05,
+        "action_rate_weight": 0.05,
+        "drop_arm_height_m": 0.02,
+        "drop_penalty": -10.0,
+        "drop_trigger_height_m": 0.005,
+        "grasp_center_offset_from_tool_tcp_m": [
+          0.0,
+          0.0,
+          0.0171
+        ],
+        "lift_weight": 2.5,
+        "reach_sigma_m": 0.1,
+        "reach_weight": 2.5,
+        "success_consecutive_detections": 5,
+        "success_height_m": 0.035,
+        "success_weight": 1000.0,
+        "table_clearance_min_m": 0.01,
+        "table_clearance_penalty": -10.0,
+        "table_height_base_m": 0.0
+      },
+      "reward_kind": "apriltag_x040_observable_absolute_v1",
+      "state_contract": "policy_feature_1043_plus_base_limited_action_4"
+    },
+    "best_epoch": 30,
+    "metrics": {
+      "train": {
+        "smooth_l1_unit": 0.0037826120387762785,
+        "mae_unit_per_axis": [
+          0.020976776257157326,
+          0.021847080439329147,
+          0.043182123452425,
+          0.06432831287384033
+        ],
+        "mae_action_per_axis": [
+          0.0020976767409592867,
+          0.0021847065072506666,
+          0.0043182168155908585,
+          0.006432816386222839
+        ],
+        "target_mean_action": [
+          -0.00030686435638926923,
+          0.0024974560365080833,
+          -0.053586944937705994,
+          0.006203501485288143
+        ],
+        "predicted_mean_action": [
+          -0.00015186982636805624,
+          0.001265915809199214,
+          -0.053705718368291855,
+          0.005010716151446104
+        ],
+        "nonzero_target_sign_accuracy_per_axis": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "predicted_abs_ge_0_095_fraction": 0.7423385897054449
+      },
+      "validation": {
+        "smooth_l1_unit": 0.005350632593035698,
+        "mae_unit_per_axis": [
+          0.021098922938108444,
+          0.03229394927620888,
+          0.07229908555746078,
+          0.09971586614847183
+        ],
+        "mae_action_per_axis": [
+          0.0021098912693560123,
+          0.0032293961849063635,
+          0.007229907438158989,
+          0.00997159443795681
+        ],
+        "target_mean_action": [
+          0.0,
+          0.0014917864464223385,
+          -0.035352569073438644,
+          -0.021518973633646965
+        ],
+        "predicted_mean_action": [
+          0.001308566890656948,
+          0.003226466244086623,
+          -0.03267798200249672,
+          -0.015601416118443012
+        ],
+        "nonzero_target_sign_accuracy_per_axis": [
+          null,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "predicted_abs_ge_0_095_fraction": 0.4810126582278481
+      },
+      "test": {
+        "smooth_l1_unit": 0.007487696595489979,
+        "mae_unit_per_axis": [
+          0.0258313100785017,
+          0.029195038601756096,
+          0.054073430597782135,
+          0.11876627802848816
+        ],
+        "mae_action_per_axis": [
+          0.002583129797130823,
+          0.002919502556324005,
+          0.005407343618571758,
+          0.011876625008881092
+        ],
+        "target_mean_action": [
+          -0.0038269010838121176,
+          0.0017395000904798508,
+          -0.05261443927884102,
+          -0.0003690034500323236
+        ],
+        "predicted_mean_action": [
+          -0.0033284735400229692,
+          0.000621955725364387,
+          -0.052238691598176956,
+          0.0010444564977660775
+        ],
+        "nonzero_target_sign_accuracy_per_axis": [
+          1.0,
+          0.9,
+          1.0,
+          1.0
+        ],
+        "predicted_abs_ge_0_095_fraction": 0.8431734317343174
+      }
+    },
+    "split": {
+      "train": [
+        "20260912_140138_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_140255_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_141730_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_141841_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_142427_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_143200_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_143440_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_143610_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_143959_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_144110_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_144255_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_144412_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_144529_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_144639_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_144807_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_144916_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_145026_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_145136_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_145232_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_145354_expert_e2e_bundle_real_exported_0912_gelsight_progress"
+      ],
+      "validation": [
+        "20260912_143736_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_143046_expert_e2e_bundle_real_exported_0912_gelsight_progress"
+      ],
+      "test": [
+        "20260912_141154_expert_e2e_bundle_real_exported_0912_gelsight_progress",
+        "20260912_143847_expert_e2e_bundle_real_exported_0912_gelsight_progress"
+      ]
+    }
+  },
+  "direct_bc_cuda_max_abs_error": [
+    4.738569259643555e-05,
+    5.7220458984375e-06,
+    4.9855560064315796e-05
+  ]
+}

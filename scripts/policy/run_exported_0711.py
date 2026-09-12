@@ -545,6 +545,8 @@ def _run_deploy(args: argparse.Namespace) -> int:
     metadata = json.loads(Path(config.model.metadata_path).read_text(encoding="utf-8"))
     policy_name = metadata.get("task") or metadata.get("kind", "unknown")
     print(f"Policy task: {policy_name}")
+    if metadata.get("deployment_variant") is not None:
+        print(f"Deployment variant: {metadata['deployment_variant']}")
     print(f"Config: {args.config}")
     print(f"Model: {config.model.model_path}")
     print(f"Inference device: {config.model.device}")
@@ -565,7 +567,17 @@ def _run_deploy(args: argparse.Namespace) -> int:
             for name in input_order
         )
     )
-    print("Model outputs: [dx, dy, dz, gripper]")
+    output_signature = metadata.get("output_signature", {})
+    if isinstance(output_signature, dict) and output_signature:
+        print(
+            "Model outputs: "
+            + ", ".join(
+                f"{name}[{','.join(str(value) for value in shape)}]"
+                for name, shape in output_signature.items()
+            )
+        )
+    else:
+        print("Model outputs: [dx, dy, dz, gripper]")
     print(f"Control mode: {config.control_mode}")
     if config.tactile_camera.enabled:
         print(

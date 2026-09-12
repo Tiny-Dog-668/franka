@@ -7,7 +7,8 @@
 
 - 0814 单帧 RGB＋双 GelSight policy；
 - 0823 三帧 RGB＋双 GelSight policy；
-- 0911 Progress 单帧 RGB＋双 GelSight policy（仅作为 RLPD base）；
+- 0911 Progress 单帧 RGB＋双 GelSight policy（支持直接部署和 RLPD base）；
+- 0912 Progress 三帧 RGB＋双 GelSight policy（独立 Replay/checkpoint contract）；
 - XYZ＋gripper 四维 residual action；
 - 人工专家全接管的 offline 数据采集；
 - policy checkpoint 控制的 online 数据采集；
@@ -15,8 +16,9 @@
 - AprilTag 离线 reward 和 privileged critic state。
 
 当前默认配置和命令入口使用 **0823 三帧策略**。0814 仍保留用于检查旧数据和旧 checkpoint。0911
-使用独立的 `gelsight_reference_progress_single_frame_v1` adapter ID；其离线行为审计未通过直接运动门禁，
-因此只能用于专家全接管或已校验的 RLPD residual checkpoint，不能作为裸 base policy 控制真机。
+使用独立的 `gelsight_reference_progress_single_frame_v1` adapter ID；0912 使用
+`gelsight_reference_progress_three_frame_v1`，通过 metadata task 与旧 0823 三帧策略隔离。0911 metadata 保留离线行为审计告警，并在
+操作者确认饱和动作符合简单仿真任务预期后允许直接部署和 RLPD，二者仍使用同一套动作与安全契约。
 
 ## 1. 核心数据流
 
@@ -139,33 +141,38 @@ scripts/real_rlpd/run_rlpd.py
 
 ## 5. 专家源数据、派生 Replay 与 rollout 隔离
 
-数据分为三层：
+数据按策略日期隔离，每个命名空间内再分为三层：
 
-- `real_rlpd_data/expert/`：策略无关的专家源 episode；
-- `real_rlpd_data/derived/<policy>/`：针对某个 frozen base policy 生成的专家 residual Replay；
-- `real_rlpd_data/rollout/<policy>/`：该 residual checkpoint 控制产生的 rollout episode 和 online Replay。
+- `real_rlpd_data/<policy>/expert/`：该任务采集的策略无关专家源 episode；
+- `real_rlpd_data/<policy>/derived/`：针对该 frozen base policy 生成的专家 residual Replay；
+- `real_rlpd_data/<policy>/rollout/`：该 residual checkpoint 控制产生的 rollout episode 和 online Replay。
 
 默认布局为：
 
 ```text
 real_rlpd_data/
-├── expert/<timestamp>_expert_.../
-│   ├── expert_manifest.json
-│   ├── expert_boundaries.jsonl
-│   ├── expert_actions.jsonl
-│   ├── expert_observations/
-│   └── raw_rgb/
-├── derived/0823/offline_expert.sqlite3
-├── derived/0911_progress/offline_expert.sqlite3
-├── rollout/0823/
-    ├── <timestamp>_rollout_.../
-    └── online_policy.sqlite3
-└── rollout/0911_progress/
+├── 0912/
+│   ├── expert/<timestamp>_expert_.../
+│   │   ├── expert_manifest.json
+│   │   ├── expert_boundaries.jsonl
+│   │   ├── expert_actions.jsonl
+│   │   ├── expert_observations/
+│   │   └── raw_rgb/
+│   ├── derived/offline_expert.sqlite3
+│   └── rollout/
+│       ├── <timestamp>_rollout_.../
+│       └── online_policy.sqlite3
+└── 0913/...
+├── rollout/0911_progress/
+│   ├── <timestamp>_rollout_.../
+│   └── online_policy.sqlite3
+└── rollout/0912_progress/
     ├── <timestamp>_rollout_.../
     └── online_policy.sqlite3
 
 checkpoints/real_rlpd/0823/
 checkpoints/real_rlpd/0911_progress/
+checkpoints/real_rlpd/0912_progress/
 ```
 
 专家源的 `expert_action_physical_delta_m` 是 canonical 标签，顺序为基座系 XYZ 加 gripper 总宽度增量；
@@ -218,7 +225,7 @@ checkpoint 已被根目录 `.gitignore` 忽略。
   --device cuda:0
 ```
 
-0911 Progress（RLPD-only）：
+0911 Progress：
 
 ```bash
 .venv/bin/python scripts/real_rlpd/run_rlpd.py validate \
@@ -228,8 +235,29 @@ checkpoint 已被根目录 `.gitignore` 忽略。
 
 0911 后续专家采集、训练和 online 采集命令与 0823 相同，只需替换 config；其派生数据和 checkpoint
 自动写入 `0911_progress` 独立目录。成功标注使用抬升 `0.035 m`、连续 5 次有效 AprilTag 检测，和
-Progress 训练终止契约一致。运行时拒绝超过 150 step；AprilTag reward 当前仍在控制结束后离线标注，
-因此成功时由操作者或外部监控停止，而不是依赖 base policy 的辅助 contact logits。
+Progress 训练终止契约一致。训练时的 150 step horizon 仅作为 provenance，不限制直接部署或 RLPD 的
+`--steps`；AprilTag reward 当前仍在控制结束后离线标注，因此成功时由操作者或外部监控停止，而不是
+依赖 base policy 的辅助 contact logits。
+
+0912 Progress：
+
+```bash
+.venv/bin/python scripts/real_rlpd/run_rlpd.py validate \
+  --config configs/real_rlpd_0912_progress.json \
+  --device cuda:0
+```
+
+0912 后续命令使用同一入口并指定 `configs/real_rlpd_0912_progress.json`；派生 Replay、online Replay
+和 checkpoint 均位于 `0912_progress` 独立命名空间，reward 同样使用 `0.035 m` 和连续 5 次检测。
+
+0912 另提供 `configs/real_rlpd_0912_progress_observable_absolute.json`。它保留原配置和数据，使用独立的
+`apriltag_x040_observable_absolute_v1` reward、Replay 和 checkpoint 路径。先用 CPU 验证：
+
+```bash
+.venv/bin/python scripts/real_rlpd/run_rlpd.py validate \
+  --config configs/real_rlpd_0912_progress_observable_absolute.json \
+  --device cpu
+```
 
 `validate` 不连接机器人和相机。它会加载实际 TorchScript，校验 policy metadata、feature API、模型哈希，
 并验证从 1043D feature 重新计算的 base action 与模型输出一致。
@@ -318,7 +346,7 @@ tag_t.capture_timestamp <= action_timestamp < tag_t1.capture_timestamp
 .venv/bin/python scripts/real_rlpd/run_rlpd.py label \
   --config configs/real_rlpd_0823.json \
   --role offline \
-  --run-dir real_rlpd_data/expert/<运行目录>
+  --run-dir real_rlpd_data/0823/expert/<运行目录>
 ```
 
 当前 reward kind 是 `apriltag_reach_lift_success`：
@@ -334,6 +362,36 @@ k_reach * (distance_t - distance_t1)
 成功奖励仍只写入触发成功的 transition。该阈值属于 Replay/checkpoint contract，不能与旧阈值的数据或
 checkpoint 静默混用。
 
+0912 可观测绝对奖励按 transition 的下一状态计算：
+
+```text
+2.5 * (1 - tanh(distance_to_gelpad_midpoint / 0.1))
++ 2.5 * clip(reset_relative_height / 0.035, 0, 1)
++ 1000 * success_event
+- 0.05 * mean(executed_action^2)
+- 0.05 * mean((executed_action - previous_executed_action)^2)
+- 10 * drop_event
+- 10 * (physical_tool_clearance < 0.010 m)
+```
+
+物理工具 TCP 是夹爪最低点；reward 用固定基座系 `+0.0171 m` 偏移还原 GelSight 接触面中点。成功事件为
+相对初始高度达到 `0.035 m` 并连续检测 5 帧。掉落事件在曾达到 `0.020 m` 后首次低于 `0.005 m` 时触发。
+当前数据没有可靠的左右接触力、非法碰撞分类和方块姿态，因此仿真的 contact acquisition、15 N 超力、
+illegal collision 和 upright success gate 明确不在此可观测版本内；模型 contact head 不参与 reward。
+
+已有 0912 派生 Replay 不能直接换 reward，但可从旧 Replay 非破坏性复制 policy/action/state 字段，然后用
+原始边界帧重新标注。目标文件已存在时命令会拒绝覆盖：
+
+```bash
+.venv/bin/python scripts/real_rlpd/run_rlpd.py rebuild-reward-replay \
+  --config configs/real_rlpd_0912_progress_observable_absolute.json \
+  --device cpu --role offline \
+  --source-replay real_rlpd_data/0912/derived/offline_expert.sqlite3
+```
+
+源 Replay 中已找不到 episode 目录或原始边界帧的旧记录会保留为不可训练条目，并列在 `skipped` 中；它们
+不会阻止其余完整 episode 完成重建。
+
 ## 10. 初始离线训练
 
 至少准备配置中 `minimum_offline_transitions` 条 trainable expert transition，默认是 1000 条：
@@ -342,6 +400,16 @@ checkpoint 静默混用。
 .venv/bin/python scripts/real_rlpd/run_rlpd.py train \
   --config configs/real_rlpd_0823.json \
   --device cuda:0
+```
+
+训练启动时打印数据量和 schedule；默认在第 1 个 group、之后每 10 个 group 以及最后一个 group 打印
+百分比、累计 `update_group`、elapsed、ETA、`critic_loss`、`q_mean`、`actor_loss`、temperature 和 entropy。
+可用 `--progress-interval N` 调整打印间隔，例如：
+
+```bash
+.venv/bin/python scripts/real_rlpd/run_rlpd.py train \
+  --config configs/real_rlpd_0912_progress_observable_absolute.json \
+  --device cuda:0 --progress-interval 10
 ```
 
 首次执行默认进行 1000 个 offline update group，并生成：

@@ -22,6 +22,7 @@ Franka 真机控制、RealSense 图像采集、TorchScript policy 部署和基�
 - [常用诊断](#常用诊断)
 - [重要配置](#重要配置)
 - [输出日志](#输出日志)
+- [0912 Frozen-Encoder Direct BC](#0912-frozen-encoder-direct-bc)
 - [目录结构](#目录结构)
 - [安全原则](#安全原则)
 
@@ -95,8 +96,10 @@ python scripts/policy/<runner> --steps 15 --confirm-each-step  # 5. 多步逐步
 | 0809 X040-Wide Direct-Action | `run_exported_0809_x040_wide_direct_action.py` | X040-Wide XYZ、无接触输入 |
 | 0809 XY | `run_exported_0809_xy_only.py` | XY RMA，需运行时抓取状态 |
 | 0823 GelSight | `run_exported_0823_gelsight.py` | 修正 161.3 mm 夹爪几何的三帧 RGB＋双 GelSight Student |
+| 0912 GelSight Progress | `run_exported_0912_gelsight_progress.py` | 当前 156.3 mm 夹爪几何的三帧 Progress Student |
+| 0912 Frozen-Encoder Direct BC | `run_exported_0912_direct_bc.py` | 冻结 0912 encoder、直接模仿专家 4D 动作 |
 
-> `--streaming-check` 仅 streaming 配置支持（包括 0801/0802/0823）；`0726` 只有 `--validate-only` / `--preview-only` / `--steps`。
+> `--streaming-check` 仅 streaming 配置支持（包括 0801/0802/0823/0912）；`0726` 只有 `--validate-only` / `--preview-only` / `--steps`。
 
 0823 GelSight 策略使用三帧腕部 RGB、左右 GelSight 当前帧和每回合固定参考帧。部署配置将物理
 workspace 检查点放在相对 `O_T_EE` 的 `+57.9 mm`，对应
@@ -113,6 +116,23 @@ workspace 检查点放在相对 `O_T_EE` 的 `+57.9 mm`，对应
 
 单步运动会要求人工确认，首次验收不要加 `--yes`、`--allow-full-scale` 或提高
 `--action-limit`。确认动作方向、最低点 workspace 和夹爪行为正确后，再逐渐增加步数。
+
+0912 Progress 策略沿用三帧腕部 RGB、双 GelSight 当前帧和每回合固定参考帧，辅助接触概率和
+方块根坐标只写入 rollout 日志，不参与真机控制。当前 +21 mm 夹爪的
+`panda_hand→最低点` 为 `156.3 mm`，因此 workspace 检查点相对 `O_T_EE` 使用 `+52.9 mm`。
+默认 150 步仅对应训练 horizon；通过 `--steps 1000` 可延长运行，但没有视觉成功自动停止，必须由
+操作者持续监控。首次部署依次执行：
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0912_gelsight_progress.py --validate-only
+.venv/bin/python scripts/policy/run_exported_0912_gelsight_progress.py --steps 1 --preview-only --auto-gelsight
+.venv/bin/python scripts/policy/run_exported_0912_gelsight_progress.py --streaming-check
+.venv/bin/python scripts/policy/run_exported_0912_gelsight_progress.py --steps 1 --auto-gelsight
+.venv/bin/python scripts/policy/run_exported_0912_gelsight_progress.py --steps 1000 --auto-gelsight
+```
+
+首次运动不要使用 `--yes` 或 `--allow-full-scale`；确认单步方向、夹爪动作和最低点安全检查均正确后，
+再执行多步运行。
 
 ### 相机、对齐与视觉验证
 
@@ -967,10 +987,48 @@ server9 Real-RL 的 Franka Hand 由独立 `spawn` 进程独占：`move_async/gra
 缺少 capture/action timestamp 的 Replay v1 不会被自动升级或伪造成可训练数据；若已有 v1 数据库，
 请在配置中使用新的 Replay 路径重新采集，旧库会以 schema mismatch 明确拒绝。
 
+如果需要区分 Hand 的 `stop()` RPC 延迟与有限宽度运动耗时，可先运行完全离线的参数预览：
+
+```bash
+.venv/bin/python scripts/diagnostics/test_franka_gripper_latency.py
+```
+
+确认夹爪内没有物体、手指运动范围无人后，才显式启用只连接夹爪的 6 mm 有界对比测试；脚本不会连接或
+移动机械臂，并要求输入 `y`/`yes`：
+
+```bash
+.venv/bin/python scripts/diagnostics/test_franka_gripper_latency.py \
+  --run-hardware --mode compare --direction open \
+  --travel-mm 6 --speed 0.03 --stop-after-ms 50
+```
+
+测试入口硬限制单次行程不超过 10 mm、速度不超过 0.05 m/s，并把逐次 `move_async()`、`stop()`、
+自然完成和 Hand 状态读取耗时写入 `runs/gripper_latency/*.json`。它只诊断当前生产使用的 `franky`
+路径，不会修改 RLPD 控制方式。
+
+如果 Python 结果确认延迟存在，再构建并运行同版本的原生对照。构建脚本链接 `franky-control 1.1.3`
+自带的 `libfranka 0.17.0`，先自动执行不连接硬件的 self-test 和 dry-run：
+
+```bash
+bash scripts/build_franka_gripper_latency.sh
+```
+
+随后在相同清场和人工确认条件下执行原生 C++ 测试：
+
+```bash
+dist/gripper_latency/franka_gripper_latency \
+  --run-hardware --mode compare --direction open \
+  --travel-mm 6 --speed 0.03 --stop-after-ms 50
+```
+
+该程序在一个线程执行阻塞 `Gripper::move()`，另一个线程在指定延迟后调用同一线程安全 Gripper 对象的
+`stop()`，从而去掉 `franky` future/包装层，同时保持 libfranka 版本、目标、速度和动作范围一致。报告写入
+`runs/gripper_latency/*_libfranka_0_17.json`。
+
 ## RLPD 残差强化学习
 
-`real_rlpd/` 是独立于旧 Real-RL 的 PyTorch RLPD 实现。当前适配 0814 单帧、0823 三帧，以及独立的
-0911 Progress 单帧 GelSight 策略，默认仍使用 0823。专家源数据保存同步视觉/触觉、机器人观测和专家绝对动作，不绑定某个
+`real_rlpd/` 是独立于旧 Real-RL 的 PyTorch RLPD 实现。当前适配 0814 单帧、0823 三帧、0911
+Progress 单帧和 0912 Progress 三帧 GelSight 策略，默认仍使用 0823。专家源数据保存同步视觉/触觉、机器人观测和专家绝对动作，不绑定某个
 base policy；每个 base policy 的派生 expert Replay、online Replay 和 checkpoint 仍由模型与 metadata
 SHA 隔离。
 Actor 输入是 frozen base-policy feature 1043D 加限幅后的 base action 4D，输出 XYZ＋gripper 4D residual。
@@ -986,9 +1044,9 @@ LayerNorm、offline/online 50:50、UTD=20；每组做 20 次 Critic 更新和 1 
 ```
 
 0911 Progress 使用新的 artifact kind、adapter ID 和独立数据目录，不修改或复用 0814/0823 的
-Replay/checkpoint。该 checkpoint 的真实历史帧离线审计发现动作饱和和触觉辅助接触输出塌缩，因此
-`motion_authorization=rlpd_only`：部署入口只允许 `--validate-only`/`--preview-only`；真机控制只能走
-RLPD 专家全接管或通过契约校验的 RLPD checkpoint。
+Replay/checkpoint。该 checkpoint 的真实历史帧离线审计发现动作饱和和触觉辅助接触输出塌缩；操作者已
+确认饱和是简单仿真任务中预期的 bang-bang 最优行为，因此 metadata 保留审计告警，同时设置
+`motion_authorization=direct_and_rlpd`，允许标准裸 policy 多步部署和 RLPD 流程。
 
 ```bash
 .venv/bin/python scripts/policy/run_exported_0911_gelsight_progress.py --validate-only
@@ -996,11 +1054,52 @@ RLPD 专家全接管或通过契约校验的 RLPD checkpoint。
   --config configs/real_rlpd_0911_progress.json --device cuda:0
 ```
 
+0912 Progress 使用三帧 feature API、独立的 `gelsight_reference_progress_three_frame_v1` adapter ID 和
+`0912_progress` 数据/checkpoint 命名空间，同时沿用 Progress 成功条件：抬升 `0.035 m` 且连续检测 5 帧。
+
+```bash
+.venv/bin/python scripts/real_rlpd/run_rlpd.py validate \
+  --config configs/real_rlpd_0912_progress.json --device cuda:0
+```
+
+若使用与仿真可观测项对齐的绝对 reach/lift 奖励，请改用独立配置；它不会覆盖原 0912 Replay/checkpoint：
+
+```bash
+.venv/bin/python scripts/real_rlpd/run_rlpd.py validate \
+  --config configs/real_rlpd_0912_progress_observable_absolute.json --device cpu
+```
+
+具体公式、旧专家 Replay 的非破坏性重建命令和不可观测项说明见
+[`real_rlpd/README.md`](real_rlpd/README.md)。
+
 把下文命令中的 `configs/real_rlpd_0823.json` 替换为
-`configs/real_rlpd_0911_progress.json` 即可执行 0911 的专家采集、训练和 online 采集；对应 checkpoint
-目录为 `checkpoints/real_rlpd/0911_progress/`。0911 reward 的成功条件按训练 Progress 契约设置为
-抬升 `0.035 m` 且连续检测 5 帧；单个 episode 被强制限制在最多 150 个 policy step。当前在线检测仍是
-离线标注，成功后需要操作者或外部监控停止，不得把步数提高到训练 horizon 之外。
+`configs/real_rlpd_0911_progress.json` 或 `configs/real_rlpd_0912_progress.json`，即可执行对应 Progress
+policy 的专家采集、训练和 online 采集；checkpoint 分别写入 `checkpoints/real_rlpd/0911_progress/`
+和 `checkpoints/real_rlpd/0912_progress/`。Progress reward 的成功条件按训练契约设置为
+抬升 `0.035 m` 且连续检测 5 帧。训练 horizon 的 150 步只作为 provenance 记录，不是运行时上限；
+当前在线检测仍是离线标注，因此成功后需要操作者或外部监控停止。
+
+裸 policy 使用标准部署入口，`--steps` 可由操作者设置且没有 150 步硬上限。动作尺度、`±0.1`
+commissioning limit、workspace、
+初始状态门禁、碰撞阈值和首次 proposed action 人工确认均保持不变。首次真机测试仍按 preview、
+streaming check、单步、再多步的顺序进行；不要传 `--yes`：
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0911_gelsight_progress.py \
+  --steps 300 --auto-gelsight --preview-only
+
+.venv/bin/python scripts/policy/run_exported_0911_gelsight_progress.py \
+  --steps 300 --streaming-check
+
+.venv/bin/python scripts/policy/run_exported_0911_gelsight_progress.py \
+  --steps 1 --auto-gelsight
+
+.venv/bin/python scripts/policy/run_exported_0911_gelsight_progress.py \
+  --steps 300 --auto-gelsight
+```
+
+`±0.1` normalized envelope 对应每个 policy step 的 XYZ 单轴最多 `5 mm`、夹爪总宽度最多变化 `1 mm`。
+由于成功检测不在裸部署闭环内，多步运行期间必须由操作者监控并在成功、异常接触或偏离预期时停止。
 
 专家数据是全人工接管：base policy 只做 shadow，窗口聚焦后按 Enter arm，`W/S`、`A/D`、`J/K`
 控制基座系 XYZ，`U/I` 连续开合夹爪；窗口失焦、ESC 或关闭窗口都会安全停止。先 preview，再
@@ -1044,9 +1143,53 @@ online 动作在原 base policy 的 commissioning limiter 之后组成 residual�
 保存的是人工绝对动作，同时生成当前 policy-specific residual Replay。
 不允许 `--allow-full-scale`。动作尺度、workspace、initial-state gate、DLS/FCI 与 server9 ABI 都没有放宽。
 采集时 30 Hz 控制线程只缓存 transition，worker 停止后才单事务写 SQLite；AprilTag reward 也只在停止后
-离线标注。专家 episode 写入 `real_rlpd_data/expert/`，rollout 写入 `real_rlpd_data/rollout/0823/`，不会
-混放。0823 的附加物理 TCP 偏移已确认为 `0.0579 m`，workspace z 下界为 `0.01 m`；该偏移仅用于工具
+离线标注。每个策略日期使用独立目录，例如专家 episode 写入 `real_rlpd_data/0823/expert/`，rollout 写入
+`real_rlpd_data/0823/rollout/`；新增 0913 时使用对应的 `real_rlpd_data/0913/`，不会混放。0823 的附加物理
+TCP 偏移已确认为 `0.0579 m`，workspace z 下界为 `0.01 m`；该偏移仅用于工具
 最低点的 workspace 检查和日志，不改变策略动作坐标系或 IK 命令点。
+
+## 0912 Frozen-Encoder Direct BC
+
+该实验路径复用并冻结 0912 三帧 RGB、双 GelSight、proprio/history encoder，只训练
+`1043→256→256→4` 的 direct-action BC head。标签是专家最终执行的四维 normalized action，训练时除以
+固定 `0.1`，部署 artifact 再乘回 `0.1`；它不把 base action 加到输出上。现有 0912 base/RLPD 配置和
+checkpoint 均保持不变。
+
+重新训练要求输出目录为空：
+
+```bash
+.venv/bin/python scripts/training/train_0912_direct_bc.py \
+  --device cuda:0 --epochs 100 --batch-size 256 --patience 15
+```
+
+当前产物和独立部署入口：
+
+```text
+checkpoint/0912_direct_bc/direct_bc_best.pt
+checkpoint/0912_direct_bc/direct_bc_policy.pt
+checkpoint/0912_direct_bc/direct_bc_policy.json
+configs/e2e_bundle_real_exported_0912_direct_bc.json
+scripts/policy/run_exported_0912_direct_bc.py
+```
+
+真机验收必须保持标准顺序，不使用 `--yes` 或 `--allow-full-scale`：
+
+```bash
+.venv/bin/python scripts/policy/run_exported_0912_direct_bc.py --validate-only
+.venv/bin/python scripts/policy/run_exported_0912_direct_bc.py \
+  --steps 1 --preview-only --auto-gelsight
+.venv/bin/python scripts/policy/run_exported_0912_direct_bc.py --streaming-check
+.venv/bin/python scripts/policy/run_exported_0912_direct_bc.py \
+  --steps 1 --auto-gelsight
+```
+
+该入口沿用 `±0.1` commissioning limit；单步 XYZ/夹爪宽度上限仍是 `5 mm / 1 mm`。当前已完成离线
+训练和 artifact 校验；第一次 preview 在 step 0 被 CUDA 惰性初始化安全拒绝，以下预热修复后的 preview、
+streaming check 和真机单步仍需操作者执行。
+
+Direct BC 启动时会在控制接管前打印 `Policy CUDA warmup completed before control`。它会依次覆盖全零和
+固定非零图像的 CUDA 惰性初始化，约需 1 秒但不会发送动作；之后首个真实帧才进入 250 ms policy
+watchdog。若仍在 step 0 超时，请保留该行的两次预热耗时和 run 目录，不要增大 watchdog。
 
 ## 目录结构
 
@@ -1058,6 +1201,7 @@ online 动作在原 base policy 的 commissioning limiter 之后组成 residual�
 - `scripts/real_rl/`：Residual SAC 的校验、真机采集和离线训练入口。
 - `scripts/real_rlpd/`：RLPD 专家/online 采集、标注和 episode 间训练入口。
 - `real_rlpd/`：多 base-policy adapter、4D residual、ensemble SAC 与分离 Replay。
+- `real_rlpd/direct_bc.py`：0912 frozen-feature Direct BC 数据、训练、模型与导出工具。
 - `franka_sim2real/`：运行时、真实机器人 backend、安全限制和日志。
 - `configs/`：部署配置。
 - `tools/system/`：网络、realtime 和主机检查。

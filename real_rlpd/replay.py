@@ -15,6 +15,13 @@ SCHEMA_VERSION = 1
 ReplayRole = Literal["offline", "online"]
 
 
+def _reward_independent_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    result = dict(contract)
+    result.pop("reward_kind", None)
+    result.pop("reward", None)
+    return result
+
+
 def _vector(value: Any, size: int, name: str) -> np.ndarray:
     result = np.asarray(value, dtype=np.float32).reshape(-1)
     if result.shape != (size,) or not np.all(np.isfinite(result)):
@@ -215,3 +222,100 @@ class ReplayBuffer:
 
     def __exit__(self, *_args: Any) -> None:
         self.close()
+
+
+def clone_for_reward_relabel(
+    source_path: str | Path,
+    target_path: str | Path,
+    role: ReplayRole,
+    target_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """复制 policy 派生字段并清空标签，供新 reward 契约重新标注。"""
+
+    source = Path(source_path).expanduser().resolve()
+    target = Path(target_path).expanduser().resolve()
+    if source == target:
+        raise ValueError("Reward relabel source and target Replay paths must differ")
+    if target.exists():
+        raise FileExistsError(
+            f"Reward relabel target already exists; refusing to overwrite: {target}"
+        )
+    transition_count = 0
+    episodes: set[str] = set()
+
+    def pending_transition(row: sqlite3.Row) -> Transition:
+        return Transition(
+            episode_id=str(row["episode_id"]),
+            step_id=int(row["step_id"]),
+            state=_unpack(row["state"], STATE_DIM, "state"),
+            next_state=_unpack(row["next_state"], STATE_DIM, "next_state"),
+            action=_unpack(row["action"], ACTION_DIM, "action"),
+            base_limited_action=_unpack(
+                row["base_limited_action"], ACTION_DIM, "base_limited_action"
+            ),
+            executed_action=_unpack(
+                row["executed_action"], ACTION_DIM, "executed_action"
+            ),
+            ee_position=_unpack(row["ee_position"], 3, "ee_position"),
+            next_ee_position=_unpack(
+                row["next_ee_position"], 3, "next_ee_position"
+            ),
+            initial_object_z=float(row["initial_object_z"]),
+            privileged=None,
+            next_privileged=None,
+            reward=None,
+            terminated=False,
+            truncated=bool(row["truncated"]),
+            success=False,
+            accepted=bool(row["accepted"]),
+            trainable=False,
+            trainable_reason=(
+                "offline_apriltag_pending"
+                if bool(row["accepted"])
+                else "action_not_accepted"
+            ),
+            action_timestamp=(
+                None
+                if row["action_timestamp"] is None
+                else float(row["action_timestamp"])
+            ),
+            run_dir=str(row["run_dir"]),
+            checkpoint_sha256=row["checkpoint_sha256"],
+        )
+
+    try:
+        with ReplayBuffer(source, role, create=False) as old:
+            source_contract = old.get_meta("contract")
+            if not isinstance(source_contract, dict):
+                raise ValueError("Source Replay has no policy contract")
+            if _reward_independent_contract(
+                source_contract
+            ) != _reward_independent_contract(target_contract):
+                raise ValueError(
+                    "Source Replay policy/action contract does not match the target config"
+                )
+            with ReplayBuffer(target, role) as new:
+                new.assert_contract(target_contract)
+                cursor = old.connection.execute(
+                    "SELECT * FROM transitions ORDER BY id"
+                )
+                while rows := cursor.fetchmany(256):
+                    transitions = [pending_transition(row) for row in rows]
+                    new.append_many(transitions)
+                    transition_count += len(transitions)
+                    episodes.update(item.run_dir for item in transitions)
+    except BaseException:
+        for path in (
+            target,
+            target.with_name(target.name + "-wal"),
+            target.with_name(target.name + "-shm"),
+        ):
+            path.unlink(missing_ok=True)
+        raise
+    return {
+        "source": str(source),
+        "target": str(target),
+        "role": role,
+        "transitions": transition_count,
+        "episodes": sorted(episodes),
+    }

@@ -43,6 +43,7 @@ from .streaming import (
     reshape_column_major,
     streaming_robot_action,
     validate_streaming_contract,
+    warm_up_bundle_policy,
 )
 from .types import (
     RobotAction,
@@ -921,45 +922,7 @@ def run_server9_streaming_bundle_deploy(
                 config.model.history_scale, config.model.history_delay_steps,
                 processed_action_scale=config.action_adapter.scales,
             )
-            tactile_zeros = {
-                name: np.zeros(shape, dtype=np.uint8)
-                for name, shape in getattr(bundle, "gelsight_input_shapes", {}).items()
-            }
-            warmup_args = (
-                np.zeros(bundle.history_dim, dtype=np.float32),
-                np.zeros(bundle.proprio_dim, dtype=np.float32),
-                np.zeros(
-                    getattr(
-                        bundle,
-                        "rgb_input_shape",
-                        (bundle.rgb_height, bundle.rgb_width, 3),
-                    ),
-                    dtype=np.uint8,
-                ),
-            )
-            warmup_contact_force = (
-                np.zeros(getattr(bundle, "contact_force_dim", 0), dtype=np.float32)
-                if getattr(bundle, "contact_force_dim", 0)
-                else None
-            )
-            if tactile_zeros:
-                bundle.predict(
-                    *warmup_args,
-                    tactile_zeros["gsmini_left_rgb"],
-                    tactile_zeros["gsmini_right_rgb"],
-                    gsmini_left_reference_rgb=tactile_zeros.get(
-                        "gsmini_left_reference_rgb"
-                    ),
-                    gsmini_right_reference_rgb=tactile_zeros.get(
-                        "gsmini_right_reference_rgb"
-                    ),
-                    contact_force_n=warmup_contact_force,
-                )
-            else:
-                if warmup_contact_force is None:
-                    bundle.predict(*warmup_args)
-                else:
-                    bundle.predict(*warmup_args, contact_force_n=warmup_contact_force)
+            timing["policy_warmup"] = warm_up_bundle_policy(bundle)
             if bundle.real_rl_runtime is not None:
                 # 模型 dummy warmup 不得消耗 episode 的首个 AR(1) 探索样本。
                 bundle.real_rl_runtime.reset_episode()

@@ -6,8 +6,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from franka_sim2real.real_rl.config import AprilTagConfig, RewardConfig
-from .reward import APRILTAG_PROGRESS_REWARD
+from franka_sim2real.real_rl.config import (
+    AprilTagConfig,
+    RewardConfig,
+    X040ObservableAbsoluteRewardConfig,
+)
+from .reward import (
+    APRILTAG_PROGRESS_REWARD,
+    APRILTAG_X040_OBSERVABLE_ABSOLUTE_REWARD,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -104,7 +111,9 @@ class RLPDConfig:
     expert_data_dir: Path
     rollout_data_dir: Path
     apriltag: AprilTagConfig
-    reward: RewardConfig = field(default_factory=RewardConfig)
+    reward: RewardConfig | X040ObservableAbsoluteRewardConfig = field(
+        default_factory=RewardConfig
+    )
     reward_kind: str = APRILTAG_PROGRESS_REWARD
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     residual: ResidualConfig = field(default_factory=ResidualConfig)
@@ -132,8 +141,21 @@ class RLPDConfig:
             raise ValueError("Expert source data and rollout directories must not overlap")
         self.apriltag.validate()
         self.reward.validate()
-        if self.reward_kind != APRILTAG_PROGRESS_REWARD:
+        if self.reward_kind not in {
+            APRILTAG_PROGRESS_REWARD,
+            APRILTAG_X040_OBSERVABLE_ABSOLUTE_REWARD,
+        }:
             raise ValueError(f"Unsupported RLPD reward_kind: {self.reward_kind!r}")
+        expected_reward_type = (
+            X040ObservableAbsoluteRewardConfig
+            if self.reward_kind == APRILTAG_X040_OBSERVABLE_ABSOLUTE_REWARD
+            else RewardConfig
+        )
+        if not isinstance(self.reward, expected_reward_type):
+            raise ValueError(
+                f"RLPD reward_kind {self.reward_kind!r} requires "
+                f"{expected_reward_type.__name__}"
+            )
         self.algorithm.validate()
         self.residual.validate()
         self.teleop.validate()
@@ -156,6 +178,17 @@ def load_config(path: str | Path) -> RLPDConfig:
         raise ValueError(
             "RLPD schema v2 requires separate data.expert_dir and data.rollout_dir"
         )
+    reward_kind = str(payload.get("reward_kind", APRILTAG_PROGRESS_REWARD))
+    reward_payload = dict(payload.get("reward", {}))
+    if reward_kind == APRILTAG_X040_OBSERVABLE_ABSOLUTE_REWARD:
+        if "grasp_center_offset_from_tool_tcp_m" in reward_payload:
+            reward_payload["grasp_center_offset_from_tool_tcp_m"] = tuple(
+                float(value)
+                for value in reward_payload["grasp_center_offset_from_tool_tcp_m"]
+            )
+        reward = X040ObservableAbsoluteRewardConfig(**reward_payload)
+    else:
+        reward = RewardConfig(**reward_payload)
     result = RLPDConfig(
         schema_version=int(payload.get("schema_version", 1)),
         base_policy_config=_path(payload["base_policy_config"]),
@@ -165,8 +198,8 @@ def load_config(path: str | Path) -> RLPDConfig:
         expert_data_dir=_path(data["expert_dir"]),
         rollout_data_dir=_path(data["rollout_dir"]),
         apriltag=AprilTagConfig(**april),
-        reward=RewardConfig(**payload.get("reward", {})),
-        reward_kind=str(payload.get("reward_kind", APRILTAG_PROGRESS_REWARD)),
+        reward=reward,
+        reward_kind=reward_kind,
         algorithm=AlgorithmConfig(**algorithm),
         residual=ResidualConfig(**payload.get("residual", {})),
         teleop=TeleopConfig(**payload.get("teleop", {})),

@@ -75,6 +75,66 @@ class RewardConfig:
 
 
 @dataclass(frozen=True)
+class X040ObservableAbsoluteRewardConfig:
+    """0912 X040 仿真奖励中可由当前真机数据可靠重建的部分。"""
+
+    reach_sigma_m: float = 0.1
+    reach_weight: float = 2.5
+    lift_weight: float = 2.5
+    success_weight: float = 1000.0
+    action_magnitude_weight: float = 0.05
+    action_rate_weight: float = 0.05
+    success_height_m: float = 0.035
+    success_consecutive_detections: int = 5
+    drop_arm_height_m: float = 0.020
+    drop_trigger_height_m: float = 0.005
+    drop_penalty: float = -10.0
+    table_height_base_m: float = 0.0
+    table_clearance_min_m: float = 0.010
+    table_clearance_penalty: float = -10.0
+    grasp_center_offset_from_tool_tcp_m: tuple[float, float, float] = (
+        0.0,
+        0.0,
+        0.0171,
+    )
+
+    def validate(self) -> None:
+        for name in (
+            "reach_sigma_m",
+            "success_height_m",
+            "drop_arm_height_m",
+            "drop_trigger_height_m",
+            "table_clearance_min_m",
+        ):
+            _positive(f"reward.{name}", getattr(self, name))
+        for name in (
+            "reach_weight",
+            "lift_weight",
+            "success_weight",
+            "action_magnitude_weight",
+            "action_rate_weight",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"reward.{name} must be finite and non-negative")
+        for name in ("drop_penalty", "table_clearance_penalty"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value > 0.0:
+                raise ValueError(f"reward.{name} must be finite and non-positive")
+        if not math.isfinite(float(self.table_height_base_m)):
+            raise ValueError("reward.table_height_base_m must be finite")
+        if self.drop_trigger_height_m >= self.drop_arm_height_m:
+            raise ValueError("reward drop trigger height must be below arm height")
+        if self.success_consecutive_detections < 1:
+            raise ValueError("reward.success_consecutive_detections must be positive")
+        offset = tuple(float(value) for value in self.grasp_center_offset_from_tool_tcp_m)
+        if len(offset) != 3 or not all(math.isfinite(value) for value in offset):
+            raise ValueError(
+                "reward.grasp_center_offset_from_tool_tcp_m must contain three finite values"
+            )
+
+
+@dataclass(frozen=True)
 class ResidualConfig:
     max_residual_m: float = 0.002
     action_scale_m: float = 0.05

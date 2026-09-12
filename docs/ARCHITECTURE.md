@@ -274,6 +274,31 @@ Residual 推理信息进入每步 JSONL/NPZ；deadline miss 不更新 history。
 的动作选择组合，真机模式还要求独立 enable flag 且禁止无交互 `--yes`。默认不开启时 policy 构造、推理、
 日志和依赖路径保持原状。
 
+### 6.3 0912 Frozen-Encoder Direct BC
+
+`real_rlpd/direct_bc.py` 与 `scripts/training/train_0912_direct_bc.py` 从 0912 policy-specific expert Replay
+读取 `state[:1043]` 和最终 `executed_action[4]`。Replay contract 必须绑定
+`gelsight_reference_progress_three_frame_v1`、准确的 base model SHA、1043D feature 和 4D action；动作
+超过现有 `±0.1` commissioning limit 时失败即拒绝。数据按完整 episode 分为 train/validation/test，并在
+validation/test 中各保留成功和未成功 episode，避免连续帧泄漏。默认保留专家动作的真实采样分布；可选
+`--balanced-sampling` 才按 hold、XYZ-only、gripper-only、XYZ+gripper 四类反频率采样。
+
+BC head 是 `1043→256→256→4`，以 `executed_action/0.1` 为标签使用 Smooth-L1；feature normalizer 只由
+train episode 拟合并冻结。导出的 `FrozenEncoderDirectBCPolicy` 内嵌原 0912 encoder，一次前向计算三帧
+视觉、双 GelSight、proprio/history feature；新的 action head 输出经 `tanh×0.1` 成为四维 direct action，
+原 base action 不参与组合。原 position/contact 辅助输出继续供 rollout 日志使用，不驱动动作或终止。
+
+部署使用独立 `configs/e2e_bundle_real_exported_0912_direct_bc.json` 和
+`scripts/policy/run_exported_0912_direct_bc.py`。metadata 的 `deployment_variant=frozen_encoder_direct_bc`
+触发额外 provenance 校验，固定 feature/action 维度、base/replay SHA 关系和 `0.1` action limit。之后仍经过
+标准 `clip_streaming_action`、动作尺度、workspace、DLS、碰撞阈值和 server9 worker；不新增运行时旁路，
+共享内存 ABI 不变。
+
+Direct BC 在 RTX 5060 上会分别为首次全零与首次非零图像触发 CUDA/TorchScript 惰性初始化。因此
+`warm_up_bundle_policy()` 在首个计时 policy boundary 和控制接管前，对该 deployment variant 执行
+`0/127` 两组确定性图像预热；普通策略仍仅预热全零输入。预热耗时记录到
+`timing.policy_warmup`，不计入实时 deadline，也不通过放宽 watchdog 掩盖首帧初始化。
+
 ## 7. 动作映射
 
 ```text
@@ -327,6 +352,18 @@ DLS 和 FCI 路径。仅当 worker 按期接受动作时才执行
 history 是最终限幅后的实际接受组合动作。deadline miss 令机械臂继续 hold/brake，且不更新 history；
 夹爪则保持最后一个已接受的速度意图，避免把单帧推理抖动误判成松键。只有超过
 `policy_watchdog_s` 仍没有接受新动作时，夹爪才进入 hold。
+
+`scripts/diagnostics/test_franka_gripper_latency.py` 是独立的 Hand 时序诊断入口。默认只校验并打印参数，
+只有显式 `--run-hardware` 且人工输入 `y`/`yes` 后才构造 `franky.Gripper`；它从不构造 `Robot`，因此不连接
+或移动机械臂。真机测试将每条夹爪运动限制在 10 mm、0.05 m/s 内，可分别测有界 move 中的同步
+`stop()` 和有限目标自然完成，并把原始耗时保存到 `runs/gripper_latency/`。该入口用于定位 Hand/franky
+延迟，不属于策略控制链路，也不改变 `ProcessGripperQueue` 行为。
+
+`native/franka_gripper_latency.cpp` 提供同条件的原生对照：它链接 `franky-control 1.1.3` 随附的
+`libfranka 0.17.0`，由一个 C++ 线程阻塞执行 `Gripper::move()`，主线程延时后在同一个线程安全对象上调用
+`Gripper::stop()`。因此与 Python 报告对比时保持 Hand、libfranka 版本、目标和速度不变，只去掉 franky
+future/包装层。`scripts/build_franka_gripper_latency.sh` 构建后自动运行纯离线 self-test 与 dry-run；原生
+程序仍需显式 `--run-hardware` 和 `y`/`yes` 才连接 Hand，使用相同的 10 mm/0.05 m/s 硬上限。
 
 ### 8.3 控制律
 
@@ -495,9 +532,9 @@ Real-RL 数据根目录是 `real_rl_logs/`，不与通用部署的 `runs/` 混�
 
 ### 12.2 多策略 RLPD 4D residual
 
-RLPD 与 12.1 的旧 XYZ Residual SAC 完全分开，当前通过 adapter 支持三种 frozen base policy：0814
-单帧 GelSight、0911 Progress 单帧 GelSight 的 `encode_visual()`，以及 0823 三帧 GelSight 的
-`encode_visual_features()`。三条路径都在
+RLPD 与 12.1 的旧 XYZ Residual SAC 完全分开，当前通过 adapter 支持四种 frozen base policy：0814
+单帧 GelSight、0911 Progress 单帧 GelSight 的 `encode_visual()`，以及 0823 和 0912 Progress 三帧
+GelSight 的 `encode_visual_features()`。四条路径都在
 原模型的 `action_head` 之前得到完全相同的 feature contract：
 
 ```text
@@ -519,14 +556,14 @@ gripper 完全接管，同时保留 base action 作为 shadow 输入。组合发
 `[0.05,0.05,0.05] m`，gripper delta-width 尺度仍为 `0.01 m`。初始状态门禁、碰撞阈值、watchdog、
 停止时序、native worker 和 ABI-8 均未改变。
 
-RLPD config schema v2 将数据拆成策略无关的专家源、policy-specific 派生 expert Replay，以及 online
-rollout 三层：
+RLPD config schema v2 先按策略日期建立命名空间，再拆成策略无关格式的专家源、policy-specific 派生
+expert Replay，以及 online rollout 三层：
 
 ```text
-real_rlpd_data/expert/<episode>/                 # 专家源 episode
-real_rlpd_data/derived/<policy>/offline_expert.sqlite3
-real_rlpd_data/rollout/<policy>/<episode>/       # rollout episode
-real_rlpd_data/rollout/<policy>/online_policy.sqlite3
+real_rlpd_data/<policy>/expert/<episode>/        # 专家源 episode
+real_rlpd_data/<policy>/derived/offline_expert.sqlite3
+real_rlpd_data/<policy>/rollout/<episode>/       # rollout episode
+real_rlpd_data/<policy>/rollout/online_policy.sqlite3
 ```
 
 专家源由 `expert_dataset.py` 写入，保存同步的当前腕部 RGB、左右 GelSight 当前帧与每回合固定参考帧、
@@ -534,6 +571,8 @@ proprio、action history、机器人观测，以及基座系 XYZ＋gripper delta
 明确排除 base feature、base action 和 residual target；shadow model 的 kind/SHA 只作为采集 provenance。
 因此同一任务的专家源可以由另一 adapter 重新编码。采集时仍同步写入当前 base-policy 的 offline SQLite，
 它是为现有 trainer 准备的派生缓存；当前尚无从历史源 episode 批量重建该缓存的独立 CLI。
+通用 rollout JSON 在 expert takeover 时记录 `expert_requested_action`、`expert_limited_action` 和按键快照，
+不写 `unit_residual_action`/`residual_normalized_action`；后二者只属于 online residual policy 记录。
 
 Replay schema v1 继续按 base-policy contract 隔离派生 expert 与 online policy 两个 SQLite 文件。契约包括
 adapter ID、policy kind、模型 SHA、metadata SHA、1047D state、4D residual、动作尺度和 commissioning
@@ -542,10 +581,14 @@ state、base/executed/residual action、TCP 位置、action timestamp 及离线 
 只缓存 transition 和专家源数组；worker 和 Hand owner 停止后才写源 episode，并以单个事务写库，避免 I/O
 进入 30 Hz 路径。原始 D435 边界帧沿用 Real-RL 的离线 AprilTag 流程，只有 accepted 且满足
 `tag_t <= action_time < tag_t1` 的样本标为 trainable。
-标注器通过 `RewardFunction` 接口调用由 `reward_kind` 选择的实现；当前注册的
-`apriltag_reach_lift_success` 保持原 reach/lift/success/action-penalty 公式，后续任务 reward 不需要改
-Replay、collector 或 learner。当前 0823 的成功条件是物体相对 episode 初始高度严格超过 `0.05 m` 并连续
-检测到 3 帧；reward 参数属于 Replay/checkpoint contract，阈值不同的数据和 checkpoint 不得混用。
+操作者在启动确认处取消，或 episode 没有写入任何 transition 时，CLI 将其作为空采集正常结束并跳过
+AprilTag 离线标注；空 run 没有原始边界帧，也不会被误报成旧版 224×224-only 数据。
+标注器通过 `RewardFunction` 接口调用由 `reward_kind` 选择的实现。旧的
+`apriltag_reach_lift_success` 保持原 reach/lift 增量及 residual-action penalty；0912 可选的
+`apriltag_x040_observable_absolute_v1` 使用仿真同权重的绝对归一化 reach/lift、一次性成功奖励、最终执行
+动作幅值/变化、掉落和工具最低点桌面间隙。后者用 `+17.1 mm` 将最低点 TCP 转为 GelSight 接触面中点；
+contact force、非法碰撞分类和 upright gate 因当前真机标签不可观测而不伪造。reward 参数属于
+Replay/checkpoint contract，公式或阈值不同的数据和 checkpoint 不得混用。
 collector 在 AprilTag preflight 前校验 Replay contract，不兼容时不会等待检测或启动控制。
 
 PyTorch learner 是 asymmetric SAC：Actor 只看 1047D state；10 个 Q 都额外看 object-relative XYZ＋height
@@ -555,20 +598,30 @@ PyTorch learner 是 asymmetric SAC：Actor 只看 1047D state；10 个 Q 都额�
 按 checkpoint high-watermark 之后新增的 trainable online transition 更新。Normalizer 首次由 expert
 offline 数据拟合并随 checkpoint 冻结。部署 checkpoint 的模型/metadata/action contract 不匹配时，在
 worker 启动前 fail closed；随机 residual 还要求单独的显式开关。
+trainer 默认每 10 个 update group 输出当前进度、累计 group、elapsed/ETA 和 Critic/Actor/temperature
+指标；`--progress-interval` 只控制日志频率，不进入算法、Replay 或 checkpoint contract。
 
-`configs/real_rlpd_0814.json`、`configs/real_rlpd_0823.json` 与
-`configs/real_rlpd_0911_progress.json` 共享专家源根目录，但使用各自独立的
-`derived/<policy>/`、`rollout/<policy>/` 和 `checkpoints/real_rlpd/<policy>/`；不会迁移或读取旧
+`configs/real_rlpd_0814.json`、`configs/real_rlpd_0823.json`、
+`configs/real_rlpd_0911_progress.json` 与 `configs/real_rlpd_0912_progress.json` 分别使用 `0814/`、`0823/`、
+`0911/`、`0912/` 数据命名空间；其 `expert/`、`derived/`、`rollout/` 和
+`checkpoints/real_rlpd/<policy>/` 相互隔离，不会迁移或读取旧
 `real_rl_logs/replay.sqlite3` 或 `real_rlpd_runs/`。`rlpd/` 只是用户引入的参考实现，生产路径不 import 它。
 
 0911 另建 `tacex_rma_gelsight_size_buckets_progress_student_torchscript` kind 和
 `gelsight_reference_progress_single_frame_v1` adapter ID，避免与 0814 的 Replay/checkpoint 合并。其 metadata
-记录 Progress reward/terminal-success、GelSight v7 几何和真实历史帧行为审计；由于审计发现动作饱和与
-辅助接触输出塌缩，运行时将其标记为 `rlpd_only`，直接 base-policy 真机运动在 worker 启动前拒绝。
-RLPD 专家模式是四维人工全接管；online 模式必须先通过 residual checkpoint 的 model/metadata/reward
-完整契约校验。其离线成功边界为抬升 `0.035 m` 且连续检测 5 帧，派生 Replay 与 0814/0823 均不兼容。
-运行时把单 episode 限制在 150 policy step；RLPD 的 AprilTag 检测仍是停止后离线标注，所以提前成功
-需要操作者或外部监控停止，不使用已发生塌缩的辅助 contact logits 作为终止信号。
+记录 Progress reward/terminal-success、GelSight v7 几何和真实历史帧行为审计。审计中的动作饱和与
+辅助接触输出塌缩告警继续保留；操作者确认饱和符合简单仿真任务预期后，运行时将其标记为
+`direct_and_rlpd`，允许标准 base-policy 部署与 RLPD。RLPD 专家模式是四维人工全接管；online 模式必须
+先通过 residual checkpoint 的 model/metadata/reward 完整契约校验。其离线成功边界为抬升 `0.035 m`
+且连续检测 5 帧，派生 Replay 与 0814/0823 均不兼容。
+metadata 将训练时的 150 policy-step horizon 记录为 provenance，不将其用作直接部署或 RLPD 的运行时
+步数上限。RLPD 的 AprilTag 检测仍是停止后离线标注，所以提前成功需要操作者或外部监控停止，不使用
+已发生塌缩的辅助 contact logits 作为终止信号。
+
+0911 裸 policy 复用标准部署 CLI，运行步数由 `--steps` 设置。动作尺度、`±0.1` commissioning limit、workspace、
+初始状态门禁、碰撞阈值、坐标系和首次 proposed action 人工确认均未改变。`±0.1` normalized envelope
+对应每步单轴最大 `5 mm` XYZ 和 `1 mm` gripper-width 增量；由于裸部署没有闭环成功检测，运行期间由
+操作者负责在成功或异常时停止。
 
 0911 的 GelSight v7 最低点距 `panda_hand` 为 `0.1563 m`，减去 `O_T_EE` 已包含的 `0.1034 m` 后，
 workspace/日志附加偏移为 `tool_tcp_offset_ee_m.z=0.0529 m`。该值不改变 IK 命令点或动作坐标系。
@@ -576,6 +629,24 @@ workspace/日志附加偏移为 `tool_tcp_offset_ee_m.z=0.0529 m`。该值不改
 0823 的工具最低点距 `panda_hand` 为 `0.1613 m`；`O_T_EE` 已包含 `0.1034 m` 的 flange-to-EE 平移，
 因此 workspace/日志使用的附加 `tool_tcp_offset_ee_m.z` 是 `0.0579 m`。该偏移不改变 IK 命令点或策略
 动作坐标系。0823 workspace z 下界现为 `0.01 m`，与测试和 RLPD 真机门禁一致。
+
+0912 X040 Progress 三帧 Student 继续复用 0823 的三帧缓存、双 GelSight 固定 reference 和三输出
+TorchScript 路径，但通过 metadata `task` 与旧的无 task 产物区分几何。0912 使用当前 v7 的
+`0.1563 m` 最低点和 `tool_tcp_offset_ee_m.z=0.0529 m`；旧 0814/0815/0823 三帧产物继续使用
+`0.0579 m`。辅助接触概率和方块根坐标仅记录到 rollout，不参与动作或自动终止；150 步是训练
+horizon provenance，直接部署可覆盖步数并由操作者负责停止。
+
+0912 RLPD 在相同三帧 feature API 上注册独立的 `gelsight_reference_progress_three_frame_v1` adapter，
+与 0823 的 `gelsight_reference_three_frame_v1` 分离；派生 Replay、online Replay 和 checkpoint 使用
+`0912_progress` 命名空间。reward/离线成功标注沿用 Progress 契约的 `0.035 m` 抬升阈值和连续 5 次检测，
+不会读取 0823 或 0911 的 policy-specific Replay/checkpoint。
+
+`configs/real_rlpd_0912_progress_observable_absolute.json` 是独立实验契约，不覆盖上述旧配置；它使用
+`offline_expert_observable_absolute_v1.sqlite3`、`online_policy_observable_absolute_v1.sqlite3` 和
+`checkpoints/real_rlpd/0912_progress_observable_absolute_v1/`。`rebuild-reward-replay` 可校验除 reward 外
+完全相同的 policy/action contract，复制旧 Replay 的派生 state/action 后清空旧标签，再从各 episode 的
+原始 D435 边界帧重新计算 privileged state 和新 reward；目标存在时拒绝覆盖。
+缺少 episode 目录或原始边界帧的历史记录保留为 non-trainable 并报告 `skipped`，不伪造新 reward。
 
 `scripts/diagnostics/compare_sim_real_images.py` 是纯离线的外观对齐分析，不碰硬件：
 

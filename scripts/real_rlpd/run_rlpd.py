@@ -20,6 +20,7 @@ from franka_sim2real.e2e_bundle import (  # noqa: E402
 from franka_sim2real.real_rl.apriltag_tracker import load_base_t_camera  # noqa: E402
 from real_rlpd.config import RLPDConfig, load_config  # noqa: E402
 from real_rlpd.labeler import label_episode  # noqa: E402
+from real_rlpd.replay import clone_for_reward_relabel  # noqa: E402
 from real_rlpd.runtime import RLPDDeploySettings  # noqa: E402
 from real_rlpd.trainer import train  # noqa: E402
 
@@ -79,12 +80,26 @@ def build_parser() -> argparse.ArgumentParser:
     label.add_argument("--run-dir", type=Path, required=True)
     label.add_argument("--role", choices=("offline", "online"), required=True)
 
+    rebuild = commands.add_parser(
+        "rebuild-reward-replay",
+        help="Clone a compatible Replay and relabel it under a new reward contract",
+    )
+    _common_config(rebuild)
+    rebuild.add_argument("--source-replay", type=Path, required=True)
+    rebuild.add_argument("--role", choices=("offline", "online"), required=True)
+
     training = commands.add_parser(
         "train", help="Run offline pretraining or between-episode online updates"
     )
     _common_config(training)
     training.add_argument("--checkpoint", type=Path)
     training.add_argument("--groups", type=int)
+    training.add_argument(
+        "--progress-interval",
+        type=int,
+        default=10,
+        help="Print training metrics every N update groups (default: 10)",
+    )
     return parser
 
 
@@ -219,6 +234,26 @@ def _confirm(label: str):
     return confirm
 
 
+def _offline_label_skip_reason(summary: dict[str, Any]) -> str | None:
+    """Explain why a completed collection has no transition to label."""
+
+    timing = summary.get("timing")
+    if isinstance(timing, dict) and bool(timing.get("cancelled_by_user")):
+        return "the operator cancelled before the control session started"
+    collection = timing.get("rlpd_collection") if isinstance(timing, dict) else None
+    transition_count = (
+        collection.get("transitions_written")
+        if isinstance(collection, dict)
+        else None
+    )
+    if transition_count is not None and int(transition_count) < 1:
+        return "the episode contains no RLPD transitions"
+    step_count = summary.get("num_steps")
+    if step_count is not None and int(step_count) < 1:
+        return "the episode contains no recorded policy steps"
+    return None
+
+
 def _collect(args: argparse.Namespace, *, expert: bool) -> int:
     enable = args.enable_expert_control if expert else args.enable_rlpd_control
     if not args.preview_only and not enable:
@@ -286,6 +321,10 @@ def _collect(args: argparse.Namespace, *, expert: bool) -> int:
     print(f"Run saved to: {summary['run_dir']}")
     if args.preview_only:
         return 0
+    skip_reason = _offline_label_skip_reason(summary)
+    if skip_reason is not None:
+        print(f"Offline label skipped: {skip_reason}.")
+        return 0
     role = "offline" if expert else "online"
     if args.defer_offline_label:
         print("Offline label deferred. Run:")
@@ -304,6 +343,56 @@ def label_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def rebuild_reward_replay_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    base = _base_config(config, args.device)
+    _report, contract = _validate_and_contract(config, base)
+    target = (
+        config.offline_replay_path
+        if args.role == "offline"
+        else config.online_replay_path
+    )
+    report = clone_for_reward_relabel(
+        args.source_replay,
+        target,
+        args.role,
+        contract,
+    )
+    labels = []
+    failures = []
+    skipped = []
+    for run_dir in report["episodes"]:
+        resolved_run = Path(run_dir)
+        if not resolved_run.is_dir() or not any(
+            (resolved_run / "raw_rgb").glob("boundary_*.png")
+        ):
+            skipped.append({
+                "run_dir": run_dir,
+                "reason": "raw AprilTag boundary frames are unavailable",
+            })
+            continue
+        try:
+            labels.append(label_episode(run_dir, config, args.role))
+        except Exception as exc:
+            failures.append({
+                "run_dir": run_dir,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    report["labels"] = labels
+    report["failures"] = failures
+    report["skipped"] = skipped
+    report["trainable_transitions"] = sum(
+        int(item["trainable_transitions"]) for item in labels
+    )
+    print(json.dumps(report, indent=2))
+    if failures:
+        raise RuntimeError(
+            f"reward Replay was cloned, but {len(failures)} episode(s) failed relabeling; "
+            "inspect the report and rerun those episodes with the label command"
+        )
+    return 0
+
+
 def train_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     base = _base_config(config, args.device)
@@ -317,6 +406,7 @@ def train_command(args: argparse.Namespace) -> int:
         device=args.device,
         checkpoint_path=checkpoint,
         groups=args.groups,
+        progress_interval=args.progress_interval,
     ), indent=2))
     return 0
 
@@ -334,6 +424,8 @@ def main() -> int:
             return _collect(args, expert=False)
         if args.command == "label":
             return label_command(args)
+        if args.command == "rebuild-reward-replay":
+            return rebuild_reward_replay_command(args)
         return train_command(args)
     except KeyboardInterrupt:
         print("\nStopped by operator; no further robot commands will be sent.", file=sys.stderr)

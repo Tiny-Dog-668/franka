@@ -434,8 +434,12 @@ class Exported0911GelSightProgressConfigTests(unittest.TestCase):
             "gelsight_size_buckets_progress_rlpd_base_v1",
         )
         self.assertEqual(
-            report["streaming_contract"]["motion_authorization"], "rlpd_only"
+            report["streaming_contract"]["motion_authorization"], "direct_and_rlpd"
         )
+        self.assertEqual(
+            report["streaming_contract"]["training_episode_length_steps"], 150
+        )
+        self.assertNotIn("max_episode_length_steps", report["streaming_contract"])
 
     def test_0911_rejects_a_geometry_offset_from_an_older_policy(self) -> None:
         config = load_bundle_config(
@@ -446,25 +450,104 @@ class Exported0911GelSightProgressConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "0.0529"):
             validate_bundle_artifacts(config)
 
-    def test_0911_cannot_run_past_its_terminal_training_horizon(self) -> None:
+    def test_0911_training_horizon_is_not_a_runtime_step_cap(self) -> None:
         config = load_bundle_config(
             REPO_ROOT / "configs/e2e_bundle_real_exported_0911_gelsight_progress.json"
         )
         config.model.device = "cpu"
-        config.runner.steps = 151
-        with self.assertRaisesRegex(ValueError, "at most 150 policy steps"):
-            validate_bundle_artifacts(config)
+        config.runner.steps = 1000
+        report = validate_bundle_artifacts(config)
 
-    def test_0911_direct_motion_is_blocked_but_rlpd_is_allowed(self) -> None:
+        self.assertEqual(
+            report["streaming_contract"]["training_episode_length_steps"], 150
+        )
+        self.assertNotIn("max_episode_length_steps", report["streaming_contract"])
+
+    def test_0911_direct_and_rlpd_motion_are_both_allowed(self) -> None:
         bundle = MagicMock()
         bundle.is_tacex_rma_x040_wide_three_frame_direct_action_student = False
         bundle.is_tacex_rma_gelsight_size_buckets_progress_student = True
-        bundle.metadata = {"motion_authorization": "rlpd_only"}
+        bundle.metadata = {"motion_authorization": "direct_and_rlpd"}
 
-        with self.assertRaisesRegex(ValueError, "RLPD checkpoint"):
-            reject_evaluation_only_motion(bundle, True)
+        reject_evaluation_only_motion(bundle, True)
         reject_evaluation_only_motion(bundle, False)
         reject_evaluation_only_motion(bundle, True, rlpd_settings=object())
+
+
+class Exported0912GelSightProgressConfigTests(unittest.TestCase):
+    CONFIG_PATH = (
+        REPO_ROOT / "configs/e2e_bundle_real_exported_0912_gelsight_progress.json"
+    )
+
+    def test_0912_config_matches_progress_three_frame_contract(self) -> None:
+        config = load_bundle_config(self.CONFIG_PATH)
+        config.model.device = "cpu"
+        report = validate_bundle_artifacts(config)
+
+        self.assertEqual(config.tool_tcp_offset_ee_m, [0.0, 0.0, 0.0529])
+        self.assertEqual(config.workspace["minimum"][2], 0.01)
+        self.assertEqual(config.runner.steps, 150)
+        self.assertIn("/checkpoint/0912/", config.model.model_path)
+        self.assertEqual(
+            report["task"],
+            e2e_bundle.GELSIGHT_X040_PROGRESS_THREE_FRAME_STUDENT_TASK,
+        )
+        self.assertEqual(
+            report["rgb_history"],
+            {"frames": 3, "order": "oldest_to_newest"},
+        )
+        self.assertEqual(
+            report["input_signature"]["gsmini_left_reference_rgb"],
+            [96, 128, 3],
+        )
+        self.assertEqual(
+            len(report["rma_actor_input"]["contact_probability"]), 2
+        )
+        self.assertEqual(len(report["rma_actor_input"]["cube_position_root"]), 3)
+        self.assertEqual(
+            report["streaming_contract"]["training_episode_length_steps"], 150
+        )
+        self.assertNotIn(
+            "max_episode_length_steps", report["streaming_contract"]
+        )
+
+    def test_0912_rejects_legacy_geometry(self) -> None:
+        config = load_bundle_config(self.CONFIG_PATH)
+        config.model.device = "cpu"
+        config.tool_tcp_offset_ee_m = [0.0, 0.0, 0.0579]
+
+        with self.assertRaisesRegex(ValueError, "corrected 156.3 mm"):
+            validate_bundle_artifacts(config)
+
+    def test_0912_training_horizon_is_not_a_runtime_step_cap(self) -> None:
+        config = load_bundle_config(self.CONFIG_PATH)
+        config.model.device = "cpu"
+        config.runner.steps = 1000
+        report = validate_bundle_artifacts(config)
+
+        self.assertEqual(
+            report["streaming_contract"]["training_episode_length_steps"], 150
+        )
+        self.assertNotIn(
+            "max_episode_length_steps", report["streaming_contract"]
+        )
+
+    def test_x040_three_frame_rejects_unknown_task_provenance(self) -> None:
+        config = load_bundle_config(self.CONFIG_PATH)
+        config.model.device = "cpu"
+        bundle = BundleTorchScriptPolicy(
+            config.model.model_path,
+            config.model.metadata_path,
+            device="cpu",
+        )
+        bundle.metadata["task"] = "TacEx-Unknown-X040-Three-Frame-v0"
+
+        with self.assertRaisesRegex(ValueError, "unsupported task provenance"):
+            e2e_bundle._validate_tacex_rma_gelsight_x040_three_frame_student_contract(
+                bundle,
+                config,
+                np.ones(4, dtype=np.float32),
+            )
 
 
 class Exported0809XYConfigTests(unittest.TestCase):

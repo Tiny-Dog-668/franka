@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,41 @@ import torch
 from .config import RLPDConfig
 from .learner import DeterministicActorArtifact, FrozenNormalizer, RLPDLearner, STATE_DIM
 from .replay import ReplayBuffer
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _format_training_progress(
+    *,
+    completed: int,
+    total: int,
+    update_group: int,
+    elapsed_s: float,
+    metrics: dict[str, float],
+) -> str:
+    fraction = completed / total
+    eta_s = elapsed_s * (total - completed) / completed
+    fields = [
+        f"RLPD train {completed}/{total} ({100.0 * fraction:.1f}%)",
+        f"update_group={update_group}",
+        f"elapsed={_format_duration(elapsed_s)}",
+        f"eta={_format_duration(eta_s)}",
+    ]
+    for name in (
+        "critic_loss",
+        "q_mean",
+        "actor_loss",
+        "temperature",
+        "entropy",
+    ):
+        if name in metrics:
+            fields.append(f"{name}={float(metrics[name]):.6g}")
+    return " | ".join(fields)
 
 
 def _atomic_save(value: Any, path: Path) -> None:
@@ -66,6 +102,7 @@ def train(
     device: str,
     checkpoint_path: Path | None = None,
     groups: int | None = None,
+    progress_interval: int = 10,
 ) -> dict[str, Any]:
     config.validate()
     latest = config.checkpoint_dir / "latest.pt"
@@ -118,12 +155,25 @@ def train(
         checkpoint_high_watermark = online_high_watermark
     if group_count < 1:
         raise ValueError("Training groups must be positive")
+    if isinstance(progress_interval, bool) or int(progress_interval) < 1:
+        raise ValueError("Training progress interval must be a positive integer")
+    progress_interval = int(progress_interval)
 
     rng = np.random.default_rng(config.seed + learner.update_groups)
     group_size = config.algorithm.batch_size * config.algorithm.utd_ratio
     sums: dict[str, float] = {}
     last_metrics: dict[str, float] = {}
-    for _ in range(group_count):
+    started_at = time.monotonic()
+    print(
+        "RLPD training started: "
+        f"schedule={schedule}, groups={group_count}, "
+        f"start_update_group={learner.update_groups}, "
+        f"offline_transitions={len(offline['state'])}, "
+        f"online_transitions={0 if not online else len(online['state'])}, "
+        f"device={device}, progress_interval={progress_interval}",
+        flush=True,
+    )
+    for index in range(group_count):
         batch = mixed_batch(
             rng, offline, training_online,
             total=group_size,
@@ -132,6 +182,22 @@ def train(
         last_metrics = learner.update_group(batch, rng)
         for name, value in last_metrics.items():
             sums[name] = sums.get(name, 0.0) + float(value)
+        completed = index + 1
+        if (
+            completed == 1
+            or completed % progress_interval == 0
+            or completed == group_count
+        ):
+            print(
+                _format_training_progress(
+                    completed=completed,
+                    total=group_count,
+                    update_group=learner.update_groups,
+                    elapsed_s=time.monotonic() - started_at,
+                    metrics=last_metrics,
+                ),
+                flush=True,
+            )
         if learner.update_groups % config.algorithm.snapshot_interval_groups == 0:
             _atomic_save(
                 learner.checkpoint(contract, checkpoint_high_watermark),

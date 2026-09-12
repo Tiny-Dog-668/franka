@@ -18,6 +18,13 @@ SUPPORTED_KINDS = {
     ),
     "tacex_rma_gelsight_x040_dr_three_frame_student_torchscript": "gelsight_reference_three_frame_v1",
 }
+GELSIGHT_X040_PROGRESS_THREE_FRAME_STUDENT_TASK = (
+    "TacEx-Sim2Real-Cube-Real-Alignment-RMA-GelSight-X040-Progress-"
+    "Three-Frame-Direct-Action-Student-DR-v0"
+)
+GELSIGHT_X040_PROGRESS_THREE_FRAME_ADAPTER = (
+    "gelsight_reference_progress_three_frame_v1"
+)
 
 
 def sha256_file(path: str | Path) -> str:
@@ -47,7 +54,7 @@ class AdapterContract:
 
 
 class GelSightPolicyAdapter:
-    """把 0814/0823/0911 的不同导出接口统一为 action-head feature。"""
+    """把 GelSight base policies 的不同导出接口统一为 action-head feature。"""
 
     def __init__(
         self,
@@ -58,6 +65,16 @@ class GelSightPolicyAdapter:
         kind = str(metadata.get("kind", ""))
         if kind not in SUPPORTED_KINDS:
             raise ValueError(f"RLPD does not support base policy kind {kind!r}")
+        adapter_id = SUPPORTED_KINDS[kind]
+        if kind == "tacex_rma_gelsight_x040_dr_three_frame_student_torchscript":
+            task = metadata.get("task")
+            if task == GELSIGHT_X040_PROGRESS_THREE_FRAME_STUDENT_TASK:
+                adapter_id = GELSIGHT_X040_PROGRESS_THREE_FRAME_ADAPTER
+            elif task is not None:
+                raise ValueError(
+                    "RLPD does not support X040 three-frame task provenance "
+                    f"{task!r}"
+                )
         visual_method = (
             "encode_visual"
             if kind
@@ -76,7 +93,7 @@ class GelSightPolicyAdapter:
         self.kind = kind
         self.visual_method = visual_method
         self.contract = AdapterContract(
-            adapter_id=SUPPORTED_KINDS[kind],
+            adapter_id=adapter_id,
             policy_kind=kind,
             feature_dim=FEATURE_DIM,
             action_dim=ACTION_DIM,

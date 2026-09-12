@@ -5,15 +5,18 @@ import unittest
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import torch
 
 from real_rlpd.action import combine_post_limit, expert_residual_target
+from real_rlpd.adapters import GelSightPolicyAdapter
 from real_rlpd.config import AlgorithmConfig, load_config
 from real_rlpd.collector import RLPDCollector
 from real_rlpd.expert_dataset import ExpertEpisodeDataset
+from real_rlpd.labeler import _success_boundary
 from real_rlpd.learner import (
     ACTION_DIM,
     PRIVILEGED_DIM,
@@ -21,19 +24,19 @@ from real_rlpd.learner import (
     FrozenNormalizer,
     RLPDLearner,
 )
-from real_rlpd.replay import ReplayBuffer, Transition
+from real_rlpd.replay import ReplayBuffer, Transition, clone_for_reward_relabel
 from real_rlpd.reward import RewardInput, build_reward
 from real_rlpd.runtime import RLPDDeploySettings
 from real_rlpd.teleop import ExpertKeyState, ExpertSnapshot, expert_raw_action
-from real_rlpd.trainer import mixed_batch
-from scripts.real_rlpd.run_rlpd import _base_config
+from real_rlpd.trainer import _format_training_progress, mixed_batch
+from scripts.real_rlpd.run_rlpd import _base_config, _offline_label_skip_reason
 from franka_sim2real.e2e_bundle import load_bundle_config, validate_bundle_artifacts
-from franka_sim2real.streaming import _PolicyResult
+from franka_sim2real.streaming import _PolicyResult, _policy_record
 from franka_sim2real.streaming_server9 import (
     _apply_rlpd_expert_action,
     _print_streaming_progress,
 )
-from franka_sim2real.types import RobotAction
+from franka_sim2real.types import RobotAction, RobotObservation
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -67,16 +70,43 @@ def _transition(step: int, *, trainable: bool = True) -> Transition:
 
 
 class RLPDConfigTests(unittest.TestCase):
+    def test_cancelled_or_empty_collection_skips_offline_label(self) -> None:
+        self.assertEqual(
+            _offline_label_skip_reason({
+                "num_steps": 0,
+                "timing": {"cancelled_by_user": True},
+            }),
+            "the operator cancelled before the control session started",
+        )
+        self.assertEqual(
+            _offline_label_skip_reason({
+                "num_steps": 0,
+                "timing": {
+                    "rlpd_collection": {"transitions_written": 0},
+                },
+            }),
+            "the episode contains no RLPD transitions",
+        )
+        self.assertIsNone(_offline_label_skip_reason({
+            "num_steps": 1,
+            "timing": {
+                "rlpd_collection": {"transitions_written": 1},
+            },
+        }))
+
     def test_0823_uses_corrected_tool_offset_and_separate_data_roots(self) -> None:
         config = load_config(REPO_ROOT / "configs" / "real_rlpd_0823.json")
         base = load_bundle_config(config.base_policy_config)
         self.assertEqual(config.schema_version, 2)
         self.assertEqual(base.tool_tcp_offset_ee_m, [0.0, 0.0, 0.0579])
         self.assertEqual(base.workspace["minimum"][2], 0.01)
-        self.assertEqual(config.expert_data_dir, REPO_ROOT / "real_rlpd_data" / "expert")
+        self.assertEqual(
+            config.expert_data_dir,
+            REPO_ROOT / "real_rlpd_data" / "0823" / "expert",
+        )
         self.assertEqual(
             config.rollout_data_dir,
-            REPO_ROOT / "real_rlpd_data" / "rollout" / "0823",
+            REPO_ROOT / "real_rlpd_data" / "0823" / "rollout",
         )
         self.assertNotEqual(config.expert_data_dir, config.rollout_data_dir)
         expert_base = _base_config(config, "cpu", data_role="expert")
@@ -96,7 +126,7 @@ class RLPDConfigTests(unittest.TestCase):
 
     def test_0911_progress_uses_its_own_policy_and_replay_contract(self) -> None:
         config = load_config(REPO_ROOT / "configs" / "real_rlpd_0911_progress.json")
-        base = _base_config(config, "cpu")
+        base = _base_config(config, "cpu", steps=1000)
         settings = RLPDDeploySettings(
             config,
             "expert_shadow",
@@ -107,9 +137,10 @@ class RLPDConfigTests(unittest.TestCase):
 
         self.assertEqual(config.reward.success_height_m, 0.035)
         self.assertEqual(config.reward.success_consecutive_detections, 5)
+        self.assertEqual(base.runner.steps, 1000)
         self.assertEqual(
             config.rollout_data_dir,
-            REPO_ROOT / "real_rlpd_data" / "rollout" / "0911_progress",
+            REPO_ROOT / "real_rlpd_data" / "0911" / "rollout",
         )
         self.assertEqual(
             contract["adapter_id"], "gelsight_reference_progress_single_frame_v1"
@@ -118,6 +149,120 @@ class RLPDConfigTests(unittest.TestCase):
             contract["policy_kind"],
             "tacex_rma_gelsight_size_buckets_progress_student_torchscript",
         )
+
+    def test_0912_progress_uses_three_frame_features_and_an_isolated_contract(self) -> None:
+        config = load_config(REPO_ROOT / "configs" / "real_rlpd_0912_progress.json")
+        base = _base_config(config, "cpu", steps=1000)
+        settings = RLPDDeploySettings(
+            config,
+            "expert_shadow",
+            base.streaming.commissioning_action_limit,
+        )
+        report = validate_bundle_artifacts(base, rlpd_settings=settings)
+        contract = report["rlpd"]["contract"]
+
+        self.assertEqual(config.reward.success_height_m, 0.035)
+        self.assertEqual(config.reward.success_consecutive_detections, 5)
+        self.assertEqual(base.tool_tcp_offset_ee_m, [0.0, 0.0, 0.0529])
+        self.assertEqual(base.runner.steps, 1000)
+        self.assertEqual(
+            config.rollout_data_dir,
+            REPO_ROOT / "real_rlpd_data" / "0912" / "rollout",
+        )
+        self.assertEqual(
+            config.offline_replay_path,
+            REPO_ROOT
+            / "real_rlpd_data"
+            / "0912"
+            / "derived"
+            / "offline_expert.sqlite3",
+        )
+        self.assertEqual(
+            config.checkpoint_dir,
+            REPO_ROOT / "checkpoints" / "real_rlpd" / "0912_progress",
+        )
+        self.assertEqual(
+            contract["adapter_id"],
+            "gelsight_reference_progress_three_frame_v1",
+        )
+        self.assertEqual(
+            contract["policy_kind"],
+            "tacex_rma_gelsight_x040_dr_three_frame_student_torchscript",
+        )
+        self.assertEqual(contract["feature_dim"], 1043)
+        self.assertEqual(
+            contract["state_contract"],
+            "policy_feature_1043_plus_base_limited_action_4",
+        )
+
+    def test_0912_observable_absolute_reward_has_an_isolated_contract(self) -> None:
+        config = load_config(
+            REPO_ROOT
+            / "configs"
+            / "real_rlpd_0912_progress_observable_absolute.json"
+        )
+        self.assertEqual(config.reward_kind, "apriltag_x040_observable_absolute_v1")
+        self.assertEqual(config.reward.reach_sigma_m, 0.1)
+        self.assertEqual(config.reward.reach_weight, 2.5)
+        self.assertEqual(config.reward.lift_weight, 2.5)
+        self.assertEqual(config.reward.success_weight, 1000.0)
+        self.assertEqual(config.reward.action_magnitude_weight, 0.05)
+        self.assertEqual(config.reward.action_rate_weight, 0.05)
+        self.assertEqual(
+            config.offline_replay_path,
+            REPO_ROOT
+            / "real_rlpd_data"
+            / "0912"
+            / "derived"
+            / "offline_expert_observable_absolute_v1.sqlite3",
+        )
+        self.assertEqual(
+            config.checkpoint_dir,
+            REPO_ROOT
+            / "checkpoints"
+            / "real_rlpd"
+            / "0912_progress_observable_absolute_v1",
+        )
+        base = _base_config(config, "cpu")
+        settings = RLPDDeploySettings(
+            config,
+            "expert_shadow",
+            base.streaming.commissioning_action_limit,
+        )
+        report = validate_bundle_artifacts(base, rlpd_settings=settings)
+        contract = report["rlpd"]["contract"]
+        self.assertEqual(contract, json.loads(json.dumps(contract)))
+        self.assertEqual(
+            contract["reward"]["grasp_center_offset_from_tool_tcp_m"],
+            [0.0, 0.0, 0.0171],
+        )
+
+    def test_0823_keeps_its_legacy_three_frame_adapter_id(self) -> None:
+        config = load_config(REPO_ROOT / "configs" / "real_rlpd_0823.json")
+        base = _base_config(config, "cpu")
+        settings = RLPDDeploySettings(
+            config,
+            "expert_shadow",
+            base.streaming.commissioning_action_limit,
+        )
+        report = validate_bundle_artifacts(base, rlpd_settings=settings)
+
+        self.assertEqual(
+            report["rlpd"]["contract"]["adapter_id"],
+            "gelsight_reference_three_frame_v1",
+        )
+
+    def test_x040_three_frame_adapter_rejects_unknown_task_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            model_path = Path(temporary) / "model.pt"
+            model_path.write_bytes(b"test")
+            metadata = {
+                "kind": "tacex_rma_gelsight_x040_dr_three_frame_student_torchscript",
+                "task": "TacEx-Unknown-X040-Three-Frame-v0",
+            }
+
+            with self.assertRaisesRegex(ValueError, "task provenance"):
+                GelSightPolicyAdapter(mock.Mock(), metadata, model_path)
 
 
 class RLPDActionTests(unittest.TestCase):
@@ -210,6 +355,35 @@ class RLPDActionTests(unittest.TestCase):
         self.assertIn("expert_takeover=True", output)
         self.assertIn("requested_norm=", output)
 
+        observation = RobotObservation(
+            joint_positions=[0.0] * 7,
+            joint_velocities=[0.0] * 7,
+            tcp_translation=[0.4, 0.0, 0.2],
+            tcp_quaternion=[0.0, 0.0, 0.0, 1.0],
+            external_wrench=[0.0] * 6,
+            robot_mode="Move",
+            has_errors=False,
+            is_in_control=True,
+            control_command_success_rate=1.0,
+        )
+        record = _policy_record(
+            0,
+            observation,
+            takeover,
+            accepted=True,
+            motion_enabled=True,
+            episode_id="expert_episode",
+        )
+        self.assertTrue(record["rlpd_expert_takeover"])
+        self.assertNotIn("unit_residual_action", record)
+        self.assertNotIn("residual_normalized_action", record)
+        np.testing.assert_allclose(
+            record["expert_requested_action"], takeover.raw_action, atol=1e-7
+        )
+        np.testing.assert_allclose(
+            record["expert_limited_action"], takeover.executed_action, atol=1e-7
+        )
+
 
 class ExpertDatasetTests(unittest.TestCase):
     def test_source_dataset_excludes_base_and_residual_actions(self) -> None:
@@ -279,6 +453,58 @@ class ExpertDatasetTests(unittest.TestCase):
 
 
 class RLPDReplayTests(unittest.TestCase):
+    def test_0912_absolute_success_boundary_is_inclusive_and_sustained(self) -> None:
+        config = load_config(
+            REPO_ROOT
+            / "configs"
+            / "real_rlpd_0912_progress_observable_absolute.json"
+        )
+        poses = {
+            boundary: SimpleNamespace(
+                object_position_base_m=np.asarray([0.4, 0.0, height])
+            )
+            for boundary, height in enumerate(
+                [0.02, 0.055, 0.055, 0.055, 0.055, 0.055]
+            )
+        }
+        self.assertEqual(_success_boundary(poses, 0.02, config), 5)
+
+    def test_reward_relabel_clone_preserves_policy_data_and_clears_old_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.sqlite3"
+            target = root / "target.sqlite3"
+            source_contract = {
+                "policy": "0912",
+                "reward_kind": "old",
+                "reward": {"weight": 10.0},
+            }
+            target_contract = {
+                "policy": "0912",
+                "reward_kind": "new",
+                "reward": {"weight": 2.5},
+            }
+            with ReplayBuffer(source, "offline") as replay:
+                replay.assert_contract(source_contract)
+                replay.append(_transition(0))
+            report = clone_for_reward_relabel(
+                source, target, "offline", target_contract
+            )
+            self.assertEqual(report["transitions"], 1)
+            with ReplayBuffer(target, "offline", create=False) as replay:
+                self.assertEqual(replay.get_meta("contract"), target_contract)
+                row = replay.connection.execute(
+                    "SELECT * FROM transitions"
+                ).fetchone()
+                self.assertIsNone(row["reward"])
+                self.assertIsNone(row["privileged"])
+                self.assertEqual(row["trainable"], 0)
+                self.assertEqual(row["trainable_reason"], "offline_apriltag_pending")
+                np.testing.assert_allclose(
+                    np.frombuffer(row["executed_action"], dtype="<f4"),
+                    np.zeros(4),
+                )
+
     def test_policy_contract_and_trainable_filter_are_persistent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "offline.sqlite3"
@@ -346,8 +572,73 @@ class RLPDReplayTests(unittest.TestCase):
         self.assertAlmostEqual(reward.action_penalty, 0.01)
         self.assertAlmostEqual(reward.total, 10.39)
 
+    def test_0912_observable_reward_matches_absolute_sim_terms(self) -> None:
+        config = load_config(
+            REPO_ROOT
+            / "configs"
+            / "real_rlpd_0912_progress_observable_absolute.json"
+        )
+        reward_function = build_reward(config.reward_kind, config.reward)
+        value = RewardInput(
+            object_relative_to_ee=np.asarray([0.2, 0.0, 0.0171]),
+            next_object_relative_to_ee=np.asarray([0.1, 0.0, 0.0171]),
+            object_height=0.0,
+            next_object_height=0.0175,
+            action=np.zeros(4, dtype=np.float32),
+            success=True,
+            executed_action=np.asarray([1.0, 0.0, 0.0, 0.0]),
+            previous_executed_action=np.zeros(4, dtype=np.float32),
+            next_tool_tcp_position=np.asarray([0.5, 0.0, 0.009]),
+            dropped=True,
+        )
+        reward = reward_function.compute(value)
+        expected_reach = 2.5 * (1.0 - np.tanh(1.0))
+        self.assertAlmostEqual(reward.reach, expected_reach)
+        self.assertAlmostEqual(reward.lift, 1.25)
+        self.assertAlmostEqual(reward.success, 1000.0)
+        self.assertAlmostEqual(reward.action_magnitude_penalty, 0.0125)
+        self.assertAlmostEqual(reward.action_rate_penalty, 0.0125)
+        self.assertAlmostEqual(reward.table_clearance_penalty, -10.0)
+        self.assertAlmostEqual(reward.drop_penalty, -10.0)
+        self.assertAlmostEqual(
+            reward.total,
+            expected_reach + 1.25 + 1000.0 - 0.025 - 10.0 - 10.0,
+        )
+
+        stationary = reward_function.compute(replace(
+            value,
+            success=False,
+            executed_action=np.zeros(4, dtype=np.float32),
+            next_tool_tcp_position=np.asarray([0.5, 0.0, 0.010]),
+            dropped=False,
+        ))
+        self.assertAlmostEqual(stationary.reach, expected_reach)
+        self.assertAlmostEqual(stationary.lift, 1.25)
+        self.assertEqual(stationary.table_clearance_penalty, 0.0)
+
 
 class RLPDLearnerTests(unittest.TestCase):
+    def test_training_progress_includes_eta_and_core_metrics(self) -> None:
+        output = _format_training_progress(
+            completed=10,
+            total=100,
+            update_group=260,
+            elapsed_s=20.0,
+            metrics={
+                "critic_loss": 12.5,
+                "q_mean": 3.25,
+                "actor_loss": -1.5,
+                "temperature": 0.75,
+                "entropy": 2.0,
+            },
+        )
+        self.assertIn("10/100 (10.0%)", output)
+        self.assertIn("update_group=260", output)
+        self.assertIn("elapsed=00:00:20", output)
+        self.assertIn("eta=00:03:00", output)
+        self.assertIn("critic_loss=12.5", output)
+        self.assertIn("temperature=0.75", output)
+
     def test_ensemble_update_uses_one_actor_update_per_utd_group(self) -> None:
         rng = np.random.default_rng(8)
         states = rng.normal(size=(8, STATE_DIM)).astype(np.float32)

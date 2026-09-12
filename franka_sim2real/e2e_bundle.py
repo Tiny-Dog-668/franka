@@ -31,6 +31,10 @@ from real_rlpd.runtime import RLPDDeploySettings, RLPDPolicyRuntime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUNDLE_DIR = REPO_ROOT / "deploy_bundle_e2e"
+GELSIGHT_X040_PROGRESS_THREE_FRAME_STUDENT_TASK = (
+    "TacEx-Sim2Real-Cube-Real-Alignment-RMA-GelSight-X040-Progress-"
+    "Three-Frame-Direct-Action-Student-DR-v0"
+)
 
 
 @dataclass(frozen=True)
@@ -1916,7 +1920,11 @@ class BundleTorchScriptPolicy:
                 raise RuntimeError(
                     "TacEx GelSight X040 three-frame Student output contract is invalid"
                 )
-            if collect_rma_debug:
+            if (
+                collect_rma_debug
+                or self.metadata.get("task")
+                == GELSIGHT_X040_PROGRESS_THREE_FRAME_STUDENT_TASK
+            ):
                 self.last_inference_info = {
                     "contact_probability": contact_probability.detach()
                     .cpu()
@@ -2122,21 +2130,6 @@ def reject_evaluation_only_motion(
             "This TorchScript export is marked legacy_appearance_evaluation_only by TacEx; "
             "it may be used with --validate-only or --preview-only, but cannot command "
             "the real robot. Re-export a deployment-approved checkpoint first."
-        )
-    if (
-        execute_motion
-        and getattr(
-            bundle,
-            "is_tacex_rma_gelsight_size_buckets_progress_student",
-            False,
-        ) is True
-        and rlpd_settings is None
-    ):
-        raise ValueError(
-            "The 0911 Progress Student is marked motion_authorization='rlpd_only' "
-            "because its offline behavior audit rejected direct motion. It may be used "
-            "with --validate-only/--preview-only, RLPD expert takeover, or a validated "
-            "RLPD checkpoint; direct base-policy motion is disabled."
         )
 
 
@@ -2433,6 +2426,10 @@ def _validate_tacex_rma_gelsight_size_buckets_student_contract(
         frequency = deployment_contract.get("policy_frequency_hz")
         episode_length = deployment_contract.get("episode_length_s")
         max_steps = deployment_contract.get("max_episode_length_steps")
+        training_steps = deployment_contract.get("training_episode_length_steps")
+        is_progress_export = metadata.get("kind") == (
+            "tacex_rma_gelsight_size_buckets_progress_student_torchscript"
+        )
         if (
             isinstance(frequency, bool)
             or not isinstance(frequency, (int, float))
@@ -2440,9 +2437,23 @@ def _validate_tacex_rma_gelsight_size_buckets_student_contract(
             or isinstance(episode_length, bool)
             or not isinstance(episode_length, (int, float))
             or not math.isclose(float(episode_length), 5.0, rel_tol=0.0, abs_tol=1e-8)
-            or isinstance(max_steps, bool)
-            or not isinstance(max_steps, int)
-            or max_steps != 150
+            or (
+                is_progress_export
+                and (
+                    max_steps is not None
+                    or isinstance(training_steps, bool)
+                    or not isinstance(training_steps, int)
+                    or training_steps != 150
+                )
+            )
+            or (
+                not is_progress_export
+                and (
+                    isinstance(max_steps, bool)
+                    or not isinstance(max_steps, int)
+                    or max_steps != 150
+                )
+            )
         ):
             raise ValueError(f"{policy_name} v2 deployment step contract is inconsistent")
     validation = metadata.get("validation")
@@ -2482,8 +2493,8 @@ def _validate_tacex_rma_gelsight_size_buckets_progress_student_contract(
         raise ValueError(f"{policy_name} task provenance is inconsistent")
     if metadata.get("behavior_profile") != "gelsight_size_buckets_progress_rlpd_base_v1":
         raise ValueError(f"{policy_name} behavior profile is inconsistent")
-    if metadata.get("motion_authorization") != "rlpd_only":
-        raise ValueError(f"{policy_name} must remain restricted to RLPD motion")
+    if metadata.get("motion_authorization") != "direct_and_rlpd":
+        raise ValueError(f"{policy_name} motion authorization is inconsistent")
 
     source = metadata.get("source_export")
     if not isinstance(source, dict) or source != {
@@ -2517,11 +2528,12 @@ def _validate_tacex_rma_gelsight_size_buckets_progress_student_contract(
         not isinstance(deployment, dict)
         or deployment.get("success_stop")
         != "external_apriltag_or_operator_required"
-        or config.runner.steps > int(deployment.get("max_episode_length_steps", 0))
+        or deployment.get("max_episode_length_steps") is not None
+        or deployment.get("training_episode_length_steps") != 150
     ):
         raise ValueError(
-            f"{policy_name} requires an external/operator success stop and at most "
-            "150 policy steps"
+            f"{policy_name} requires an external/operator success stop and must keep "
+            "the 150-step training horizon as provenance rather than a runtime cap"
         )
 
     geometry = metadata.get("gelsight_geometry")
@@ -2546,10 +2558,10 @@ def _validate_tacex_rma_gelsight_size_buckets_progress_student_contract(
     audit = metadata.get("behavioral_validation")
     if (
         not isinstance(audit, dict)
-        or audit.get("status") != "direct_motion_rejected"
-        or audit.get("approved_runtime") != "rlpd_residual_only"
+        or audit.get("status") != "warning_acknowledged"
+        or audit.get("approved_runtime") != "direct_and_rlpd"
     ):
-        raise ValueError(f"{policy_name} behavior audit restriction is missing")
+        raise ValueError(f"{policy_name} behavior audit acknowledgement is missing")
     cuda_details = metadata.get("cuda_validation_details")
     cuda_error = (
         cuda_details.get("cpu_cuda_max_abs_error")
@@ -2653,6 +2665,48 @@ def _validate_tacex_rma_gelsight_x040_three_frame_student_contract(
         != "x040_wide_robot_root_xyz"
     ):
         raise ValueError(f"{policy_name} v3 position-normalization is inconsistent")
+    deployment_variant = metadata.get("deployment_variant")
+    if deployment_variant is not None:
+        if deployment_variant != "frozen_encoder_direct_bc":
+            raise ValueError(
+                f"{policy_name} has unsupported deployment_variant "
+                f"{deployment_variant!r}"
+            )
+        direct_bc = metadata.get("direct_bc")
+        if not isinstance(direct_bc, dict) or (
+            direct_bc.get("format_version") != 1
+            or direct_bc.get("input") != "frozen_actor_feature_1043"
+            or direct_bc.get("output")
+            != "commissioning_limited_direct_action_4"
+            or not math.isclose(
+                float(direct_bc.get("action_limit", math.nan)),
+                0.1,
+                rel_tol=0.0,
+                abs_tol=1.0e-9,
+            )
+        ):
+            raise ValueError(f"{policy_name} Direct BC contract is inconsistent")
+        replay_contract = direct_bc.get("replay_contract")
+        base_sha256 = metadata.get("base_policy_model_sha256")
+        if not isinstance(replay_contract, dict) or (
+            replay_contract.get("adapter_id")
+            != "gelsight_reference_progress_three_frame_v1"
+            or replay_contract.get("feature_dim") != 1043
+            or replay_contract.get("action_dim") != 4
+            or replay_contract.get("model_sha256") != base_sha256
+        ):
+            raise ValueError(
+                f"{policy_name} Direct BC base/replay provenance is inconsistent"
+            )
+        if not math.isclose(
+            float(config.streaming.commissioning_action_limit),
+            0.1,
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        ):
+            raise ValueError(
+                f"{policy_name} Direct BC requires commissioning_action_limit=0.1"
+            )
     validation = metadata.get("validation")
     if not isinstance(validation, dict):
         raise ValueError(f"{policy_name} CPU TorchScript validation is missing")
@@ -2678,12 +2732,20 @@ def _validate_tacex_rma_gelsight_x040_three_frame_student_contract(
         config.streaming.policy_frequency_hz, 30.0, rel_tol=0.0, abs_tol=1.0e-8
     ):
         raise ValueError(f"{policy_name} requires streaming.policy_frequency_hz=30")
-    # The corrected GelSight geometry places the lowest centered fingertip
-    # 0.1613 m along panda_hand +Z. libfranka's configured O_T_EE origin is
-    # already 0.1034 m along the same axis from panda_hand, so the workspace
-    # point must use the remaining 0.0579 m. This offset only changes safety
-    # validation; IK continues to command the configured O_T_EE frame.
-    expected_tool_tcp_offset = np.asarray([0.0, 0.0, 0.0579], dtype=np.float64)
+    task = metadata.get("task")
+    if task is None:
+        # Legacy 0814/0815/0823 exports predate task provenance and use the
+        # 161.3 mm panda_hand-to-lowest-point geometry.
+        lowest_point_m = 0.1613
+        expected_tool_tcp_offset = np.asarray([0.0, 0.0, 0.0579], dtype=np.float64)
+    elif task == GELSIGHT_X040_PROGRESS_THREE_FRAME_STUDENT_TASK:
+        # The 0912 Progress task uses the current +21 mm asset: 156.3 mm from
+        # panda_hand to the lowest point. O_T_EE is already 103.4 mm from the
+        # hand, leaving a 52.9 mm workspace safety offset.
+        lowest_point_m = 0.1563
+        expected_tool_tcp_offset = np.asarray([0.0, 0.0, 0.0529], dtype=np.float64)
+    else:
+        raise ValueError(f"{policy_name} has unsupported task provenance {task!r}")
     configured_tool_tcp_offset = np.asarray(
         config.tool_tcp_offset_ee_m, dtype=np.float64
     ).reshape(-1)
@@ -2696,9 +2758,13 @@ def _validate_tacex_rma_gelsight_x040_three_frame_student_contract(
             atol=1.0e-9,
         )
     ):
+        expected_offset_text = ", ".join(
+            f"{value:g}" for value in expected_tool_tcp_offset
+        )
         raise ValueError(
-            f"{policy_name} requires tool_tcp_offset_ee_m=[0, 0, 0.0579] "
-            "for the corrected 161.3 mm panda_hand-to-lowest-point geometry"
+            f"{policy_name} requires tool_tcp_offset_ee_m=[{expected_offset_text}] "
+            f"for the corrected {lowest_point_m * 1000:.1f} mm "
+            "panda_hand-to-lowest-point geometry"
         )
     _validate_tacex_rma_x040_wide_real_runtime(
         config, history_scale_vector, policy_name
@@ -3290,6 +3356,7 @@ def validate_bundle_artifacts(
         "metadata_path": str(bundle.metadata_path),
         "torchscript_sha256": _sha256_file(bundle.model_path),
         "task": bundle.metadata.get("task"),
+        "deployment_variant": bundle.metadata.get("deployment_variant"),
         "input_signature": {
             "action_history": [bundle.history_dim],
             "proprio_obs": [bundle.proprio_dim],

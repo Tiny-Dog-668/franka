@@ -12,10 +12,36 @@ from franka_sim2real.real_rl.offline_apriltag import (
     _load_boundaries,
     _offline_success_boundary,
 )
+from franka_sim2real.real_rl.config import X040ObservableAbsoluteRewardConfig
 
 from .config import RLPDConfig
 from .replay import ACTION_DIM, PRIVILEGED_DIM, ReplayBuffer, ReplayRole, _pack, _unpack
-from .reward import RewardInput, build_reward
+from .reward import (
+    APRILTAG_X040_OBSERVABLE_ABSOLUTE_REWARD,
+    RewardInput,
+    build_reward,
+)
+
+
+def _success_boundary(
+    poses: dict[int, Any | None], initial_z: float, config: RLPDConfig
+) -> int | None:
+    if config.reward_kind != APRILTAG_X040_OBSERVABLE_ABSOLUTE_REWARD:
+        return _offline_success_boundary(poses, initial_z, config)
+    streak = 0
+    threshold = float(config.reward.success_height_m) - 1e-6
+    for boundary in sorted(poses):
+        pose = poses[boundary]
+        if (
+            pose is not None
+            and float(pose.object_position_base_m[2] - initial_z) >= threshold
+        ):
+            streak += 1
+        else:
+            streak = 0
+        if streak >= config.reward.success_consecutive_detections:
+            return boundary
+    return None
 
 
 def label_episode(
@@ -58,7 +84,19 @@ def label_episode(
         if not rows:
             raise RuntimeError(f"RLPD replay has no episode {resolved.name}")
         initial_z = float(rows[0]["initial_object_z"])
-        success_boundary = _offline_success_boundary(poses, initial_z, config)
+        success_boundary = _success_boundary(poses, initial_z, config)
+        x040_reward = (
+            config.reward
+            if isinstance(config.reward, X040ObservableAbsoluteRewardConfig)
+            else None
+        )
+        previous_executed_action = np.zeros(ACTION_DIM, dtype=np.float32)
+        drop_armed = False
+        drop_already_penalized = False
+        first_pose = poses.get(min(poses)) if poses else None
+        if x040_reward is not None and first_pose is not None:
+            first_height = float(first_pose.object_position_base_m[2] - initial_z)
+            drop_armed = first_height >= x040_reward.drop_arm_height_m
         for row in rows:
             step = int(row["step_id"])
             pose_t, pose_next = poses.get(step), poses.get(step + 1)
@@ -84,6 +122,24 @@ def label_episode(
             truncated = bool(row["truncated"] and not success)
             privileged = next_privileged = None
             reward = None
+            executed_action = _unpack(
+                row["executed_action"], ACTION_DIM, "executed_action"
+            )
+            dropped = False
+            if x040_reward is not None and pose_next is not None:
+                observed_next_height = float(
+                    pose_next.object_position_base_m[2] - initial_z
+                )
+                drop_armed = (
+                    drop_armed
+                    or observed_next_height >= x040_reward.drop_arm_height_m
+                )
+                dropped = bool(
+                    drop_armed
+                    and observed_next_height < x040_reward.drop_trigger_height_m
+                    and not drop_already_penalized
+                )
+                drop_already_penalized = drop_already_penalized or dropped
             if valid:
                 ee = _unpack(row["ee_position"], 3, "ee_position")
                 next_ee = _unpack(row["next_ee_position"], 3, "next_ee_position")
@@ -101,6 +157,10 @@ def label_episode(
                     next_object_height=next_height,
                     action=action,
                     success=success,
+                    executed_action=executed_action,
+                    previous_executed_action=previous_executed_action,
+                    next_tool_tcp_position=next_ee,
+                    dropped=dropped,
                 )).total
                 trainable_count += 1
             reasons[reason] = reasons.get(reason, 0) + 1
@@ -113,6 +173,8 @@ def label_episode(
                     reward, int(terminated), int(truncated), int(success), int(valid), reason, int(row["id"]),
                 ),
             )
+            if bool(row["accepted"]):
+                previous_executed_action = executed_action
         replay.connection.commit()
     return {
         "episode_id": resolved.name,

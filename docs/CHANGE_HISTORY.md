@@ -34,6 +34,246 @@
 
 # 变更时间线
 
+## 2026-09-12 修复 0912 Direct BC 首帧 CUDA watchdog
+
+**变更**：将 streaming 的模型预热收敛为公共入口。普通策略保持一次全零输入预热；仅
+`deployment_variant=frozen_encoder_direct_bc` 额外执行一次固定非零图像预热，并把两次耗时写入
+`timing.policy_warmup`。server9 与旧 async streaming backend 使用同一实现，预热全部发生在首个计时
+policy boundary 和任何动作接受之前。
+
+**动机**：RTX 5060 上的 Direct BC TorchScript 首次全零调用和首次非零图像调用分别触发独立的 CUDA
+惰性初始化。旧代码只做全零预热，导致首个真实帧耗时 676–703 ms，并在 step 0 被 250 ms policy
+watchdog 安全拒绝；后续同形状推理实际只需约 3 ms。
+
+**影响**：Direct BC 启动增加约 1.1 s 的无运动模型预热；不放宽 policy/control watchdog。模型、动作
+维度与尺度、workspace、初始状态门禁、坐标系、碰撞阈值、停止时序、native worker 和共享内存 ABI
+均不变；已有非 Direct-BC 策略仍只执行原来的一次预热。
+
+**验证**：从两个失败 run 的 `summary.json` 确认均为 step 0、`num_steps=0`、无 control tick，policy
+耗时分别为 702.853 ms 和 675.598 ms。独立 CUDA 复现得到全零 558 ms、首个随机非零 655 ms、之后
+约 3 ms；修复后的新进程预热耗时为 437/657 ms，首个随机非零调用为 6.42 ms，低于 250 ms
+watchdog。streaming/server9/Direct-BC 定向单测 50 项通过；全量 270 项测试有 269 项通过，唯一错误是
+既有 live-AprilTag 测试仍查找已迁移前的 `runs/...` 标定文件，而当前文件位于 `runs_old/...`。
+Direct-BC GPU `--validate-only`、Python compileall 和 `git diff --check` 通过。未由本次修改连接相机或
+Franka，未执行真机运动；修复后的真实相机 preview 待操作者复验。
+
+**文件**：`franka_sim2real/streaming.py`、`franka_sim2real/streaming_server9.py`、
+`tests/test_streaming.py`、`README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-09-12 0912 新增 Frozen-Encoder Direct BC
+
+**变更**：新增独立 0912 Direct BC 数据/训练模块、训练 CLI、部署配置和入口。从 observable-absolute
+expert Replay 的 1043D frozen feature 预测专家最终 4D executed action；按 episode 分割，默认保留真实
+专家动作分布并提供可选类别平衡采样，使用 Smooth-L1 和 early stopping。导出 artifact 内嵌冻结 0912 encoder，action 直接由 BC head
+产生，不与 base action 相加；position/contact 辅助输出继续写日志。metadata 增加 Direct BC provenance
+并校验 base/replay SHA、feature/action contract 和固定 `0.1` limit。
+
+**动机**：原纯离线 RLPD Actor 在未覆盖的状态上产生明显 base-action 抵消和持续开爪。Direct BC 用专家
+最终执行动作做显式监督，先验证不依赖 base action 组合的保守替代路径。
+
+**影响**：新配置和 artifact 与 0912 base/RLPD 完全隔离。动作输出在模型内严格限制为 `±0.1`，随后仍走
+原 streaming limiter；动作尺度、workspace、初始状态门禁、坐标系、碰撞阈值、停止时序、native worker
+和共享内存 ABI 均不变。
+
+**验证**：7580 条 transition 按 20/2/2 个 episode 分为 6722/316/542 条 train/validation/test；GPU
+训练在 epoch 45 early-stop，最佳 epoch 30。held-out test 四轴 normalized-action MAE 为
+`[0.00258,0.00292,0.00541,0.01188]`，非零目标符号准确率为 `[1.0,0.9,1.0,1.0]`。CPU batch 1/8
+TorchScript 与 eager 三输出最大误差均为 0；CUDA 三输出最大误差不超过 `4.99e-5`；新入口
+`--validate-only` 通过，完整 artifact 的 CUDA 平均推理耗时约 `2.45 ms`，内联图未调用原 action head；
+RLPD/bundle/Direct-BC 定向单测 68 项通过。全量 268 项测试有 267 项通过，唯一错误是既有 live-AprilTag
+测试仍查找已迁移前的 `runs/...` 标定文件，而当前文件位于 `runs_old/...`。Python compileall、两份 JSON
+解析和 `git diff --check` 通过。未连接相机或 Franka，未执行真机运动。
+
+**文件**：`real_rlpd/direct_bc.py`、`scripts/training/train_0912_direct_bc.py`、
+`checkpoint/0912_direct_bc/direct_bc_best.pt`、`checkpoint/0912_direct_bc/direct_bc_policy.pt`、
+`checkpoint/0912_direct_bc/direct_bc_policy.json`、`checkpoint/0912_direct_bc/training_history.json`、
+`configs/e2e_bundle_real_exported_0912_direct_bc.json`、
+`scripts/policy/run_exported_0912_direct_bc.py`、`franka_sim2real/e2e_bundle.py`、
+`scripts/policy/run_exported_0711.py`、`tests/test_direct_bc.py`、`README.md`、`docs/ARCHITECTURE.md`、
+`docs/CHANGE_HISTORY.md`
+
+## 2026-09-12 RLPD 训练增加实时进度输出
+
+**变更**：训练启动时打印 schedule、数据量、设备和起始 update group；默认在第 1 个 group、每 10 个
+group 及最后一个 group 打印百分比、累计 update group、elapsed、ETA、Critic/Actor loss、Q 均值、
+temperature 和 entropy。CLI 新增 `--progress-interval` 调整频率。
+
+**动机**：1000-group 离线训练此前只在结束时打印结果，中间保存快照也无终端输出，容易被误认为卡死。
+
+**影响**：增加训练日志和 CLI 参数，并将 contract 中 dataclass tuple 规范化为 JSON list，修复新增奖励
+配置与 SQLite JSON contract 的等价表示比较；contract 字段和值不变。采样、UTD、优化器、reward、模型
+张量、动作尺度、限幅、workspace、初始状态门禁、坐标系、停止时序、native worker 和 ABI 均不变。
+
+**验证**：RLPD/bundle 定向单测 63 项通过；Python compileall、CLI `train --help` 和
+`git diff --check` 通过；使用正式 0912 observable-absolute Replay 的 7580 条 trainable transition 在
+RTX 5060 Laptop GPU 上完成临时 1-group smoke，打印 1/1、elapsed/ETA 和指标并执行 20 次 critic update，
+临时 checkpoint 自动清理。未连接相机或 Franka，未执行真机运动。
+
+**文件**：`real_rlpd/trainer.py`、`real_rlpd/runtime.py`、`scripts/real_rlpd/run_rlpd.py`、`tests/test_real_rlpd.py`、
+`real_rlpd/README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-09-12 0912 RLPD 新增可观测绝对奖励契约
+
+**变更**：新增 `apriltag_x040_observable_absolute_v1` reward 与独立 0912 配置。reach/lift 使用仿真同式的
+绝对归一化状态值，权重均为 2.5；成功事件为 1000；最终执行动作幅值和变化权重均为 0.05；加入 20/5 mm
+掉落状态机和严格低于 10 mm 的桌面间隙惩罚。新增非破坏性的 `rebuild-reward-replay`，可复制相同
+policy/action contract 的旧 Replay 并从原始 D435 边界帧重新标注，目标存在时拒绝覆盖。
+缺少原始边界帧的历史 episode 仅作为 non-trainable 条目保留并报告，不会伪造奖励或阻止其余 episode。
+
+**动机**：原 0912 真机奖励使用相邻帧距离/高度增量和 residual-action penalty，与训练环境的绝对
+reach/lift 及 executed-action 契约不一致；同时需要保留旧实验以便对比和回退。
+
+**影响**：原 `configs/real_rlpd_0912_progress.json`、旧 Replay 和 checkpoint 保持不变。新 reward 使用
+独立 Replay/checkpoint；Actor/Critic 张量维度、4D residual、动作尺度、commissioning limit、workspace、
+初始状态门禁、坐标系、碰撞阈值、停止时序、native worker 与共享内存 ABI 均不变。当前没有可靠的左右
+接触力、非法碰撞分类和方块姿态标签，因此不伪造 contact、超力、illegal-collision 或 upright 奖励项。
+
+**验证**：新配置在 CPU 上完成实际 0912 TorchScript、metadata、三帧 feature 与 RLPD contract 校验；
+RLPD/bundle 定向单测 62 项通过；五份 RLPD JSON 加载、Python compileall 和 `git diff --check` 通过。
+全量 262 项测试有 261 项通过，唯一失败是既有的 live-AprilTag 测试仍查找已迁移前的 `runs/...`
+标定路径，而当前配置使用 `runs_old/...`。未运行 Replay 批量重建，未连接相机或 Franka，未执行真机运动。
+
+**文件**：`franka_sim2real/real_rl/config.py`、`real_rlpd/config.py`、`real_rlpd/reward.py`、
+`real_rlpd/labeler.py`、`real_rlpd/replay.py`、`scripts/real_rlpd/run_rlpd.py`、
+`configs/real_rlpd_0912_progress_observable_absolute.json`、`tests/test_real_rlpd.py`、`README.md`、
+`real_rlpd/README.md`、`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-09-12 增加 Franka Hand 延迟有界诊断与原生对照
+
+**变更**：新增独立的夹爪时序测试脚本，默认只做离线参数预览；显式启用真机后，可测量当前 `franky`
+路径的 `move_async()`、运动中同步 `stop()`、有限目标自然完成和状态读取耗时，并输出 JSON 报告。诊断硬限制
+单次行程不超过 10 mm、速度不超过 0.05 m/s，要求人工输入 `y`/`yes`，且不构造机械臂连接。新增离线
+参数、安全边界和汇总测试。随后增加链接同一 `libfranka 0.17.0` 的原生 C++ 对照：一个线程执行阻塞
+`Gripper::move()`，主线程延时调用同一对象的 `Gripper::stop()`，以隔离 franky future/包装层开销。
+
+**动机**：现有 0814/0912 RLPD 记录只能确认整个 Hand `stop()` 调用耗时较长，尚不能把停止 RPC 延迟与
+有限运动自然完成耗时分开。先提供可重复、动作有界的测量入口，再决定是否替换 binding 或改成短分段控制。
+
+**影响**：只新增 Python/C++ 诊断、构建脚本、测试代码及操作文档；不改变 RLPD、策略输入/动作、夹爪生产控制、动作尺度、限幅、
+workspace、initial-state gate、坐标系、机械臂停止时序或共享内存 ABI。未执行真机测试。
+
+**验证**：默认 dry-run 确认 `franky-control 1.1.3` 且未建立 Hand 连接；新增测试与现有
+`test_gripper_process` 合计 13 项通过；原生诊断完成编译、离线 self-test、dry-run，并由 `ldd` 确认链接
+`franky_control.libs/libfranka-*.so.0.17.0`；全仓 Python compileall 和 `git diff --check` 通过。未连接
+Franka，未执行夹爪或机械臂运动。
+
+**文件**：`scripts/diagnostics/test_franka_gripper_latency.py`、`native/franka_gripper_latency.cpp`、
+`scripts/build_franka_gripper_latency.sh`、`tests/test_franka_gripper_latency.py`、`README.md`、
+`docs/ARCHITECTURE.md`、`docs/CHANGE_HISTORY.md`
+
+## 2026-09-12 RLPD 数据改为策略日期命名空间
+
+**变更**：将 RLPD 数据统一整理为 `real_rlpd_data/<policy>/{expert,derived,rollout}`；0814、0823、
+0911、0912 配置分别使用自己的日期目录。迁移现有 0912 episode、offline Replay，并同步运行产物与
+SQLite transition 中的绝对 `run_dir`。
+
+**动机**：避免不同日期策略的专家数据、派生 Replay 和 online rollout 混在共享顶层目录，并为后续
+0913 等策略提供一致的目录模板。
+
+**影响**：只改变数据存储路径；专家源格式、Replay schema/contract、checkpoint 路径、动作维度与尺度、
+reward、commissioning limit、workspace、初始状态门禁、坐标系、停止时序、native worker 和共享内存
+ABI 均不变。不同日期的 expert 默认物理隔离；需要复用时必须显式迁移/重新编码。
+
+**验证**：迁移后共有 8 个 0912 episode，其中 3 个带离线标注；SQLite `integrity_check=ok`，300 条
+transition 的 `run_dir` 均指向存在的新目录。RLPD、streaming、server9 定向测试共 60 项通过；四份
+RLPD JSON 校验、0912 CUDA `validate`、Python compileall 与 `git diff --check` 均通过。未启动相机或
+Franka，未执行新的真机运动。
+
+**文件**：`configs/real_rlpd_0814.json`、`configs/real_rlpd_0823.json`、
+`configs/real_rlpd_0911_progress.json`、`configs/real_rlpd_0912_progress.json`、
+`tests/test_real_rlpd.py`、`README.md`、`real_rlpd/README.md`、`docs/ARCHITECTURE.md`、
+`docs/CHANGE_HISTORY.md`，以及 Git 忽略的 `real_rlpd_data/` 运行数据。
+
+## 2026-09-12 RLPD 空采集跳过离线标注
+
+**变更**：`collect-expert`/`collect-online` 在操作者确认取消、零 policy step 或零 Replay transition 时，
+明确报告空采集并跳过 AprilTag 离线标注；新增取消、空 episode 和正常 episode 的分支测试。
+
+**动机**：取消发生在 worker 和键盘窗口启动之前，不会生成原始边界帧。旧 CLI 仍无条件调用标注器，
+把正常取消误报为“older 224x224-only runs cannot be relabeled”。
+
+**影响**：只改变无 transition run 的收尾报告；含 transition 的 expert/online episode 仍必须保存原始
+640×480 边界帧并执行或显式延后离线标注。动作、Replay schema、奖励、限幅、workspace、初始状态门禁、
+坐标系、停止时序、native worker 和共享内存 ABI 均不变。
+
+**验证**：RLPD、streaming 与 server9 定向测试共 60 项通过；Python compileall 和
+`git diff --check` 通过。未连接相机或 Franka，未执行真机运动。
+
+**文件**：`scripts/real_rlpd/run_rlpd.py`、`tests/test_real_rlpd.py`、`docs/ARCHITECTURE.md`、
+`docs/CHANGE_HISTORY.md`
+
+## 2026-09-12 修复 RLPD expert 首步记录 KeyError
+
+**变更**：将通用 streaming rollout 的 RLPD 记录按 expert takeover 与 online residual 分支序列化。
+expert 记录保存请求动作、最终限幅动作和按键快照，不再读取已经按设计删除的
+`unit_residual_action`/`residual_normalized_action`；新增首步记录回归测试。
+
+**动机**：expert 全接管使用绝对 4D 动作，shadow runtime 的零 residual 不是专家标签；旧记录器仍按
+online residual schema 无条件取值，导致键盘 Enter 后第一步抛出 `KeyError: 'unit_residual_action'`。
+
+**影响**：只修正 RLPD expert 的 JSON 运行记录；专家源 dataset 和派生 Replay 的动作语义不变。
+动作尺度、commissioning limit、workspace、初始状态门禁、坐标系、碰撞阈值、watchdog、停止时序、
+native worker 与共享内存 ABI 均不变。
+
+**验证**：RLPD 定向测试 16 项通过，streaming/server9 测试 43 项通过；0912 `validate --device cuda:0`
+通过；Python compileall 与 `git diff --check` 通过。未连接相机或 Franka，未执行真机运动。
+
+**文件**：`franka_sim2real/streaming.py`、`tests/test_real_rlpd.py`、`docs/ARCHITECTURE.md`、
+`docs/CHANGE_HISTORY.md`
+
+## 2026-09-12 0912 Progress 三帧 policy 接入 RLPD
+
+**变更**：为 0912 新增 RLPD 配置和 `gelsight_reference_progress_three_frame_v1` adapter；复用三帧
+1043D base feature，同时按 Progress 契约设置 `0.035 m`/连续 5 次成功检测。
+
+**影响**：0912 的派生 Replay、online Replay 和 checkpoint 使用独立 `0912_progress` 路径；动作仍为
+4D post-commissioning residual，模型/metadata hash 和 adapter ID 阻止与 0823/0911 checkpoint 混用。
+
+**验证**：RLPD `unittest` 16 项通过；0912 GPU `validate` 通过，三帧 feature 能复现 base action，
+CUDA 推理及独立 replay contract 校验通过。未运行专家采集、训练、相机或 Franka 真机运动。
+
+**文件**：`configs/real_rlpd_0912_progress.json`、`real_rlpd/adapters.py`、`tests/test_real_rlpd.py`、
+`README.md`、`real_rlpd/README.md`、`docs/ARCHITECTURE.md`。
+
+## 2026-09-12 0912 X040 三帧 Progress policy 真机部署
+
+**变更**：新增 0912 独立部署入口和配置；按 metadata task 将当前 156.3 mm 几何与旧 0823 的
+161.3 mm 几何分流，并记录模型辅助接触概率和方块根坐标。训练 horizon 作为 provenance，不限制运行步数。
+
+**影响**：0912 使用 `tool_tcp_offset_ee_m.z=0.0529 m`、三帧 RGB、双 GelSight reference 和 4D direct
+action；0823 继续使用 `0.0579 m`。动作尺度、ABI、workspace、初始状态门禁不变，checkpoint 无需重训。
+
+**验证**：相关 `unittest` 41 项通过；0912 CPU `--steps 1000 --validate-only`、compileall、JSON
+解析和 `git diff --check` 通过。未运行 GPU、相机、Isaac Sim 或 Franka 真机测试。
+
+**文件**：`configs/e2e_bundle_real_exported_0912_gelsight_progress.json`、
+`scripts/policy/run_exported_0912_gelsight_progress.py`、`franka_sim2real/e2e_bundle.py`、
+`franka_sim2real/streaming.py`、`tests/test_e2e_bundle_runtime.py`、`README.md`、`docs/ARCHITECTURE.md`。
+
+## 2026-09-11 0911 裸 policy 多步部署
+
+**变更**：将 0911 Progress metadata 的运动授权改为 `direct_and_rlpd`，移除直接部署与 RLPD 的 150 步
+运行时硬上限；训练 horizon 仍作为 provenance 记录，并保留离线行为审计告警以及首次 proposed action
+人工确认。
+
+**动机**：操作者确认动作饱和是简单仿真任务中预期的最优 bang-bang 控制，希望先直接运行多步 policy
+观察真机效果，同时继续保留审计结果供部署判断。
+
+**影响**：仅解除 0911 裸 policy 的 RLPD-only 运行门禁；旧 policy、RLPD 数据隔离、动作尺度、`±0.1`
+commissioning limit、workspace、初始状态门禁、碰撞阈值、坐标系、停止时序和 ABI-8 均不变。每步 XYZ
+单轴最多 5 mm，夹爪宽度最多变化 1 mm；运行时长不再受训练 horizon 限制，且裸部署没有闭环成功检测，
+仍需操作者监控停止。
+
+**验证**：0911 裸 deploy 使用 `--steps 1000 --validate-only` 通过，RLPD GPU `validate` 通过；部署 CLI、bundle、server9
+与 RLPD 相关单测 85 项通过；0814/0823 原入口 GPU `--validate-only` 均通过；JSON、compileall 和
+`git diff --check` 通过。未连接相机或 Franka，未执行真机运动。
+
+**文件**：`checkpoint/0911/gelsight_reference_progress_student_100000.json`、
+`franka_sim2real/e2e_bundle.py`、`franka_sim2real/streaming.py`、
+`scripts/policy/run_exported_0911_gelsight_progress.py`、`tests/test_e2e_bundle_runtime.py`、
+`tests/test_real_rlpd.py`、`README.md`、`real_rlpd/README.md`、`docs/ARCHITECTURE.md`、
+`docs/CHANGE_HISTORY.md`
+
 ## 2026-09-11 0911 Progress policy 隔离与 RLPD 接入
 
 **变更**：为 0911 checkpoint 新增独立 Progress metadata kind、部署配置/入口和 RLPD 配置；新增
